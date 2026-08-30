@@ -225,6 +225,10 @@ enum Command {
         version: String,
         #[arg(long, help = "Publisher npub or hexadecimal public key")]
         publisher: String,
+        #[arg(long, help = "Target operating system; defaults to the host OS")]
+        os: Option<String>,
+        #[arg(long, help = "Target architecture; defaults to the host architecture")]
+        arch: Option<String>,
     },
     #[command(alias = "update")]
     InstallRef {
@@ -563,7 +567,16 @@ async fn main() -> Result<()> {
             name,
             version,
             publisher,
-        } => init_package(&directory, &name, &version, &publisher)?,
+            os,
+            arch,
+        } => init_package(
+            &directory,
+            &name,
+            &version,
+            &publisher,
+            os.as_deref().unwrap_or(OS),
+            arch.as_deref().unwrap_or(ARCH),
+        )?,
         Command::InstallRef {
             package,
             relays,
@@ -679,7 +692,14 @@ async fn connect_with_timeout(client: &Client) -> Result<()> {
     Ok(())
 }
 
-fn init_package(directory: &Path, name: &str, version: &str, publisher: &str) -> Result<()> {
+fn init_package(
+    directory: &Path,
+    name: &str,
+    version: &str,
+    publisher: &str,
+    os: &str,
+    arch: &str,
+) -> Result<()> {
     validate_package_name(name, "package name")?;
     Version::parse(version).context("package version must be valid SemVer")?;
     if publisher.is_empty()
@@ -689,6 +709,12 @@ fn init_package(directory: &Path, name: &str, version: &str, publisher: &str) ->
         || publisher == ".."
     {
         bail!("publisher must be a single safe path component");
+    }
+    if os.is_empty() || os.chars().any(char::is_control) {
+        bail!("target OS must not be empty or contain control characters");
+    }
+    if arch.is_empty() || arch.chars().any(char::is_control) {
+        bail!("target architecture must not be empty or contain control characters");
     }
     let metadata_dir = directory.join(".npack");
     let manifest_path = metadata_dir.join("manifest.json");
@@ -703,15 +729,15 @@ fn init_package(directory: &Path, name: &str, version: &str, publisher: &str) ->
         publisher: publisher.to_owned(),
         name: name.to_owned(),
         version: version.to_owned(),
-        artifact: format!("{name}-{version}-{OS}-{ARCH}.npk").into(),
+        artifact: format!("{name}-{version}-{os}-{arch}.npk").into(),
         sha256: String::new(),
         dependencies: vec![],
         conflicts: vec![],
         artifact_event: None,
         repo: None,
         commit: None,
-        os: OS.into(),
-        arch: ARCH.into(),
+        os: os.into(),
+        arch: arch.into(),
         format: "npk".into(),
         runtime_requires: vec![],
         provides: vec![],
