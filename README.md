@@ -69,10 +69,14 @@ npack hash ./myapp-1.0.0.npk
 npack inspect ./myapp-1.0.0.npk
 
 # Install and inspect local packages
-npack install ./myapp.manifest.json --user
+# The package metadata is embedded in the .npk.
+npack install ./myapp-1.0.0.npk --user
 npack list --user
 npack verify-installed --user
 npack remove <publisher>/myapp --user
+
+# A standalone manifest remains useful for publishing and verification
+npack verify ./myapp.manifest.json
 
 # Create and verify signed release metadata
 npack release-event ./myapp.manifest.json --secret-key <secret-key>

@@ -39,9 +39,24 @@ jobs:
       - name: Create package root
         env:
           VERSION: ${{ steps.release.outputs.version }}
+          PUBLISHER: ${{ vars.NOSTR_PUBLISHER }}
         run: |
-          mkdir -p package-root/bin package-output
+          mkdir -p package-root/bin package-root/.npack package-output
           install -m 0755 target/release/npack package-root/bin/npack
+          if [[ "$GITHUB_REF_TYPE" != tag ]]; then
+            PUBLISHER="manual-test-publisher"
+          fi
+          runtime_requires=$(cargo run --quiet -- inspect target/release/npack \
+            | awk '/^needed: / { sub(/^needed: /, ""); if ($0 != "none") print }' \
+            | jq -R -s 'split("\n") | map(select(length > 0))')
+          jq -n \
+            --arg publisher "$PUBLISHER" \
+            --arg name npack \
+            --arg version "$VERSION" \
+            --arg artifact "npack-${VERSION}-linux-x86_64.npk" \
+            --argjson runtime_requires "$runtime_requires" \
+            '{publisher:$publisher,name:$name,version:$version,artifact:$artifact,sha256:"",dependencies:[],conflicts:[],os:"linux",arch:"x86_64",format:"npk",runtime_requires:$runtime_requires,provides:[]}' \
+            > package-root/.npack/manifest.json
           cargo run --quiet -- pack package-root \
             --output "package-output/npack-${VERSION}-linux-x86_64.npk"
 

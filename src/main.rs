@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     env::consts::{ARCH, OS},
-    fs, io,
+    fs,
+    io::{self, Read},
     os::unix::fs::PermissionsExt,
     os::unix::fs::symlink,
     path::{Path, PathBuf},
@@ -354,7 +355,11 @@ async fn main() -> Result<()> {
             system,
             allowed_capabilities,
         } => {
-            let package = load_manifest(&manifest)?;
+            let package = if manifest.extension().and_then(|ext| ext.to_str()) == Some("npk") {
+                load_embedded_manifest(&manifest)?
+            } else {
+                load_manifest(&manifest)?
+            };
             verify_manifest(&package, &manifest)?;
             let installed = install_with_capabilities(
                 &package,
@@ -1996,6 +2001,33 @@ fn load_manifest(path: &Path) -> Result<Manifest> {
     Ok(manifest)
 }
 
+fn load_embedded_manifest(archive_path: &Path) -> Result<Manifest> {
+    let file = fs::File::open(archive_path)
+        .with_context(|| format!("reading package {}", archive_path.display()))?;
+    let decoder = zstd::Decoder::new(file).context("opening .npk zstd stream")?;
+    let mut archive = tar::Archive::new(decoder);
+    let mut manifest = None;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if entry.path()?.as_ref() == Path::new(".npack/manifest.json") {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            manifest = Some(
+                serde_json::from_slice::<Manifest>(&bytes)
+                    .context("parsing embedded .npack/manifest.json")?,
+            );
+            break;
+        }
+    }
+    let mut manifest = manifest.context(".npk does not contain .npack/manifest.json")?;
+    manifest.artifact = archive_path
+        .file_name()
+        .context("package path has no filename")?
+        .into();
+    manifest.sha256 = hash_file(archive_path)?;
+    Ok(manifest)
+}
+
 fn validate_repo_reference(repo: &str) -> Result<()> {
     let mut parts = repo.splitn(3, ':');
     let kind = parts.next();
@@ -2537,6 +2569,9 @@ fn npk_entry_paths(archive_path: &Path) -> Result<Vec<PathBuf>> {
         }
         if !seen.insert(relative.clone()) {
             bail!("duplicate path in .npk archive: {}", relative.display());
+        }
+        if relative == Path::new(".npack") || relative.starts_with(".npack/") {
+            continue;
         }
         if entry.header().entry_type().is_symlink() {
             let target = entry.link_name()?.context("symlink entry has no target")?;
@@ -3617,6 +3652,48 @@ mod tests {
         let files = extract_npk(&archive, &destination)?;
         assert_eq!(files.len(), 2);
         assert_eq!(fs::read(destination.join("bin/hello"))?, b"hello");
+        Ok(())
+    }
+
+    #[test]
+    fn loads_embedded_manifest_from_npk() -> Result<()> {
+        let dir = tempdir()?;
+        let source = dir.path().join("source");
+        fs::create_dir_all(source.join(".npack"))?;
+        fs::create_dir_all(source.join("bin"))?;
+        fs::write(source.join("bin/hello"), b"hello")?;
+        let embedded = Manifest {
+            publisher: "npub1test".into(),
+            name: "hello".into(),
+            version: "1.0.0".into(),
+            artifact: "hello.npk".into(),
+            sha256: String::new(),
+            dependencies: vec![],
+            conflicts: vec![],
+            artifact_event: None,
+            repo: None,
+            commit: None,
+            os: default_os(),
+            arch: default_arch(),
+            format: "npk".into(),
+            runtime_requires: vec![],
+            provides: vec![],
+            post_install: vec![],
+        };
+        fs::write(
+            source.join(".npack/manifest.json"),
+            serde_json::to_vec(&embedded)?,
+        )?;
+        let archive = dir.path().join("hello.npk");
+        pack_npk(&source, &archive)?;
+        let manifest = load_embedded_manifest(&archive)?;
+        assert_eq!(manifest.name, "hello");
+        assert_eq!(manifest.sha256, hash_file(&archive)?);
+        assert!(
+            !npk_entry_paths(&archive)?
+                .iter()
+                .any(|path| path.starts_with(".npack"))
+        );
         Ok(())
     }
 
