@@ -85,6 +85,7 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    #[command(alias = "update")]
     InstallRef {
         package: String,
         #[arg(long = "relay", required = true)]
