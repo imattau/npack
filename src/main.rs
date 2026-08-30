@@ -766,6 +766,14 @@ fn pack_npk(source: &Path, output: &Path) -> Result<()> {
     if !source.is_dir() {
         bail!("package source must be a directory");
     }
+    let embedded_manifest = source.join(".npack/manifest.json");
+    if embedded_manifest.exists() {
+        let bytes = fs::read(&embedded_manifest)
+            .with_context(|| format!("reading {}", embedded_manifest.display()))?;
+        let manifest: Manifest =
+            serde_json::from_slice(&bytes).context("parsing embedded .npack/manifest.json")?;
+        validate_manifest_metadata(&manifest, false)?;
+    }
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -2143,6 +2151,12 @@ fn validate_manifest_metadata(manifest: &Manifest, require_hash: bool) -> Result
         if value.contains('/') || value.contains('\\') || value == "." || value == ".." {
             bail!("manifest {label} must be a single safe path component");
         }
+    }
+    if manifest.artifact.as_os_str().is_empty()
+        || manifest.artifact.is_absolute()
+        || manifest.artifact.components().count() != 1
+    {
+        bail!("manifest artifact must be a single safe filename");
     }
     if require_hash
         && (manifest.sha256.len() != 64 || !manifest.sha256.chars().all(|c| c.is_ascii_hexdigit()))
@@ -3858,6 +3872,38 @@ mod tests {
                 .iter()
                 .any(|path| path.starts_with(".npack"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unsafe_embedded_manifest_artifact() -> Result<()> {
+        let dir = tempdir()?;
+        let source = dir.path().join("source");
+        fs::create_dir_all(source.join(".npack"))?;
+        let manifest = Manifest {
+            publisher: "npub1test".into(),
+            name: "hello".into(),
+            version: "1.0.0".into(),
+            artifact: "../hello.npk".into(),
+            sha256: String::new(),
+            dependencies: vec![],
+            conflicts: vec![],
+            artifact_event: None,
+            repo: None,
+            commit: None,
+            os: default_os(),
+            arch: default_arch(),
+            format: "npk".into(),
+            runtime_requires: vec![],
+            provides: vec![],
+            post_install: vec![],
+        };
+        fs::write(
+            source.join(".npack/manifest.json"),
+            serde_json::to_vec(&manifest)?,
+        )?;
+        let error = pack_npk(&source, &dir.path().join("hello.npk")).unwrap_err();
+        assert!(error.to_string().contains("safe filename"));
         Ok(())
     }
 
