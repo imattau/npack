@@ -1,89 +1,151 @@
 # npack
 
-An independent, Nostr-native package manager.
+`npack` is a Nostr-native package manager. It distributes signed software
+release metadata over Nostr relays and stores immutable `.npk` artifacts on
+Blossom-compatible servers.
 
-npack is intended to manage the complete package lifecycle: discover signed release metadata on Nostr, resolve dependencies, retrieve content-addressed artifacts, verify them, and install them into the host filesystem.
+The package format is independent of APT, RPM, and native package databases.
+An `.npk` is a deterministic tar archive compressed with zstd. `npack`
+resolves dependencies, verifies signatures and SHA-256 hashes, and installs
+files directly into the host system or the user's standard local prefix.
 
-## First vertical slice
+## Status
 
-The current prototype works locally or through configured Nostr relays and Blossom servers. It defines a package manifest, calculates SHA-256 hashes, verifies an artifact, checks declared dependencies and conflicts, installs it into a host prefix, and records installed packages.
+This is an early working prototype. The local package lifecycle, Nostr
+release events, NIP-94 artifact metadata, Blossom discovery, dependency
+resolution, lockfiles, revocations, offline replay, and GitHub Actions release
+workflow are implemented. The wire format is a project protocol and is not
+yet a registered NIP.
 
-System installation is the default and uses `/` as the payload prefix with package state in `/var/lib/npack`, so it normally requires privilege. Use `--user` to install payloads into `$HOME/.local`; user state remains in the user's local data directory. `--system` explicitly selects the system scope when configuration defaults to user scope. `--store` is available as an explicit development/test state and prefix override.
+## How it works
 
-Persistent defaults can be configured in `$XDG_CONFIG_HOME/npack/config.toml` (or the platform config directory):
+```text
+Nostr relays       signed package metadata and discovery
+      │
+      ▼
+kind:9900 release ─── kind:1063 NIP-94 artifact metadata
+      │                              │
+      └──────── SHA-256 ─────────────┘
+                                     │
+                                     ▼
+                         Blossom / content-addressed storage
+```
 
-    [network]
-    relays = ["wss://relay.example"]
+The publisher's Nostr key identifies the release. Relays and download URLs
+are transport; clients verify the event signatures and artifact hash locally.
 
-    [storage]
-    blossom = ["https://blossom.example"]
+See:
 
-    [identity]
-    pubkey = "npub1..."
+- [Package protocol v1](docs/package-protocol-v1.md)
+- [Event fixtures](docs/package-event-fixtures.md)
+- [Release-key notes](docs/release-key-model.md)
+- [GitHub Actions release workflow](docs/github-actions.md)
 
-    [trust]
-    publishers = ["npub1..."]
+## Build
 
-    [install]
-    user = true
+```bash
+cargo build --release
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+```
 
-Command-line values take precedence over configuration values.
-When `identity.pubkey` is configured, npack reads the user's NIP-65 kind:10002 relay-list event from the configured relays and adds its read-capable relays to package discovery. The configured relays act as bootstrap relays. Configured Blossom servers are added as artifact fallbacks after URLs advertised by the NIP-94 event.
+## Bootstrap installation
 
-    cargo run -- hash ./hello.tar.gz
-    cargo run -- verify ./hello.npack.json
-    cargo run -- install ./hello.npack.json --store /tmp/npack-store
-    cargo run -- install ./hello.npack.json --user
-    cargo run -- list --store /tmp/npack-store
-    cargo run -- verify-installed --store /tmp/npack-store
-    cargo run -- release-event ./hello.npack.json --secret-key <32-byte-hex-key>
-    cargo run -- verify-event ./release.json ./hello.npack.json
-    cargo run -- revoke-event ./release.json --secret-key <32-byte-hex-key> --reason "security issue"
-    cargo run -- search hello --relay wss://relay.example
-    cargo run -- search hello --relay wss://relay.example --trusted-publisher <publisher-hex>
-    cargo run -- fetch <sha256> --server https://blossom.example --output ./artifact
-    cargo run -- fetch <sha256> --output ./artifact
-    cargo run -- publish ./hello.npack.json --secret-key <32-byte-hex-key> --relay wss://relay.example --server https://blossom.example
-    cargo run -- install-ref <publisher-hex>/hello --relay wss://relay.example --user
-    cargo run -- update <publisher-hex>/hello --relay wss://relay.example --user
-    cargo run -- update hello --relay wss://relay.example --trusted-publisher <publisher-hex>
-    cargo run -- update hello --relay wss://relay.example --lockfile ./npack.lock.json
-    cargo run -- update hello --relay wss://relay.example --lockfile ./npack.lock.json --locked
-    cargo run -- update hello --lockfile ./npack.lock.json --locked --offline
-    cargo run -- pack ./package-root --output ./hello-1.0.0.npk
-    cargo run -- remove <publisher-hex>/hello --store /tmp/npack-store
-    cargo run -- inspect ./package-root/bin/hello
+The first `npack` package is `npack` itself. A bootstrap binary can be built
+from source or downloaded from a GitHub Release. That binary installs future
+`.npk` releases, including updates to itself.
 
-Example manifest:
+System installation is the default and targets the host filesystem. It
+normally requires privilege and stores package state in `/var/lib/npack`.
+Use `--user` for the host's user-local prefix (`$HOME/.local`) and user-local
+state. Use `--store` for isolated development or test installations.
 
-    {
-      "publisher": "npub1example",
-      "name": "hello",
-      "version": "0.1.0",
-      "artifact": "hello.tar.gz",
-      "sha256": "<64 lowercase hexadecimal characters>",
-      "dependencies": [],
-      "conflicts": [],
-      "runtime_requires": ["libc.so.6"],
-      "provides": []
-    }
+## Common commands
 
-The canonical transport artifact is .npk: a tar archive compressed with zstd. The manifest is deliberately format-neutral. dependencies declare required packages and conflicts declare packages that cannot coexist. runtime_requires records discovered runtime capabilities such as ELF DT_NEEDED libraries, while provides records capabilities supplied by a package. Exact capabilities use names such as libc.so.6; versioned capabilities use forms such as libfoo-api >=2.0.0 and libfoo-api@2.4.1. Installation checks runtime_requires against installed provides or the host system’s OS, architecture, and standard shared-library directories before extraction. Declarative post_install actions support create-directory inside the selected install prefix and register-service for the selected systemd scope. Service registration requires --allow-capability service-manager and does not enable or start the service. Remote installation filters releases to the current OS and architecture, while any remains portable; among otherwise valid releases it selects the highest version, then uses event time and event ID as deterministic tie-breakers. The release-event command uses the official Rust Nostr library for event IDs, tags, key handling, and Schnorr signatures while preserving this local package lifecycle.
+```bash
+# Build and inspect an artifact
+npack pack ./package-root --output ./myapp-1.0.0.npk
+npack hash ./myapp-1.0.0.npk
+npack inspect ./myapp-1.0.0.npk
 
-The release-event command emits a signed v1 kind:9900 Nostr package-release event. The verify-event command validates the event signature and complete metadata against the package manifest. The revoke-event command emits a publisher-signed v1 kind:9901 revocation event; remote installation rejects releases revoked by their publisher. The search command queries configured relays and displays only cryptographically valid v1 release events. The fetch command retrieves a hash-addressed blob through nostr-blossom and verifies its SHA-256 before writing it. The pack command creates .npk archives, and installation safely extracts them into the selected host prefix. The inspect command reads ELF dependency metadata without executing the artifact. The verify-installed command audits recorded artifact hashes and installed payload paths. The install-ref command connects these pieces for a verified remote release, recursively installing dependencies before dependents and printing the resulting install order; `--lockfile` records the selected package versions, hashes, dependency and conflict declarations, runtime requirements, and provides in install order, while `--locked` requires the complete dependency graph, exact values, package set, and order on replay. The remove command deletes all installed versions for a publisher-qualified package reference. Publisher-qualified references constrain selection to a specific event author.
+# Install and inspect local packages
+npack install ./myapp.manifest.json --user
+npack list --user
+npack verify-installed --user
+npack remove <publisher>/myapp --user
 
-The publish command uploads a verified `.npk` through `nostr-blossom`, creates and publishes a signed NIP-94 `kind:1063` artifact event, then publishes the signed package-release event through `nostr-sdk`. It uses configured relays plus NIP-65 write relays when `--pubkey` is supplied. Remote installation also consults the publisher's verified Blossom `kind:10063` server list before configured storage fallbacks.
+# Create and verify signed release metadata
+npack release-event ./myapp.manifest.json --secret-key <secret-key>
+npack verify-event ./release.json ./myapp.manifest.json
+npack revoke-event ./release.json --secret-key <secret-key> \
+  --reason "security issue"
 
-The tag-driven GitHub Actions reference pipeline is documented in
-[`docs/github-actions.md`](docs/github-actions.md). It builds a deterministic
-`.npk`, emits SHA-256 and SPDX SBOM metadata, creates a GitHub provenance
-attestation, and publishes the bundle to Blossom and Nostr when the protected
-`release` environment has `NOSTR_SECRET_KEY`, `NOSTR_RELAYS`, and
-`NOSTR_BLOSSOM_SERVERS` configured. Use a dedicated publisher key rather than
-a personal primary identity.
+# Discover and install from Nostr
+npack search myapp --relay wss://relay.example
+npack install-ref <publisher>/myapp --relay wss://relay.example --user
+npack update <publisher>/myapp --relay wss://relay.example --user
 
-The reference release workflow derives `runtime_requires` for the first
-`npack` package from the built executable's ELF dependencies before publishing
-its manifest.
+# Publish an artifact and its Nostr events
+npack publish ./myapp.manifest.json \
+  --secret-key <secret-key> \
+  --relay wss://relay.example \
+  --server https://blossom.example
+```
 
-Offline locked replay is available with `--locked --offline`. Online installs cache the verified v1 release and NIP-94 events under the package state directory and reuse the verified artifact cache; offline replay requires those cache entries and never queries relays or Blossom servers. Delegated/offline release keys remain a separate future extension.
+Publisher keys can be supplied as user-facing `npub` values where a public
+key is accepted; internal comparisons use canonical hex keys.
+
+## Configuration
+
+Configuration is read from `npack/config.toml` in the platform's user config
+directory, normally `$XDG_CONFIG_HOME/npack/config.toml`:
+
+```toml
+[network]
+relays = ["wss://relay.example"]
+
+[storage]
+blossom = ["https://blossom.example"]
+
+[identity]
+pubkey = "npub1..."
+
+[trust]
+publishers = ["npub1..."]
+
+[install]
+user = false
+```
+
+When an identity is configured, `npack` reads the user's NIP-65 relay list
+and adds read-capable relays to discovery. For artifact retrieval it also
+checks the publisher's Blossom `kind:10063` server list before configured
+fallback servers.
+
+## Security model
+
+- Release events are publisher-signed Nostr `kind:9900` events.
+- Artifact metadata uses signed NIP-94 `kind:1063` events.
+- Artifact bytes are accepted only when their SHA-256 matches the release.
+- Revocations are signed `kind:9901` events and remain effective if relays
+  retain copies of the original release.
+- Dependencies and runtime capabilities are declared in signed metadata.
+- Post-install actions are declarative and capability-gated; services are
+  installed but not enabled or started automatically.
+- GitHub Actions uses a dedicated `NOSTR_SECRET_KEY` in a protected release
+  environment for the current publication prototype. Do not use a personal
+  primary Nostr identity key.
+
+## GitHub Releases
+
+The tag-driven workflow builds the first `npack` `.npk` package, extracts ELF
+runtime requirements, generates SHA-256 and SPDX metadata, creates a GitHub
+provenance attestation, and publishes the artifact and Nostr events when the
+protected release environment is configured.
+
+Required repository configuration is documented in
+[docs/github-actions.md](docs/github-actions.md).
+
+## License
+
+MIT
