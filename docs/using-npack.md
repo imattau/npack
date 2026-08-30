@@ -499,7 +499,13 @@ npack announce "npack is now available!"
 ```
 
 Use `--secret-key` for a one-off key override, or `--relay` to select relays
-explicitly.
+explicitly. To attach a signed package release event, pass its JSON file with
+`--release-event`. The command adds package name, version, platform, SHA-256,
+a `nostr:nevent...` link, and NIP-27-compatible event tags automatically:
+
+```bash
+npack announce --release-event ./release.json "npack 0.2.6 is available!"
+```
 
 Generate the installed command reference:
 

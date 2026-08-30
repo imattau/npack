@@ -233,7 +233,7 @@ enum Command {
     },
     /// Publish a signed Nostr text note
     Announce {
-        content: String,
+        content: Option<String>,
         #[arg(
             long,
             help = "Nostr secret key in nsec or 32-byte hexadecimal form; defaults to the registered key"
@@ -241,6 +241,11 @@ enum Command {
         secret_key: Option<String>,
         #[arg(long = "relay")]
         relays: Vec<String>,
+        #[arg(
+            long,
+            help = "Attach a signed kind:9900 package release event JSON file"
+        )]
+        release_event: Option<PathBuf>,
         #[arg(long, help = "Nostr pubkey whose NIP-65 write relays should be used")]
         pubkey: Option<String>,
     },
@@ -618,12 +623,14 @@ async fn main() -> Result<()> {
             content,
             secret_key,
             relays,
+            release_event,
             pubkey,
         } => {
             let secret_key = resolve_secret_key(secret_key.as_deref())?;
             let relays = configured_relays(relays, &config)?;
             publish_announcement(
-                &content,
+                content.as_deref(),
+                release_event.as_deref(),
                 &secret_key,
                 &relays,
                 pubkey.or_else(|| config.identity.pubkey.clone()).as_deref(),
@@ -2468,13 +2475,60 @@ async fn publish_release(
 }
 
 async fn publish_announcement(
-    content: &str,
+    content: Option<&str>,
+    release_event_path: Option<&Path>,
     secret_hex: &str,
     relays: &[String],
     user_pubkey: Option<&str>,
 ) -> Result<()> {
     let keys = Keys::parse(secret_hex).context("secret key must be hex or nsec")?;
-    let event = EventBuilder::new(Kind::TextNote, content).finalize(&keys)?;
+    let release = release_event_path
+        .map(|path| -> Result<Event> {
+            let event: Event = serde_json::from_slice(
+                &fs::read(path)
+                    .with_context(|| format!("reading release event {}", path.display()))?,
+            )?;
+            if event.kind.as_u16() != RELEASE_KIND || !release_event_is_v1(&event) {
+                bail!("release event is not a valid npack kind:{RELEASE_KIND} event");
+            }
+            event
+                .verify()
+                .context("release event has invalid signature")?;
+            Ok(event)
+        })
+        .transpose()?;
+    let (content, tags) = if let Some(release) = &release {
+        let package = tag_value(release, "name").context("release has no package name")?;
+        let version = tag_value(release, "version").context("release has no version")?;
+        let event_uri = release.to_nostr_uri()?;
+        let generated = format!(
+            "npack release {package} {version}\n\nPackage: {package}\nVersion: {version}\nOS: {}\nArchitecture: {}\nSHA-256: {}\n\nRelease event: {event_uri}",
+            tag_value(release, "os").unwrap_or("any"),
+            tag_value(release, "arch").unwrap_or("any"),
+            tag_value(release, "x").unwrap_or("unknown"),
+        );
+        let content = content.map(str::to_owned).unwrap_or(generated);
+        let tags = vec![
+            Tag::parse(vec![
+                "e".into(),
+                release.id.to_hex(),
+                "".into(),
+                "mention".into(),
+            ])?,
+            Tag::parse(vec![String::from("t"), String::from("npack")])?,
+            Tag::parse(vec![String::from("t"), package.to_owned()])?,
+        ];
+        (content, tags)
+    } else {
+        let content = content.context("announcement text or --release-event is required")?;
+        (
+            content.to_owned(),
+            vec![Tag::parse(vec![String::from("t"), String::from("npack")])?],
+        )
+    };
+    let event = EventBuilder::new(Kind::TextNote, content)
+        .tags(tags)
+        .finalize(&keys)?;
     let client = Client::default();
     for relay in relays {
         client.add_relay(relay).await?;

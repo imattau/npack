@@ -113,6 +113,9 @@ npack publish ./myapp.manifest.json \
 
 # Publish a signed Nostr announcement using the registered key
 npack announce "npack is now available!"
+
+# Announce a signed package release with a nostr:nevent link
+npack announce --release-event ./release.json "npack 0.2.6 is available!"
 ```
 
 Publisher keys can be supplied as user-facing `npub` values where a public
