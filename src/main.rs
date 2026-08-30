@@ -589,7 +589,10 @@ async fn main() -> Result<()> {
                 io::stdin().read_to_string(&mut secret_key)?;
                 secret_key.trim().to_owned()
             } else {
-                secret_key.context("provide a secret key or use --stdin")?
+                match secret_key {
+                    Some(secret_key) => secret_key,
+                    None => rpassword::prompt_password("Nostr secret key: ")?,
+                }
             };
             register_secret_key(&secret_key)?;
         }

@@ -341,10 +341,10 @@ Review package metadata and publisher identity before granting capabilities.
 ### Registering a publisher key
 
 Register a dedicated publisher key once in the operating system credential
-store:
+store. With no argument, npack prompts without echoing the key:
 
 ```bash
-npack register --stdin < publisher.nsec
+npack register
 ```
 
 The key is stored through the platform credential APIs: Secret Service on

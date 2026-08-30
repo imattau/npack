@@ -83,7 +83,7 @@ npack remove <publisher>/myapp --user
 npack verify ./myapp.manifest.json
 
 # Create and verify signed release metadata
-npack register --stdin < publisher.nsec
+npack register
 npack release-event ./myapp.manifest.json --secret-key <secret-key>
 npack verify-event ./release.json ./myapp.manifest.json
 npack revoke-event ./release.json --secret-key <secret-key> \
