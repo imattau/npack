@@ -1177,6 +1177,18 @@ async fn add_user_relays(client: &Client, user_pubkey: Option<&str>) -> Result<(
 }
 
 fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result<Manifest> {
+    for tag in event.tags.iter() {
+        let values = tag.clone().to_vec();
+        match tag.kind() {
+            "depends" | "conflicts" if values.len() != 3 && values.len() != 4 => {
+                bail!("invalid {} tag in release event", tag.kind());
+            }
+            "post-install" if values.len() != 3 => {
+                bail!("invalid post-install tag in release event");
+            }
+            _ => {}
+        }
+    }
     let dependency_tags = event.tags.iter().filter(|tag| tag.kind() == "depends");
     let dependencies = dependency_tags
         .filter_map(|tag| {
@@ -1223,14 +1235,14 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
         .filter(|tag| tag.kind() == "requires")
         .filter_map(Tag::content)
         .map(str::to_owned)
-        .collect();
+        .collect::<Vec<_>>();
     let provides = event
         .tags
         .iter()
         .filter(|tag| tag.kind() == "provides")
         .filter_map(Tag::content)
         .map(str::to_owned)
-        .collect();
+        .collect::<Vec<_>>();
     let post_install = event
         .tags
         .iter()
@@ -1245,6 +1257,8 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
         .collect();
     validate_dependency_declarations(&dependencies)?;
     validate_dependency_declarations(&conflicts)?;
+    validate_capability_declarations(&runtime_requires, "runtime requirement")?;
+    validate_capability_declarations(&provides, "provided capability")?;
     Ok(Manifest {
         publisher: event.pubkey.to_hex(),
         name: tag_value(event, "name")
@@ -2741,6 +2755,14 @@ mod tests {
         let mut changed_manifest = manifest.clone();
         changed_manifest.dependencies.clear();
         assert!(verify_release_event(&event, &changed_manifest).is_err());
+        let mut malformed = event.clone();
+        malformed.tags.push(Tag::parse(vec![
+            "depends".to_owned(),
+            "malformed".to_owned(),
+        ])?);
+        assert!(
+            manifest_from_release(&malformed, Path::new("artifact"), &manifest.sha256).is_err()
+        );
         Ok(())
     }
 
