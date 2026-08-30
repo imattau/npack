@@ -100,12 +100,11 @@ struct LockedPackage {
 
 #[derive(Subcommand)]
 enum Command {
-    Hash {
-        artifact: PathBuf,
-    },
-    Verify {
-        target: PathBuf,
-    },
+    /// Calculate the SHA-256 hash of a file.
+    Hash { artifact: PathBuf },
+    /// Verify a package archive or external manifest.
+    Verify { target: PathBuf },
+    /// Install a local .npk or resolve and install a package from Nostr.
     Install {
         target: String,
         #[arg(long)]
@@ -139,6 +138,7 @@ enum Command {
         #[arg(long, requires = "locked")]
         offline: bool,
     },
+    /// List installed packages.
     List {
         #[arg(long)]
         store: Option<PathBuf>,
@@ -155,6 +155,7 @@ enum Command {
         )]
         system: bool,
     },
+    /// Verify the files and metadata of installed packages.
     VerifyInstalled {
         #[arg(long)]
         store: Option<PathBuf>,
@@ -171,6 +172,7 @@ enum Command {
         )]
         system: bool,
     },
+    /// Create a signed Nostr package release event.
     ReleaseEvent {
         manifest: PathBuf,
         #[arg(
@@ -181,10 +183,9 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         created_at: u64,
     },
-    VerifyEvent {
-        event: PathBuf,
-        manifest: PathBuf,
-    },
+    /// Verify a signed release event against a package manifest.
+    VerifyEvent { event: PathBuf, manifest: PathBuf },
+    /// Create a signed revocation event for a package release.
     RevokeEvent {
         event: PathBuf,
         #[arg(
@@ -197,6 +198,7 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         created_at: u64,
     },
+    /// Search Nostr relays for available packages.
     Search {
         query: String,
         #[arg(long = "relay")]
@@ -210,6 +212,7 @@ enum Command {
         #[arg(long, help = "Do not read or write the local search cache")]
         no_cache: bool,
     },
+    /// Download an artifact by its SHA-256 hash.
     Fetch {
         sha256: String,
         #[arg(long)]
@@ -217,6 +220,7 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Upload an artifact and publish its package events.
     Publish {
         manifest: PathBuf,
         #[arg(
@@ -257,6 +261,7 @@ enum Command {
         )]
         show_secret: bool,
     },
+    /// Register a Nostr secret key in the OS credential store.
     Register {
         #[arg(
             help = "Nostr secret key in nsec or 32-byte hexadecimal form",
@@ -266,6 +271,7 @@ enum Command {
         #[arg(long, help = "Read the secret key from standard input")]
         stdin: bool,
     },
+    /// Create package metadata for a new project.
     Init {
         directory: PathBuf,
         #[arg(long)]
@@ -281,6 +287,7 @@ enum Command {
     },
     /// Render the complete command reference as a man page
     Man,
+    /// Install a package's latest available version, or update all packages.
     #[command(alias = "update")]
     InstallRef {
         package: Option<String>,
@@ -315,11 +322,13 @@ enum Command {
         #[arg(long = "allow-capability")]
         allowed_capabilities: Vec<String>,
     },
+    /// Build a deterministic .npk archive from a package directory.
     Pack {
         source: PathBuf,
         #[arg(long)]
         output: PathBuf,
     },
+    /// Remove an installed package.
     Remove {
         package: String,
         #[arg(long)]
@@ -337,9 +346,9 @@ enum Command {
         )]
         system: bool,
     },
-    Inspect {
-        artifact: PathBuf,
-    },
+    /// Display metadata embedded in an .npk archive.
+    Inspect { artifact: PathBuf },
+    /// Extract the embedded manifest from an .npk archive.
     Manifest {
         artifact: PathBuf,
         #[arg(long)]

@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH npack 1  "npack 0.2.7"
+.TH npack 1  "npack 0.2.8"
 .SH NAME
 npack \- A Nostr\-native package manager
 .SH SYNOPSIS
@@ -17,26 +17,37 @@ Print version
 .SH SUBCOMMANDS
 .TP
 npack\-hash(1)
+Calculate the SHA\-256 hash of a file
 .TP
 npack\-verify(1)
+Verify a package archive or external manifest
 .TP
 npack\-install(1)
+Install a local .npk or resolve and install a package from Nostr
 .TP
 npack\-list(1)
+List installed packages
 .TP
 npack\-verify\-installed(1)
+Verify the files and metadata of installed packages
 .TP
 npack\-release\-event(1)
+Create a signed Nostr package release event
 .TP
 npack\-verify\-event(1)
+Verify a signed release event against a package manifest
 .TP
 npack\-revoke\-event(1)
+Create a signed revocation event for a package release
 .TP
 npack\-search(1)
+Search Nostr relays for available packages
 .TP
 npack\-fetch(1)
+Download an artifact by its SHA\-256 hash
 .TP
 npack\-publish(1)
+Upload an artifact and publish its package events
 .TP
 npack\-announce(1)
 Publish a signed Nostr text note
@@ -45,23 +56,30 @@ npack\-generate\-key(1)
 Generate a new publisher key and register it in the OS credential store
 .TP
 npack\-register(1)
+Register a Nostr secret key in the OS credential store
 .TP
 npack\-init(1)
+Create package metadata for a new project
 .TP
 npack\-man(1)
 Render the complete command reference as a man page
 .TP
 npack\-install\-ref(1)
+Install a package\*(Aqs latest available version, or update all packages
 .TP
 npack\-pack(1)
+Build a deterministic .npk archive from a package directory
 .TP
 npack\-remove(1)
+Remove an installed package
 .TP
 npack\-inspect(1)
+Display metadata embedded in an .npk archive
 .TP
 npack\-manifest(1)
+Extract the embedded manifest from an .npk archive
 .TP
 npack\-help(1)
 Print this message or the help of the given subcommand(s)
 .SH VERSION
-v0.2.7
+v0.2.8
