@@ -8,7 +8,7 @@ npack is intended to manage the complete package lifecycle: discover signed rele
 
 The current prototype works entirely locally. It defines a package manifest, calculates SHA-256 hashes, verifies an artifact, checks declared dependencies, installs it into a versioned store, and records installed packages.
 
-System installation is the default and uses `/` as the payload prefix with package state in `/var/lib/npack`, so it normally requires privilege. Use `--user` to install payloads into `$HOME/.local`; user state remains in the user's local data directory. `--store` is available as an explicit development/test state and prefix override.
+System installation is the default and uses `/` as the payload prefix with package state in `/var/lib/npack`, so it normally requires privilege. Use `--user` to install payloads into `$HOME/.local`; user state remains in the user's local data directory. `--system` explicitly selects the system scope when configuration defaults to user scope. `--store` is available as an explicit development/test state and prefix override.
 
 Persistent defaults can be configured in `$XDG_CONFIG_HOME/npack/config.toml` (or the platform config directory):
 

@@ -87,22 +87,52 @@ enum Command {
         manifest: PathBuf,
         #[arg(long)]
         store: Option<PathBuf>,
-        #[arg(long, help = "Install into the current user's ~/.local prefix")]
+        #[arg(
+            long,
+            conflicts_with = "system",
+            help = "Install into the current user's ~/.local prefix"
+        )]
         user: bool,
+        #[arg(
+            long,
+            conflicts_with = "user",
+            help = "Install into the system prefix (the default)"
+        )]
+        system: bool,
         #[arg(long = "allow-capability")]
         allowed_capabilities: Vec<String>,
     },
     List {
         #[arg(long)]
         store: Option<PathBuf>,
-        #[arg(long, help = "List packages installed in the user's prefix")]
+        #[arg(
+            long,
+            conflicts_with = "system",
+            help = "List packages installed in the user's prefix"
+        )]
         user: bool,
+        #[arg(
+            long,
+            conflicts_with = "user",
+            help = "List packages installed in the system prefix"
+        )]
+        system: bool,
     },
     VerifyInstalled {
         #[arg(long)]
         store: Option<PathBuf>,
-        #[arg(long, help = "Verify packages installed in the user's prefix")]
+        #[arg(
+            long,
+            conflicts_with = "system",
+            help = "Verify packages installed in the user's prefix"
+        )]
         user: bool,
+        #[arg(
+            long,
+            conflicts_with = "user",
+            help = "Verify packages installed in the system prefix"
+        )]
+        system: bool,
     },
     ReleaseEvent {
         manifest: PathBuf,
@@ -147,8 +177,18 @@ enum Command {
         relays: Vec<String>,
         #[arg(long)]
         store: Option<PathBuf>,
-        #[arg(long, help = "Install into the current user's ~/.local prefix")]
+        #[arg(
+            long,
+            conflicts_with = "system",
+            help = "Install into the current user's ~/.local prefix"
+        )]
         user: bool,
+        #[arg(
+            long,
+            conflicts_with = "user",
+            help = "Install into the system prefix (the default)"
+        )]
+        system: bool,
         #[arg(long = "trusted-publisher")]
         trusted_publishers: Vec<String>,
         #[arg(long, help = "Nostr pubkey whose NIP-65 relay list should be used")]
@@ -169,8 +209,18 @@ enum Command {
         package: String,
         #[arg(long)]
         store: Option<PathBuf>,
-        #[arg(long, help = "Remove a package from the user's prefix")]
+        #[arg(
+            long,
+            conflicts_with = "system",
+            help = "Remove a package from the user's prefix"
+        )]
         user: bool,
+        #[arg(
+            long,
+            conflicts_with = "user",
+            help = "Remove a package from the system prefix"
+        )]
+        system: bool,
     },
     Inspect {
         artifact: PathBuf,
@@ -266,6 +316,7 @@ async fn main() -> Result<()> {
             manifest,
             store,
             user,
+            system,
             allowed_capabilities,
         } => {
             let package = load_manifest(&manifest)?;
@@ -274,7 +325,7 @@ async fn main() -> Result<()> {
                 &package,
                 &manifest,
                 store.as_deref(),
-                user || config.install.user,
+                user || (!system && config.install.user),
                 &allowed_capabilities,
             )?;
             println!(
@@ -282,14 +333,22 @@ async fn main() -> Result<()> {
                 installed.publisher, installed.name, installed.version
             );
         }
-        Command::List { store, user } => {
-            let user = user || config.install.user;
+        Command::List {
+            store,
+            user,
+            system,
+        } => {
+            let user = user || (!system && config.install.user);
             for package in installed_packages(Some(&install_paths(store.as_deref(), user).0))? {
                 println!("{}/{} {}", package.publisher, package.name, package.version);
             }
         }
-        Command::VerifyInstalled { store, user } => {
-            verify_installed(store.as_deref(), user || config.install.user)?;
+        Command::VerifyInstalled {
+            store,
+            user,
+            system,
+        } => {
+            verify_installed(store.as_deref(), user || (!system && config.install.user))?;
         }
         Command::ReleaseEvent {
             manifest,
@@ -368,6 +427,7 @@ async fn main() -> Result<()> {
             relays,
             store,
             user,
+            system,
             trusted_publishers,
             pubkey,
             lockfile,
@@ -396,7 +456,7 @@ async fn main() -> Result<()> {
                 publisher,
                 &relays,
                 store.as_deref(),
-                user || config.install.user,
+                user || (!system && config.install.user),
                 &trusted_publishers,
                 pubkey.as_deref(),
                 lockfile.as_deref(),
@@ -410,7 +470,12 @@ async fn main() -> Result<()> {
             package,
             store,
             user,
-        } => remove_package_at(&package, store.as_deref(), user || config.install.user)?,
+            system,
+        } => remove_package_at(
+            &package,
+            store.as_deref(),
+            user || (!system && config.install.user),
+        )?,
         Command::Inspect { artifact } => inspect_artifact(&artifact)?,
     }
     Ok(())
