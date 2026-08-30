@@ -485,14 +485,17 @@ fn install_remote_package<'a>(
         {
             return Ok(());
         }
-        if visiting.iter().any(|visiting_name| visiting_name == name) {
+        if visiting
+            .iter()
+            .any(|visiting_name| visiting_name == &install_key)
+        {
             bail!(
                 "dependency cycle detected: {} -> {}",
                 visiting.join(" -> "),
                 name
             );
         }
-        visiting.push(name.to_owned());
+        visiting.push(install_key.clone());
         let releases = client
             .fetch_events(Filter::new().kind(Kind::Custom(9900)).limit(500))
             .timeout(std::time::Duration::from_secs(10))
