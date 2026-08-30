@@ -48,6 +48,7 @@ When `identity.pubkey` is configured, npack reads the user's NIP-65 kind:10002 r
     cargo run -- update hello --relay wss://relay.example --trusted-publisher <publisher-hex>
     cargo run -- update hello --relay wss://relay.example --lockfile ./npack.lock.json
     cargo run -- update hello --relay wss://relay.example --lockfile ./npack.lock.json --locked
+    cargo run -- update hello --lockfile ./npack.lock.json --locked --offline
     cargo run -- pack ./package-root --output ./hello-1.0.0.npk
     cargo run -- remove <publisher-hex>/hello --store /tmp/npack-store
     cargo run -- inspect ./package-root/bin/hello
@@ -70,4 +71,4 @@ The canonical transport artifact is .npk: a tar archive compressed with zstd. Th
 
 The release-event command emits a signed v1 kind:9900 Nostr package-release event. The verify-event command validates the event signature and complete metadata against the package manifest. The revoke-event command emits a publisher-signed v1 kind:9901 revocation event; remote installation rejects releases revoked by their publisher. The search command queries configured relays and displays only cryptographically valid v1 release events. The fetch command retrieves a hash-addressed blob through nostr-blossom and verifies its SHA-256 before writing it. The pack command creates .npk archives, and installation safely extracts them into the selected host prefix. The inspect command reads ELF dependency metadata without executing the artifact. The verify-installed command audits recorded artifact hashes and installed payload paths. The install-ref command connects these pieces for a verified remote release, recursively installing dependencies before dependents and printing the resulting install order; `--lockfile` records the selected package versions, hashes, dependency and conflict declarations, runtime requirements, and provides in install order, while `--locked` requires the complete dependency graph, exact values, package set, and order on replay. The remove command deletes all installed versions for a publisher-qualified package reference. Publisher-qualified references constrain selection to a specific event author.
 
-The proposed offline publisher and delegated release-key model is documented in [`docs/release-key-model.md`](docs/release-key-model.md) and remains provisional pending protocol review.
+Offline locked replay is available with `--locked --offline`. Online installs cache the verified v1 release and NIP-94 events under the package state directory and reuse the verified artifact cache; offline replay requires those cache entries and never queries relays or Blossom servers. Delegated/offline release keys remain a separate future extension.

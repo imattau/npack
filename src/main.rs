@@ -215,6 +215,8 @@ enum Command {
         lockfile: Option<PathBuf>,
         #[arg(long, requires = "lockfile")]
         locked: bool,
+        #[arg(long, requires = "locked")]
+        offline: bool,
         #[arg(long = "allow-capability")]
         allowed_capabilities: Vec<String>,
     },
@@ -468,16 +470,21 @@ async fn main() -> Result<()> {
             pubkey,
             lockfile,
             locked,
+            offline,
             allowed_capabilities,
         } => {
-            let relays = configured_relays(relays, &config)?;
+            let relays = if offline {
+                Vec::new()
+            } else {
+                configured_relays(relays, &config)?
+            };
             let trusted_publishers = configured_publishers(trusted_publishers, &config)?;
             let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
-            let locked_packages = if locked {
+            let locked_packages = if locked || offline {
                 Some(load_lockfile(
                     lockfile
                         .as_deref()
-                        .context("--locked requires --lockfile")?,
+                        .context("--locked/--offline requires --lockfile")?,
                 )?)
             } else {
                 None
@@ -500,6 +507,7 @@ async fn main() -> Result<()> {
                     locked_packages: locked_packages.as_ref(),
                     blossom_servers: &config.storage.blossom,
                     allowed_capabilities: &allowed_capabilities,
+                    offline,
                 },
             )
             .await?
@@ -651,6 +659,7 @@ struct InstallRefOptions<'a> {
     locked_packages: Option<&'a Lockfile>,
     blossom_servers: &'a [String],
     allowed_capabilities: &'a [String],
+    offline: bool,
 }
 
 async fn install_ref(
@@ -668,13 +677,16 @@ async fn install_ref(
         locked_packages,
         blossom_servers,
         allowed_capabilities,
+        offline,
     } = options;
     let client = Client::default();
-    for relay in relays {
-        client.add_relay(relay).await?;
+    if !offline {
+        for relay in relays {
+            client.add_relay(relay).await?;
+        }
+        client.connect().await;
+        add_user_relays(&client, user_pubkey).await?;
     }
-    client.connect().await;
-    add_user_relays(&client, user_pubkey).await?;
     let (root, prefix) = install_paths(store, user);
     let mut state = ResolverState {
         client: &client,
@@ -688,9 +700,12 @@ async fn install_ref(
         visiting: Vec::new(),
         installed: Vec::new(),
         selected: HashMap::new(),
+        offline,
     };
     install_remote_package(&mut state, name.to_owned(), publisher, None).await?;
-    client.disconnect().await;
+    if !offline {
+        client.disconnect().await;
+    }
     if let Some(lockfile) = locked_packages {
         verify_locked_order(lockfile, &state.installed)?;
         verify_locked_install(lockfile, &root)?;
@@ -926,6 +941,81 @@ struct ResolverState<'a> {
     visiting: Vec<String>,
     installed: Vec<String>,
     selected: HashMap<String, Manifest>,
+    offline: bool,
+}
+
+fn cached_release_path(root: &Path, package: &LockedPackage) -> PathBuf {
+    root.join("metadata")
+        .join("releases")
+        .join(&package.publisher)
+        .join(&package.name)
+        .join(format!("{}-{}.json", package.version, package.sha256))
+}
+
+fn cache_release(root: &Path, event: &Event) -> Result<()> {
+    let name = tag_value(event, "name").context("release has no name")?;
+    validate_package_name(name, "release package name")?;
+    let version = tag_value(event, "version").context("release has no version")?;
+    let sha256 = tag_value(event, "x").context("release has no artifact hash")?;
+    let directory = root
+        .join("metadata")
+        .join("releases")
+        .join(event.pubkey.to_hex())
+        .join(name);
+    fs::create_dir_all(&directory)?;
+    fs::write(
+        directory.join(format!("{version}-{sha256}.json")),
+        serde_json::to_vec_pretty(event)?,
+    )?;
+    Ok(())
+}
+
+fn load_cached_release(root: &Path, package: &LockedPackage) -> Result<Event> {
+    let path = cached_release_path(root, package);
+    let event: Event = serde_json::from_slice(
+        &fs::read(&path).with_context(|| format!("reading cached release {}", path.display()))?,
+    )?;
+    event
+        .verify()
+        .context("cached release has invalid signature")?;
+    if !release_event_is_v1(&event)
+        || event.pubkey.to_hex() != package.publisher
+        || tag_value(&event, "name") != Some(package.name.as_str())
+        || tag_value(&event, "version") != Some(package.version.as_str())
+        || tag_value(&event, "x") != Some(package.sha256.as_str())
+    {
+        bail!("cached release does not match the lockfile");
+    }
+    Ok(event)
+}
+
+fn cached_artifact_path(root: &Path, event_id: &EventId) -> PathBuf {
+    root.join("metadata")
+        .join("artifacts")
+        .join(format!("{}.json", event_id.to_hex()))
+}
+
+fn cache_artifact(root: &Path, event: &Event) -> Result<()> {
+    let path = cached_artifact_path(root, &event.id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(event)?)?;
+    Ok(())
+}
+
+fn load_cached_artifact(root: &Path, event_id: EventId) -> Result<Event> {
+    let path = cached_artifact_path(root, &event_id);
+    let event: Event = serde_json::from_slice(
+        &fs::read(&path).with_context(|| format!("reading cached artifact {}", path.display()))?,
+    )?;
+    event
+        .verify()
+        .context("cached artifact has invalid signature")?;
+    if event.kind.as_u16() != 1063 {
+        bail!("cached artifact is not a NIP-94 event");
+    }
+    Ok(event)
 }
 
 fn install_remote_package<'a, 'b>(
@@ -1003,84 +1093,109 @@ fn install_remote_package<'a, 'b>(
             bail!("package {install_key} is not present in the lockfile");
         }
         state.visiting.push(install_key.clone());
-        let releases = state
-            .client
-            .fetch_events(Filter::new().kind(Kind::Custom(RELEASE_KIND)).limit(500))
-            .timeout(std::time::Duration::from_secs(10))
-            .await?;
-        let revoked = state
-            .client
-            .fetch_events(Filter::new().kind(Kind::Custom(REVOCATION_KIND)).limit(500))
-            .timeout(std::time::Duration::from_secs(10))
-            .await?
-            .into_iter()
-            .filter(|event| event.verify().is_ok())
-            .filter(revocation_event_is_v1)
-            .filter_map(|event| {
-                tag_value(&event, "e").map(|release| (event.pubkey.to_hex(), release.to_owned()))
-            })
-            .collect::<Vec<_>>();
-        let release = releases
-            .into_iter()
-            .filter(|event| event.verify().is_ok())
-            .filter(release_event_is_v1)
-            .filter(|event| {
-                state.trusted_publishers.is_empty()
-                    || state
-                        .trusted_publishers
-                        .iter()
-                        .any(|trusted| trusted == &event.pubkey.to_hex())
-            })
-            .filter(|event| {
-                !revoked.iter().any(|(publisher, release_id)| {
-                    publisher == &event.pubkey.to_hex() && release_id == &event.id.to_hex()
+        let release = if state.offline {
+            let package = locked_package.context("offline installs require a lockfile")?;
+            let release = load_cached_release(state.root, package)?;
+            if let Some(requirement) = &requirement {
+                let requirement = VersionReq::parse(requirement)?;
+                let version = Version::parse(
+                    tag_value(&release, "version").context("cached release has no version")?,
+                )?;
+                if !requirement.matches(&version) {
+                    bail!("cached release does not satisfy requirement {requirement}");
+                }
+            }
+            release
+        } else {
+            let releases = state
+                .client
+                .fetch_events(Filter::new().kind(Kind::Custom(RELEASE_KIND)).limit(500))
+                .timeout(std::time::Duration::from_secs(10))
+                .await?;
+            let revoked = state
+                .client
+                .fetch_events(Filter::new().kind(Kind::Custom(REVOCATION_KIND)).limit(500))
+                .timeout(std::time::Duration::from_secs(10))
+                .await?
+                .into_iter()
+                .filter(|event| event.verify().is_ok())
+                .filter(revocation_event_is_v1)
+                .filter_map(|event| {
+                    tag_value(&event, "e")
+                        .map(|release| (event.pubkey.to_hex(), release.to_owned()))
                 })
-            })
-            .filter(|event| tag_value(event, "name") == Some(name.as_str()))
-            .filter(release_matches_host)
-            .filter(|event| {
-                publisher
-                    .as_deref()
-                    .is_none_or(|publisher| event.pubkey.to_hex() == publisher)
-            })
-            .filter(|event| {
-                locked_package.is_none_or(|package| {
-                    event.pubkey.to_hex() == package.publisher
-                        && tag_value(event, "version") == Some(package.version.as_str())
-                        && tag_value(event, "x") == Some(package.sha256.as_str())
+                .collect::<Vec<_>>();
+            releases
+                .into_iter()
+                .filter(|event| event.verify().is_ok())
+                .filter(release_event_is_v1)
+                .filter(|event| {
+                    state.trusted_publishers.is_empty()
+                        || state
+                            .trusted_publishers
+                            .iter()
+                            .any(|trusted| trusted == &event.pubkey.to_hex())
                 })
-            })
-            .filter(|event| {
-                requirement.as_deref().is_none_or(|req| {
-                    VersionReq::parse(req)
-                        .ok()
-                        .zip(tag_value(event, "version").and_then(|v| Version::parse(v).ok()))
-                        .map(|(req, version)| req.matches(&version))
-                        .unwrap_or(false)
+                .filter(|event| {
+                    !revoked.iter().any(|(publisher, release_id)| {
+                        publisher == &event.pubkey.to_hex() && release_id == &event.id.to_hex()
+                    })
                 })
-            })
-            .max_by_key(|event| {
-                (
-                    tag_value(event, "version")
-                        .and_then(|v| Version::parse(v).ok())
-                        .unwrap_or_else(|| Version::new(0, 0, 0)),
-                    event.created_at.as_secs(),
-                    event.id.to_hex(),
-                )
-            })
-            .with_context(|| format!("no verified release found for {name}"))?;
+                .filter(|event| tag_value(event, "name") == Some(name.as_str()))
+                .filter(release_matches_host)
+                .filter(|event| {
+                    publisher
+                        .as_deref()
+                        .is_none_or(|publisher| event.pubkey.to_hex() == publisher)
+                })
+                .filter(|event| {
+                    locked_package.is_none_or(|package| {
+                        event.pubkey.to_hex() == package.publisher
+                            && tag_value(event, "version") == Some(package.version.as_str())
+                            && tag_value(event, "x") == Some(package.sha256.as_str())
+                    })
+                })
+                .filter(|event| {
+                    requirement.as_deref().is_none_or(|req| {
+                        VersionReq::parse(req)
+                            .ok()
+                            .zip(tag_value(event, "version").and_then(|v| Version::parse(v).ok()))
+                            .map(|(req, version)| req.matches(&version))
+                            .unwrap_or(false)
+                    })
+                })
+                .max_by_key(|event| {
+                    (
+                        tag_value(event, "version")
+                            .and_then(|v| Version::parse(v).ok())
+                            .unwrap_or_else(|| Version::new(0, 0, 0)),
+                        event.created_at.as_secs(),
+                        event.id.to_hex(),
+                    )
+                })
+                .with_context(|| format!("no verified release found for {name}"))?
+        };
+        if !state.offline {
+            cache_release(state.root, &release)?;
+        }
         let artifact_event_id = tag_value(&release, "artifact")
             .context("release has no artifact event")?
             .parse::<EventId>()?;
-        let artifact_events = state
-            .client
-            .fetch_events(Filter::new().kind(Kind::Custom(1063)).id(artifact_event_id))
-            .timeout(std::time::Duration::from_secs(10))
-            .await?;
-        let artifact_event = artifact_events
-            .into_iter()
-            .find(|event| event.verify().is_ok())
-            .context("no verified NIP-94 artifact event found")?;
+        let artifact_event = if state.offline {
+            load_cached_artifact(state.root, artifact_event_id)?
+        } else {
+            let artifact_events = state
+                .client
+                .fetch_events(Filter::new().kind(Kind::Custom(1063)).id(artifact_event_id))
+                .timeout(std::time::Duration::from_secs(10))
+                .await?;
+            let artifact_event = artifact_events
+                .into_iter()
+                .find(|event| event.verify().is_ok())
+                .context("no verified NIP-94 artifact event found")?;
+            cache_artifact(state.root, &artifact_event)?;
+            artifact_event
+        };
         if artifact_event.pubkey != release.pubkey {
             bail!("release and artifact event publishers do not match");
         }
@@ -1093,6 +1208,9 @@ fn install_remote_package<'a, 'b>(
         fs::create_dir_all(&staging)?;
         let artifact_path = staging.join("artifact");
         if !artifact_path.exists() {
+            if state.offline {
+                bail!("offline artifact cache is missing for SHA-256 {sha256}");
+            }
             let mut urls = artifact_event
                 .tags
                 .iter()
@@ -2857,6 +2975,22 @@ mod tests {
         assert!(event.verify().is_ok());
         assert!(serde_json::to_string(&event.tags)?.contains("libfoo"));
         verify_release_event(&event, &manifest)?;
+        let cache_root = tempdir()?;
+        cache_release(cache_root.path(), &event)?;
+        let locked = LockedPackage {
+            publisher: event.pubkey.to_hex(),
+            name: manifest.name.clone(),
+            version: manifest.version.clone(),
+            sha256: manifest.sha256.clone(),
+            dependencies: manifest.dependencies.clone(),
+            conflicts: vec![],
+            runtime_requires: vec![],
+            provides: vec![],
+        };
+        assert_eq!(
+            load_cached_release(cache_root.path(), &locked)?.id,
+            event.id
+        );
         let mut changed_manifest = manifest.clone();
         changed_manifest.dependencies.clear();
         assert!(verify_release_event(&event, &changed_manifest).is_err());
