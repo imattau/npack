@@ -105,7 +105,7 @@ enum Command {
         manifest: PathBuf,
     },
     Install {
-        manifest: PathBuf,
+        target: String,
         #[arg(long)]
         store: Option<PathBuf>,
         #[arg(
@@ -122,6 +122,18 @@ enum Command {
         system: bool,
         #[arg(long = "allow-capability")]
         allowed_capabilities: Vec<String>,
+        #[arg(long = "relay")]
+        relays: Vec<String>,
+        #[arg(long = "trusted-publisher")]
+        trusted_publishers: Vec<String>,
+        #[arg(long, help = "Nostr pubkey whose NIP-65 relay list should be used")]
+        pubkey: Option<String>,
+        #[arg(long, help = "Write the resolved dependency graph to a lockfile")]
+        lockfile: Option<PathBuf>,
+        #[arg(long, requires = "lockfile")]
+        locked: bool,
+        #[arg(long, requires = "locked")]
+        offline: bool,
     },
     List {
         #[arg(long)]
@@ -349,31 +361,56 @@ async fn main() -> Result<()> {
             );
         }
         Command::Install {
-            manifest,
+            target,
             store,
             user,
             system,
             allowed_capabilities,
+            relays,
+            trusted_publishers,
+            pubkey,
+            lockfile,
+            locked,
+            offline,
         } => {
-            let package = if manifest.extension().and_then(|ext| ext.to_str()) == Some("npk") {
-                load_embedded_manifest(&manifest)?
+            let path = Path::new(&target);
+            if path.exists() {
+                let package = if path.extension().and_then(|ext| ext.to_str()) == Some("npk") {
+                    load_embedded_manifest(path)?
+                } else {
+                    load_manifest(path)?
+                };
+                verify_manifest(&package, path)?;
+                let installed = install_with_capabilities(
+                    &package,
+                    path,
+                    store.as_deref(),
+                    user || (!system && config.install.user),
+                    &allowed_capabilities,
+                )?;
+                println!(
+                    "installed {}/{} {}",
+                    display_publisher(&installed.publisher),
+                    installed.name,
+                    installed.version
+                );
             } else {
-                load_manifest(&manifest)?
-            };
-            verify_manifest(&package, &manifest)?;
-            let installed = install_with_capabilities(
-                &package,
-                &manifest,
-                store.as_deref(),
-                user || (!system && config.install.user),
-                &allowed_capabilities,
-            )?;
-            println!(
-                "installed {}/{} {}",
-                display_publisher(&installed.publisher),
-                installed.name,
-                installed.version
-            );
+                install_remote_command(
+                    &target,
+                    relays,
+                    store,
+                    user,
+                    system,
+                    trusted_publishers,
+                    pubkey,
+                    lockfile,
+                    locked,
+                    offline,
+                    allowed_capabilities,
+                    &config,
+                )
+                .await?;
+            }
         }
         Command::List {
             store,
@@ -509,42 +546,19 @@ async fn main() -> Result<()> {
             offline,
             allowed_capabilities,
         } => {
-            let relays = if offline {
-                Vec::new()
-            } else {
-                configured_relays(relays, &config)?
-            };
-            let trusted_publishers = configured_publishers(trusted_publishers, &config)?;
-            let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
-            let locked_packages = if locked || offline {
-                Some(load_lockfile(
-                    lockfile
-                        .as_deref()
-                        .context("--locked/--offline requires --lockfile")?,
-                )?)
-            } else {
-                None
-            };
-            let (publisher, name) = package
-                .split_once('/')
-                .map_or((None, package.as_str()), |(p, n)| {
-                    (Some(normalize_publisher_reference(p)), n)
-                });
-            install_ref(
-                name,
-                publisher,
-                InstallRefOptions {
-                    relays: &relays,
-                    store: store.as_deref(),
-                    user: user || (!system && config.install.user),
-                    trusted_publishers: &trusted_publishers,
-                    user_pubkey: pubkey.as_deref(),
-                    lockfile: lockfile.as_deref(),
-                    locked_packages: locked_packages.as_ref(),
-                    blossom_servers: &config.storage.blossom,
-                    allowed_capabilities: &allowed_capabilities,
-                    offline,
-                },
+            install_remote_command(
+                &package,
+                relays,
+                store,
+                user,
+                system,
+                trusted_publishers,
+                pubkey,
+                lockfile,
+                locked,
+                offline,
+                allowed_capabilities,
+                &config,
             )
             .await?
         }
@@ -562,6 +576,60 @@ async fn main() -> Result<()> {
         Command::Inspect { artifact } => inspect_artifact(&artifact)?,
     }
     Ok(())
+}
+
+async fn install_remote_command(
+    package: &str,
+    relays: Vec<String>,
+    store: Option<PathBuf>,
+    user: bool,
+    system: bool,
+    trusted_publishers: Vec<String>,
+    pubkey: Option<String>,
+    lockfile: Option<PathBuf>,
+    locked: bool,
+    offline: bool,
+    allowed_capabilities: Vec<String>,
+    config: &Config,
+) -> Result<()> {
+    let relays = if offline {
+        Vec::new()
+    } else {
+        configured_relays(relays, config)?
+    };
+    let trusted_publishers = configured_publishers(trusted_publishers, config)?;
+    let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
+    let locked_packages = if locked || offline {
+        Some(load_lockfile(
+            lockfile
+                .as_deref()
+                .context("--locked/--offline requires --lockfile")?,
+        )?)
+    } else {
+        None
+    };
+    let (publisher, name) = package
+        .split_once('/')
+        .map_or((None, package), |(publisher, name)| {
+            (Some(normalize_publisher_reference(publisher)), name)
+        });
+    install_ref(
+        name,
+        publisher,
+        InstallRefOptions {
+            relays: &relays,
+            store: store.as_deref(),
+            user: user || (!system && config.install.user),
+            trusted_publishers: &trusted_publishers,
+            user_pubkey: pubkey.as_deref(),
+            lockfile: lockfile.as_deref(),
+            locked_packages: locked_packages.as_ref(),
+            blossom_servers: &config.storage.blossom,
+            allowed_capabilities: &allowed_capabilities,
+            offline,
+        },
+    )
+    .await
 }
 
 fn inspect_artifact(path: &Path) -> Result<()> {

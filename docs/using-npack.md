@@ -188,7 +188,7 @@ The resolver:
 Write a lockfile for repeatable deployments:
 
 ```bash
-npack install-ref npub1.../myapp \
+npack install npub1.../myapp \
   --relay wss://relay.example \
   --lockfile npack.lock
 ```
@@ -214,12 +214,13 @@ npack search myapp --relay wss://relay.example
 Install a publisher-qualified package:
 
 ```bash
-npack install-ref npub1.../myapp \
+npack install npub1.../myapp \
   --relay wss://relay.example \
   --user
 ```
 
-The remote installation process is:
+`install-ref` remains accepted as a compatibility alias for scripts using the
+older command name. The remote installation process is:
 
 1. Query relays for signed `kind:9900` release events.
 2. Verify the Nostr signature and release fields.
@@ -422,7 +423,8 @@ OS and architecture.
 npack pack <directory> --output <file.npk>
 npack install <file.npk> [--user|--system|--store <path>]
 npack search <query> [--relay <url>]
-npack install-ref <publisher>/<name> [options]
+npack install <publisher>/<name> [options]
+npack install-ref <publisher>/<name> [options]  # compatibility alias
 npack update <publisher>/<name> [options]
 npack list [--user|--system]
 npack verify-installed [--user|--system]

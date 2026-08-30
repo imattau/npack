@@ -87,7 +87,7 @@ npack revoke-event ./release.json --secret-key <secret-key> \
 
 # Discover and install from Nostr
 npack search myapp --relay wss://relay.example
-npack install-ref <publisher>/myapp --relay wss://relay.example --user
+npack install <publisher>/myapp --relay wss://relay.example --user
 npack update <publisher>/myapp --relay wss://relay.example --user
 
 # Publish an artifact and its Nostr events
