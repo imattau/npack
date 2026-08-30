@@ -16,6 +16,7 @@ The current prototype works entirely locally. It defines a package manifest, cal
     cargo run -- verify-event ./release.json ./hello.npack.json
     cargo run -- search hello --relay wss://relay.example
     cargo run -- fetch <sha256> --server https://blossom.example --output ./artifact
+    cargo run -- install-ref hello --relay wss://relay.example --store /tmp/npack-store
 
 Example manifest:
 
@@ -30,4 +31,4 @@ Example manifest:
 
 The manifest is deliberately format-neutral. The release-event command uses the official Rust Nostr library for event IDs, tags, key handling, and Schnorr signatures while preserving this local package lifecycle.
 
-The release-event command emits a signed, provisional kind:9900 Nostr package-release event. The verify-event command validates the event signature and checks it against the package manifest. The search command queries configured relays and displays only cryptographically valid release events. The fetch command retrieves a hash-addressed blob through nostr-blossom and verifies its SHA-256 before writing it.
+The release-event command emits a signed, provisional kind:9900 Nostr package-release event. The verify-event command validates the event signature and checks it against the package manifest. The search command queries configured relays and displays only cryptographically valid release events. The fetch command retrieves a hash-addressed blob through nostr-blossom and verifies its SHA-256 before writing it. The install-ref command connects these pieces for a verified remote release.

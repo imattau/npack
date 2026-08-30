@@ -59,6 +59,13 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    InstallRef {
+        name: String,
+        #[arg(long = "relay", required = true)]
+        relays: Vec<String>,
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -176,6 +183,11 @@ async fn main() -> Result<()> {
             server,
             output,
         } => fetch_blob(&sha256, &server, &output).await?,
+        Command::InstallRef {
+            name,
+            relays,
+            store,
+        } => install_ref(&name, &relays, store.as_deref()).await?,
     }
     Ok(())
 }
@@ -196,6 +208,113 @@ async fn fetch_blob(sha256: &str, server: &str, output: &Path) -> Result<()> {
     fs::write(output, &bytes).with_context(|| format!("writing {}", output.display()))?;
     println!("fetched {} bytes to {}", bytes.len(), output.display());
     Ok(())
+}
+
+async fn install_ref(name: &str, relays: &[String], store: Option<&Path>) -> Result<()> {
+    let client = Client::default();
+    for relay in relays {
+        client.add_relay(relay).await?;
+    }
+    client.connect().await;
+    let releases = client
+        .fetch_events(Filter::new().kind(Kind::Custom(9900)).limit(500))
+        .timeout(std::time::Duration::from_secs(10))
+        .await?;
+    let release = releases
+        .into_iter()
+        .filter(|event| event.verify().is_ok())
+        .filter(|event| tag_value(event, "name") == Some(name))
+        .max_by_key(|event| {
+            tag_value(event, "version")
+                .and_then(|version| Version::parse(version).ok())
+                .unwrap_or_else(|| Version::new(0, 0, 0))
+        })
+        .context("no verified release found")?;
+    let artifact_event_id = tag_value(&release, "artifact")
+        .context("release has no artifact event")?
+        .parse::<EventId>()?;
+    let artifact_events = client
+        .fetch_events(Filter::new().kind(Kind::Custom(1063)).id(artifact_event_id))
+        .timeout(std::time::Duration::from_secs(10))
+        .await?;
+    let artifact_event = artifact_events
+        .into_iter()
+        .find(|event| event.verify().is_ok())
+        .context("no verified NIP-94 artifact event found")?;
+    if artifact_event.pubkey != release.pubkey {
+        bail!("release and artifact event publishers do not match");
+    }
+    let sha256 = tag_value(&release, "x").context("release has no artifact hash")?;
+    if tag_value(&artifact_event, "x") != Some(sha256) {
+        bail!("release and artifact event hashes do not match");
+    }
+    let url = tag_value(&artifact_event, "url").context("artifact event has no URL")?;
+    let mut server_url = Url::parse(url)?;
+    server_url.set_path("/");
+    server_url.set_query(None);
+    server_url.set_fragment(None);
+    let expected: Sha256Hash = sha256.parse()?;
+    let bytes = BlossomClient::new(server_url)
+        .get_blob::<Keys>(expected, None, None, None)
+        .await?;
+    if Sha256Hash::hash(&bytes) != expected {
+        bail!("downloaded artifact hash does not match release");
+    }
+    let root = store.map(Path::to_path_buf).unwrap_or_else(default_store);
+    let staging = root.join("downloads").join(sha256);
+    fs::create_dir_all(&staging)?;
+    let artifact_path = staging.join("artifact");
+    fs::write(&artifact_path, bytes)?;
+    let manifest = manifest_from_release(&release, &artifact_path, sha256)?;
+    install(&manifest, &staging.join("manifest.json"), Some(&root))?;
+    client.disconnect().await;
+    println!(
+        "installed {}/{} {}",
+        release.pubkey, manifest.name, manifest.version
+    );
+    Ok(())
+}
+
+fn tag_value<'a>(event: &'a Event, kind: &str) -> Option<&'a str> {
+    event
+        .tags
+        .iter()
+        .find(|tag| tag.kind() == kind)
+        .and_then(Tag::content)
+}
+
+fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result<Manifest> {
+    let dependency_tags = event.tags.iter().filter(|tag| tag.kind() == "depends");
+    let dependencies = dependency_tags
+        .filter_map(|tag| {
+            let values = tag.clone().to_vec();
+            (values.len() >= 3).then(|| Dependency {
+                name: values[1].clone(),
+                requirement: values[2].clone(),
+            })
+        })
+        .collect();
+    Ok(Manifest {
+        publisher: event.pubkey.to_hex(),
+        name: tag_value(event, "name")
+            .context("release has no name")?
+            .into(),
+        version: tag_value(event, "version")
+            .context("release has no version")?
+            .into(),
+        artifact: artifact
+            .file_name()
+            .context("artifact has no filename")?
+            .into(),
+        sha256: sha256.into(),
+        dependencies,
+        artifact_event: tag_value(event, "artifact").map(str::to_owned),
+        repo: tag_value(event, "repo").map(str::to_owned),
+        commit: tag_value(event, "commit").map(str::to_owned),
+        os: tag_value(event, "os").unwrap_or("any").into(),
+        arch: tag_value(event, "arch").unwrap_or("any").into(),
+        format: tag_value(event, "format").unwrap_or("opaque").into(),
+    })
 }
 
 async fn search_releases(query: &str, relays: &[String]) -> Result<()> {
