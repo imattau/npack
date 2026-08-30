@@ -726,6 +726,7 @@ fn load_lockfile(path: &Path) -> Result<Lockfile> {
             .with_context(|| format!("invalid lockfile publisher: {}", package.publisher))?;
         Version::parse(&package.version)
             .with_context(|| format!("invalid lockfile version: {}", package.version))?;
+        validate_package_name(&package.name, "lockfile package name")?;
         if package.sha256.len() != 64 || !package.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
             bail!(
                 "invalid lockfile SHA-256 for {}/{}",
@@ -754,6 +755,10 @@ fn load_lockfile(path: &Path) -> Result<Lockfile> {
             VersionReq::parse(&dependency.requirement)
                 .with_context(|| format!("invalid lockfile requirement for {}", dependency.name))?;
         }
+        validate_dependency_declarations(&package.dependencies)?;
+        validate_dependency_declarations(&package.conflicts)?;
+        validate_capability_declarations(&package.runtime_requires, "runtime requirement")?;
+        validate_capability_declarations(&package.provides, "provided capability")?;
     }
     validate_lockfile_graph(&lockfile)?;
     Ok(lockfile)
@@ -1475,19 +1480,27 @@ fn load_manifest(path: &Path) -> Result<Manifest> {
     }
     validate_dependency_declarations(&manifest.dependencies)?;
     validate_dependency_declarations(&manifest.conflicts)?;
+    validate_capability_declarations(&manifest.runtime_requires, "runtime requirement")?;
+    validate_capability_declarations(&manifest.provides, "provided capability")?;
     Ok(manifest)
+}
+
+fn validate_package_name(name: &str, label: &str) -> Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.chars().any(char::is_control)
+    {
+        bail!("{label} must be a single safe path component");
+    }
+    Ok(())
 }
 
 fn validate_dependency_declarations(dependencies: &[Dependency]) -> Result<()> {
     for dependency in dependencies {
-        if dependency.name.is_empty()
-            || dependency.name.contains('/')
-            || dependency.name.contains('\\')
-            || dependency.name == "."
-            || dependency.name == ".."
-        {
-            bail!("dependency name must be a single safe path component");
-        }
+        validate_package_name(&dependency.name, "dependency name")?;
         if let Some(publisher) = &dependency.publisher {
             if publisher.is_empty()
                 || publisher.contains('/')
@@ -1504,6 +1517,15 @@ fn validate_dependency_declarations(dependencies: &[Dependency]) -> Result<()> {
                 dependency.name, dependency.requirement
             )
         })?;
+    }
+    Ok(())
+}
+
+fn validate_capability_declarations(capabilities: &[String], label: &str) -> Result<()> {
+    for capability in capabilities {
+        if capability.trim().is_empty() || capability.chars().any(char::is_control) {
+            bail!("{label} must not be empty or contain control characters");
+        }
     }
     Ok(())
 }
