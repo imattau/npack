@@ -1242,4 +1242,27 @@ mod tests {
         ));
         assert!(capability_satisfies("libfoo.so.2", "libfoo.so.2"));
     }
+
+    #[test]
+    fn post_install_actions_are_scoped() -> Result<()> {
+        let dir = tempdir()?;
+        run_post_install(
+            &[PostInstallAction {
+                action: "create-directory".into(),
+                path: "var/cache".into(),
+            }],
+            dir.path(),
+        )?;
+        assert!(dir.path().join("var/cache").is_dir());
+        let error = run_post_install(
+            &[PostInstallAction {
+                action: "create-directory".into(),
+                path: "../escape".into(),
+            }],
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unsafe post-install path"));
+        Ok(())
+    }
 }
