@@ -17,6 +17,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+const RELEASE_KIND: u16 = 9900;
+const REVOCATION_KIND: u16 = 9901;
+const PROTOCOL_VERSION: &str = "1";
+
 #[derive(Parser)]
 #[command(name = "npack", version, about = "A Nostr-native package manager")]
 struct Cli {
@@ -965,15 +969,16 @@ fn install_remote_package<'a>(
         }
         visiting.push(install_key.clone());
         let releases = client
-            .fetch_events(Filter::new().kind(Kind::Custom(9900)).limit(500))
+            .fetch_events(Filter::new().kind(Kind::Custom(RELEASE_KIND)).limit(500))
             .timeout(std::time::Duration::from_secs(10))
             .await?;
         let revoked = client
-            .fetch_events(Filter::new().kind(Kind::Custom(9901)).limit(500))
+            .fetch_events(Filter::new().kind(Kind::Custom(REVOCATION_KIND)).limit(500))
             .timeout(std::time::Duration::from_secs(10))
             .await?
             .into_iter()
             .filter(|event| event.verify().is_ok())
+            .filter(revocation_event_is_v1)
             .filter_map(|event| {
                 tag_value(&event, "e").map(|release| (event.pubkey.to_hex(), release.to_owned()))
             })
@@ -981,6 +986,7 @@ fn install_remote_package<'a>(
         let release = releases
             .into_iter()
             .filter(|event| event.verify().is_ok())
+            .filter(release_event_is_v1)
             .filter(|event| {
                 trusted_publishers.is_empty()
                     || trusted_publishers
@@ -1304,18 +1310,19 @@ async fn search_releases(
     }
     client.connect().await;
     add_user_relays(&client, user_pubkey).await?;
-    let filter = Filter::new().kind(Kind::Custom(9900)).limit(500);
+    let filter = Filter::new().kind(Kind::Custom(RELEASE_KIND)).limit(500);
     let events = client
         .fetch_events(filter)
         .timeout(std::time::Duration::from_secs(10))
         .await
         .context("querying Nostr relays")?;
     let revoked = client
-        .fetch_events(Filter::new().kind(Kind::Custom(9901)).limit(500))
+        .fetch_events(Filter::new().kind(Kind::Custom(REVOCATION_KIND)).limit(500))
         .timeout(std::time::Duration::from_secs(10))
         .await?
         .into_iter()
         .filter(|event| event.verify().is_ok())
+        .filter(revocation_event_is_v1)
         .filter_map(|event| {
             tag_value(&event, "e").map(|release| (event.pubkey.to_hex(), release.to_owned()))
         })
@@ -1341,7 +1348,7 @@ async fn search_releases(
                     .map(|name| name.to_ascii_lowercase().contains(&query))
                     .unwrap_or(false)
         });
-        if matches && event.verify().is_ok() {
+        if matches && event.verify().is_ok() && release_event_is_v1(&event) {
             println!(
                 "{} {} {}",
                 event.id,
@@ -1355,8 +1362,11 @@ async fn search_releases(
 }
 
 fn verify_release_event(event: &Event, manifest: &Manifest) -> Result<()> {
-    if event.kind.as_u16() != 9900 {
-        bail!("expected npack release event kind 9900, got {}", event.kind);
+    if event.kind.as_u16() != RELEASE_KIND {
+        bail!(
+            "expected npack release event kind {RELEASE_KIND}, got {}",
+            event.kind
+        );
     }
     event
         .verify()
@@ -1366,13 +1376,24 @@ fn verify_release_event(event: &Event, manifest: &Manifest) -> Result<()> {
     {
         bail!("release event signer does not match manifest publisher");
     }
+    let expected_artifact = manifest
+        .artifact_event
+        .as_deref()
+        .context("release manifests must include an artifact event")?;
+    let expected_d = format!("{}/{}/{}", manifest.name, manifest.version, manifest.arch);
+    let actual_d = tag_value(event, "d").context("release event is missing d tag")?;
+    if actual_d != expected_d {
+        bail!("release event d mismatch: expected {expected_d}, got {actual_d}");
+    }
     for (kind, expected) in [
+        ("v", PROTOCOL_VERSION),
         ("name", manifest.name.as_str()),
         ("version", manifest.version.as_str()),
         ("os", manifest.os.as_str()),
         ("arch", manifest.arch.as_str()),
         ("format", manifest.format.as_str()),
         ("x", manifest.sha256.to_ascii_lowercase().as_str()),
+        ("artifact", expected_artifact),
     ] {
         let actual = event
             .tags
@@ -1399,6 +1420,23 @@ fn verify_release_event(event: &Event, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+fn release_event_is_v1(event: &Event) -> bool {
+    event.kind.as_u16() == RELEASE_KIND
+        && tag_value(event, "v") == Some(PROTOCOL_VERSION)
+        && [
+            "d", "name", "version", "os", "arch", "format", "x", "artifact",
+        ]
+        .iter()
+        .all(|kind| tag_value(event, kind).is_some())
+}
+
+fn revocation_event_is_v1(event: &Event) -> bool {
+    event.kind.as_u16() == REVOCATION_KIND
+        && ["v", "e", "name", "version", "x", "reason"]
+            .iter()
+            .all(|kind| tag_value(event, kind).is_some())
+}
+
 fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) -> Result<Event> {
     let keys = Keys::parse(secret_hex).context("secret key must be hex or nsec")?;
     if let Ok(publisher) = PublicKey::parse(&manifest.publisher)
@@ -1406,11 +1444,16 @@ fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) ->
     {
         bail!("release signer does not match manifest publisher");
     }
+    let artifact_event = manifest
+        .artifact_event
+        .as_deref()
+        .context("release manifests must include an artifact event")?;
     let mut tags = vec![
         vec![
             "d".into(),
             format!("{}/{}/{}", manifest.name, manifest.version, manifest.arch),
         ],
+        vec!["v".into(), PROTOCOL_VERSION.into()],
         vec!["name".into(), manifest.name.clone()],
         vec!["version".into(), manifest.version.clone()],
         vec!["os".into(), manifest.os.clone()],
@@ -1418,9 +1461,7 @@ fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) ->
         vec!["format".into(), manifest.format.clone()],
         vec!["x".into(), manifest.sha256.to_ascii_lowercase()],
     ];
-    if let Some(event) = &manifest.artifact_event {
-        tags.push(vec!["artifact".into(), event.clone()]);
-    }
+    tags.push(vec!["artifact".into(), artifact_event.into()]);
     if let Some(repo) = &manifest.repo {
         tags.push(vec!["repo".into(), repo.clone()]);
     }
@@ -1466,7 +1507,7 @@ fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) ->
         .into_iter()
         .map(Tag::parse)
         .collect::<Result<Vec<_>, _>>()?;
-    EventBuilder::new(Kind::Custom(9900), content)
+    EventBuilder::new(Kind::Custom(RELEASE_KIND), content)
         .tags(tags)
         .custom_created_at(Timestamp::from(created_at))
         .finalize(&keys)
@@ -1479,8 +1520,11 @@ fn sign_revocation_event(
     reason: &str,
     created_at: u64,
 ) -> Result<Event> {
-    if release.kind.as_u16() != 9900 {
-        bail!("can only revoke a kind:9900 release event");
+    if release.kind.as_u16() != RELEASE_KIND {
+        bail!("can only revoke a kind:{RELEASE_KIND} release event");
+    }
+    if !release_event_is_v1(release) {
+        bail!("can only revoke a valid npack protocol v{PROTOCOL_VERSION} release event");
     }
     release
         .verify()
@@ -1490,6 +1534,7 @@ fn sign_revocation_event(
         bail!("revocation signer must match the release publisher");
     }
     let tags = vec![
+        Tag::parse(vec!["v".to_owned(), PROTOCOL_VERSION.to_owned()])?,
         Tag::parse(vec!["e".into(), release.id.to_hex()])?,
         Tag::parse(vec![
             String::from("name"),
@@ -1505,7 +1550,7 @@ fn sign_revocation_event(
         ])?,
         Tag::parse(vec![String::from("reason"), reason.to_owned()])?,
     ];
-    EventBuilder::new(Kind::Custom(9901), reason)
+    EventBuilder::new(Kind::Custom(REVOCATION_KIND), reason)
         .tags(tags)
         .custom_created_at(Timestamp::from(created_at))
         .finalize(&keys)
@@ -2466,7 +2511,7 @@ mod tests {
             sha256: hash_file(&artifact)?,
             dependencies: vec![],
             conflicts: vec![],
-            artifact_event: None,
+            artifact_event: Some("artifact-event-id".into()),
             repo: None,
             commit: None,
             os: default_os(),
@@ -2782,7 +2827,7 @@ mod tests {
             sha256: "00".repeat(32),
             dependencies: vec![],
             conflicts: vec![],
-            artifact_event: None,
+            artifact_event: Some("artifact-event-id".into()),
             repo: None,
             commit: None,
             os: "linux".into(),

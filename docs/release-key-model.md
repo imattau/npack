@@ -1,5 +1,9 @@
 # Release-key model
 
+This is a proposed post-v1 extension. Protocol v1 signs releases directly
+with the publisher event-author key; the delegated key model below is not
+implemented or accepted by v1 clients.
+
 The publisher's identity key should not need to remain online for every package
 build or release. The publisher key is therefore treated as an offline root,
 while one or more short-lived release keys may sign package releases.
