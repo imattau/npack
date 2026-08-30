@@ -285,6 +285,11 @@ enum Command {
     Inspect {
         artifact: PathBuf,
     },
+    Manifest {
+        artifact: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -598,6 +603,7 @@ async fn main() -> Result<()> {
             user || (!system && config.install.user),
         )?,
         Command::Inspect { artifact } => inspect_artifact(&artifact)?,
+        Command::Manifest { artifact, output } => write_manifest(&artifact, &output)?,
     }
     Ok(())
 }
@@ -766,6 +772,20 @@ fn inspect_artifact(path: &Path) -> Result<()> {
         Object::Unknown(magic) => println!("format: unknown ({magic:?})"),
         _ => println!("format: unknown"),
     }
+    Ok(())
+}
+
+fn write_manifest(artifact: &Path, output: &Path) -> Result<()> {
+    if artifact.extension().and_then(|ext| ext.to_str()) != Some("npk") {
+        bail!("manifest generation requires an .npk artifact");
+    }
+    let manifest = load_embedded_manifest(artifact)?;
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(output, serde_json::to_vec_pretty(&manifest)?)
+        .with_context(|| format!("writing manifest {}", output.display()))?;
+    println!("wrote manifest {}", output.display());
     Ok(())
 }
 

@@ -67,6 +67,7 @@ state. Use `--store` for isolated development or test installations.
 # Build and inspect an artifact
 npack init ./myapp --name myapp --version 1.0.0 --publisher npub1...
 npack pack ./myapp --output ./myapp-1.0.0.npk
+npack manifest ./myapp-1.0.0.npk --output ./myapp-1.0.0.manifest.json
 npack hash ./myapp-1.0.0.npk
 npack inspect ./myapp-1.0.0.npk
 

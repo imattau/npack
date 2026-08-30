@@ -142,6 +142,8 @@ Build and inspect the archive:
 
 ```bash
 npack pack ./package-root --output ./myapp-1.0.0.npk
+npack manifest ./myapp-1.0.0.npk \
+  --output ./myapp-1.0.0.manifest.json
 npack hash ./myapp-1.0.0.npk
 npack inspect ./myapp-1.0.0.npk
 ```
@@ -180,6 +182,14 @@ sha256=$(npack hash ./myapp-1.0.0.npk)
 
 The external manifest is used by the publishing and verification commands;
 end users normally receive equivalent release metadata from Nostr.
+
+Generate it from a completed archive instead of copying the embedded
+metadata by hand:
+
+```bash
+npack manifest ./myapp-1.0.0.npk \
+  --output ./myapp-1.0.0.manifest.json
+```
 
 ## Dependencies and install order
 
@@ -438,6 +448,7 @@ OS and architecture.
 ```text
 npack pack <directory> --output <file.npk>
 npack init <directory> --name <name> --publisher <npub-or-hex> [--version <semver>]
+npack manifest <file.npk> --output <manifest.json>
 npack install <file.npk> [--user|--system|--store <path>]
 npack search <query> [--relay <url>]
 npack install <publisher>/<name> [options]
