@@ -19,7 +19,7 @@ Persistent defaults can be configured in `$XDG_CONFIG_HOME/npack/config.toml` (o
     pubkey = "npub1..."
 
     [trust]
-    publishers = ["<publisher-hex>"]
+    publishers = ["npub1..."]
 
     [install]
     user = true

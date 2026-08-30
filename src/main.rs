@@ -335,7 +335,7 @@ async fn main() -> Result<()> {
             pubkey,
         } => {
             let relays = configured_relays(relays, &config)?;
-            let trusted_publishers = configured_publishers(trusted_publishers, &config);
+            let trusted_publishers = configured_publishers(trusted_publishers, &config)?;
             let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
             search_releases(&query, &relays, &trusted_publishers, pubkey.as_deref()).await?
         }
@@ -354,7 +354,7 @@ async fn main() -> Result<()> {
             allowed_capabilities,
         } => {
             let relays = configured_relays(relays, &config)?;
-            let trusted_publishers = configured_publishers(trusted_publishers, &config);
+            let trusted_publishers = configured_publishers(trusted_publishers, &config)?;
             let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
             let (publisher, name) = package
                 .split_once('/')
@@ -1193,12 +1193,20 @@ fn configured_relays(cli_relays: Vec<String>, config: &Config) -> Result<Vec<Str
     Ok(relays)
 }
 
-fn configured_publishers(cli_publishers: Vec<String>, config: &Config) -> Vec<String> {
-    if cli_publishers.is_empty() {
+fn configured_publishers(cli_publishers: Vec<String>, config: &Config) -> Result<Vec<String>> {
+    let publishers = if cli_publishers.is_empty() {
         config.trust.publishers.clone()
     } else {
         cli_publishers
-    }
+    };
+    publishers
+        .iter()
+        .map(|publisher| {
+            PublicKey::parse(publisher)
+                .map(|key| key.to_hex())
+                .with_context(|| format!("invalid trusted publisher key: {publisher}"))
+        })
+        .collect()
 }
 
 fn default_system_store() -> PathBuf {
@@ -2198,6 +2206,8 @@ mod tests {
             PublicKey::parse(&keys.public_key().to_hex())?,
             keys.public_key()
         );
+        let publishers = configured_publishers(vec![npub], &Config::default())?;
+        assert_eq!(publishers, vec![keys.public_key().to_hex()]);
         Ok(())
     }
 
