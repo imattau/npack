@@ -175,14 +175,22 @@ async fn search_releases(query: &str, relays: &[String]) -> Result<()> {
             .with_context(|| format!("adding relay {relay}"))?;
     }
     client.connect().await;
-    let filter = Filter::new().kind(Kind::Custom(9900)).search(query);
+    let filter = Filter::new().kind(Kind::Custom(9900)).limit(500);
     let events = client
         .fetch_events(filter)
         .timeout(std::time::Duration::from_secs(10))
         .await
         .context("querying Nostr relays")?;
+    let query = query.to_ascii_lowercase();
     for event in events {
-        if event.verify().is_ok() {
+        let matches = event.tags.iter().any(|tag| {
+            tag.kind() == "name"
+                && tag
+                    .content()
+                    .map(|name| name.to_ascii_lowercase().contains(&query))
+                    .unwrap_or(false)
+        });
+        if matches && event.verify().is_ok() {
             println!("{} {} {}", event.id, event.pubkey, event.content);
         }
     }
