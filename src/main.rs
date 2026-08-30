@@ -346,7 +346,9 @@ async fn main() -> Result<()> {
             )?;
             println!(
                 "installed {}/{} {}",
-                installed.publisher, installed.name, installed.version
+                display_publisher(&installed.publisher),
+                installed.name,
+                installed.version
             );
         }
         Command::List {
@@ -356,7 +358,12 @@ async fn main() -> Result<()> {
         } => {
             let user = user || (!system && config.install.user);
             for package in installed_packages(Some(&install_paths(store.as_deref(), user).0))? {
-                println!("{}/{} {}", package.publisher, package.name, package.version);
+                println!(
+                    "{}/{} {}",
+                    display_publisher(&package.publisher),
+                    package.name,
+                    package.version
+                );
             }
         }
         Command::VerifyInstalled {
@@ -396,7 +403,10 @@ async fn main() -> Result<()> {
             verify_release_event(&nostr_event, &package)?;
             println!(
                 "verified release event {} for {}/{} {}",
-                nostr_event.id, package.publisher, package.name, package.version
+                nostr_event.id,
+                display_publisher(&package.publisher),
+                package.name,
+                package.version
             );
         }
         Command::RevokeEvent {
@@ -672,7 +682,11 @@ async fn install_ref(
     if let Some(lockfile) = lockfile {
         write_lockfile(lockfile, &root, &installed)?;
     }
-    println!("install order: {}", installed.join(" -> "));
+    let display_order = installed
+        .iter()
+        .map(|package| display_package_reference(package))
+        .collect::<Vec<_>>();
+    println!("install order: {}", display_order.join(" -> "));
     Ok(())
 }
 
@@ -1307,7 +1321,12 @@ async fn search_releases(
                     .unwrap_or(false)
         });
         if matches && event.verify().is_ok() {
-            println!("{} {} {}", event.id, event.pubkey, event.content);
+            println!(
+                "{} {} {}",
+                event.id,
+                display_publisher(&event.pubkey.to_hex()),
+                event.content
+            );
         }
     }
     client.disconnect().await;
@@ -1634,6 +1653,22 @@ fn normalize_publisher_reference(publisher: &str) -> String {
     PublicKey::parse(publisher)
         .map(|key| key.to_hex())
         .unwrap_or_else(|_| publisher.to_owned())
+}
+
+fn display_publisher(publisher: &str) -> String {
+    PublicKey::parse(publisher)
+        .map(|key| {
+            key.to_bech32()
+                .expect("public key bech32 encoding is infallible")
+        })
+        .unwrap_or_else(|_| publisher.to_owned())
+}
+
+fn display_package_reference(package: &str) -> String {
+    package
+        .split_once('/')
+        .map(|(publisher, name)| format!("{}/{}", display_publisher(publisher), name))
+        .unwrap_or_else(|| package.to_owned())
 }
 
 fn default_system_store() -> PathBuf {
@@ -2677,6 +2712,7 @@ mod tests {
             normalize_publisher_reference(&npub),
             keys.public_key().to_hex()
         );
+        assert_eq!(display_publisher(&keys.public_key().to_hex()), npub);
         Ok(())
     }
 
