@@ -718,6 +718,33 @@ fn init_package(directory: &Path, name: &str, version: &str, publisher: &str) ->
 }
 
 fn inspect_artifact(path: &Path) -> Result<()> {
+    if path.extension().and_then(|ext| ext.to_str()) == Some("npk") {
+        let manifest = load_embedded_manifest(path)?;
+        println!("format: npk");
+        println!("publisher: {}", display_publisher(&manifest.publisher));
+        println!("name: {}", manifest.name);
+        println!("version: {}", manifest.version);
+        println!("os: {}", manifest.os);
+        println!("arch: {}", manifest.arch);
+        println!("sha256: {}", manifest.sha256);
+        if manifest.dependencies.is_empty() {
+            println!("dependencies: none");
+        } else {
+            for dependency in &manifest.dependencies {
+                let publisher = dependency
+                    .publisher
+                    .as_deref()
+                    .map(display_publisher)
+                    .map(|publisher| format!("{publisher}/"))
+                    .unwrap_or_default();
+                println!(
+                    "dependency: {}{} {}",
+                    publisher, dependency.name, dependency.requirement
+                );
+            }
+        }
+        return Ok(());
+    }
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     match Object::parse(&bytes).context("parsing executable")? {
         Object::Elf(elf) => {
