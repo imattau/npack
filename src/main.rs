@@ -1177,6 +1177,14 @@ async fn add_user_relays(client: &Client, user_pubkey: Option<&str>) -> Result<(
 }
 
 fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result<Manifest> {
+    for kind in [
+        "d", "name", "version", "os", "arch", "format", "x", "artifact", "repo", "commit",
+    ] {
+        let count = event.tags.iter().filter(|tag| tag.kind() == kind).count();
+        if count > 1 {
+            bail!("release event contains duplicate {kind} tags");
+        }
+    }
     for tag in event.tags.iter() {
         let values = tag.clone().to_vec();
         match tag.kind() {
@@ -2762,6 +2770,13 @@ mod tests {
         ])?);
         assert!(
             manifest_from_release(&malformed, Path::new("artifact"), &manifest.sha256).is_err()
+        );
+        let mut duplicate = event.clone();
+        duplicate
+            .tags
+            .push(Tag::parse(vec!["version".to_owned(), "9.9.9".to_owned()])?);
+        assert!(
+            manifest_from_release(&duplicate, Path::new("artifact"), &manifest.sha256).is_err()
         );
         Ok(())
     }
