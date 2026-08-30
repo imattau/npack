@@ -1231,9 +1231,7 @@ fn install_remote_package<'a, 'b>(
             bail!("release and artifact event publishers do not match");
         }
         let sha256 = tag_value(&release, "x").context("release has no artifact hash")?;
-        if tag_value(&artifact_event, "x") != Some(sha256) {
-            bail!("release and artifact event hashes do not match");
-        }
+        validate_artifact_event(&artifact_event, &release.pubkey, sha256)?;
         let expected: Sha256Hash = sha256.parse()?;
         let staging = state.root.join("downloads").join(sha256);
         fs::create_dir_all(&staging)?;
@@ -1708,6 +1706,33 @@ fn revocation_event_is_v1(event: &Event) -> bool {
         && ["v", "e", "name", "version", "x", "reason"]
             .iter()
             .all(|kind| tag_value(event, kind).is_some())
+}
+
+fn validate_artifact_event(event: &Event, publisher: &PublicKey, sha256: &str) -> Result<()> {
+    if event.kind.as_u16() != 1063 {
+        bail!("expected NIP-94 artifact event kind:1063");
+    }
+    event
+        .verify()
+        .context("invalid NIP-94 artifact event signature")?;
+    if &event.pubkey != publisher {
+        bail!("artifact event publisher does not match release publisher");
+    }
+    let artifact_hash = tag_value(event, "x").context("artifact event has no SHA-256 tag")?;
+    if artifact_hash != sha256 || artifact_hash.len() != 64 || !artifact_hash.is_ascii() {
+        bail!("artifact event SHA-256 does not match release");
+    }
+    if hex::decode(artifact_hash).is_err() {
+        bail!("artifact event SHA-256 is not valid hexadecimal");
+    }
+    let mime = tag_value(event, "m").context("artifact event has no MIME type")?;
+    if mime != "application/zstd" {
+        bail!("artifact event MIME type must be application/zstd");
+    }
+    if !event.tags.iter().any(|tag| tag.kind() == "url") {
+        bail!("artifact event has no download URL");
+    }
+    Ok(())
 }
 
 fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) -> Result<Event> {
@@ -3326,6 +3351,32 @@ mod tests {
         validate_repo_reference(&format!("30617:{publisher}:npack"))?;
         assert!(validate_repo_reference("30617:not-a-key:npack").is_err());
         assert!(validate_repo_reference(&format!("30617:{publisher}:../npack")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn validates_nip94_artifact_events() -> Result<()> {
+        let keys = Keys::parse(&"11".repeat(32))?;
+        let manifest = Manifest {
+            publisher: keys.public_key().to_hex(),
+            name: "hello".into(),
+            version: "1.0.0".into(),
+            artifact: "hello.npk".into(),
+            sha256: "00".repeat(32),
+            dependencies: vec![],
+            conflicts: vec![],
+            artifact_event: None,
+            repo: None,
+            commit: None,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            format: "npk".into(),
+            runtime_requires: vec![],
+            provides: vec![],
+            post_install: vec![],
+        };
+        let event = sign_artifact_event(&manifest, "https://blob.example/00", 1, &keys)?;
+        validate_artifact_event(&event, &keys.public_key(), &manifest.sha256)?;
         Ok(())
     }
 
