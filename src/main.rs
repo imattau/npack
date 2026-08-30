@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, bail};
+use bitcoin_hashes::sha256::Hash as Sha256Hash;
 use clap::{Parser, Subcommand};
+use nostr_blossom::prelude::BlossomClient;
 use nostr_sdk::prelude::*;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -49,6 +51,13 @@ enum Command {
         query: String,
         #[arg(long = "relay", required = true)]
         relays: Vec<String>,
+    },
+    Fetch {
+        sha256: String,
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -162,7 +171,30 @@ async fn main() -> Result<()> {
             );
         }
         Command::Search { query, relays } => search_releases(&query, &relays).await?,
+        Command::Fetch {
+            sha256,
+            server,
+            output,
+        } => fetch_blob(&sha256, &server, &output).await?,
     }
+    Ok(())
+}
+
+async fn fetch_blob(sha256: &str, server: &str, output: &Path) -> Result<()> {
+    let expected: Sha256Hash = sha256
+        .parse()
+        .context("sha256 must be 64 hexadecimal characters")?;
+    let client = BlossomClient::new(Url::parse(server)?);
+    let bytes = client.get_blob::<Keys>(expected, None, None, None).await?;
+    let actual = Sha256Hash::hash(&bytes);
+    if actual != expected {
+        bail!("Blossom response hash mismatch: expected {expected}, got {actual}");
+    }
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(output, &bytes).with_context(|| format!("writing {}", output.display()))?;
+    println!("fetched {} bytes to {}", bytes.len(), output.display());
     Ok(())
 }
 
