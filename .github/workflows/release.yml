@@ -106,14 +106,63 @@ jobs:
             package-output/npack.spdx.json
 
   nostr-handoff:
-    name: Nostr publication handoff
+    name: Publish to Nostr
     needs: package
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    environment: release
+    permissions:
+      contents: read
     steps:
-      - name: Explain publication boundary
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: npack-release-bundle
+          path: package-output
+
+      - name: Publish artifact and events
+        env:
+          NOSTR_SECRET_KEY: ${{ secrets.NOSTR_SECRET_KEY }}
+          NOSTR_RELAYS: ${{ vars.NOSTR_RELAYS }}
+          NOSTR_BLOSSOM_SERVERS: ${{ vars.NOSTR_BLOSSOM_SERVERS }}
         run: |
-          echo "The release bundle and GitHub provenance are ready for Nostr publication."
-          echo "Use an OIDC-authenticated signing service to invoke:"
-          echo "  npack publish <manifest> --relay <write-relay> --server <blossom-server>"
-          echo "No Nostr private key is stored in or exposed to this workflow."
+          test -n "$NOSTR_SECRET_KEY" || {
+            echo "The release environment must define NOSTR_SECRET_KEY" >&2
+            exit 1
+          }
+          test -n "$NOSTR_RELAYS" || {
+            echo "The repository must define NOSTR_RELAYS" >&2
+            exit 1
+          }
+          test -n "$NOSTR_BLOSSOM_SERVERS" || {
+            echo "The repository must define NOSTR_BLOSSOM_SERVERS" >&2
+            exit 1
+          }
+          manifest=$(find package-output -maxdepth 1 -name '*.manifest.json' -print -quit)
+          test -n "$manifest"
+          relay_args=()
+          while IFS= read -r relay; do
+            [[ -z "${relay//[[:space:]]/}" ]] && continue
+            relay_args+=(--relay "$relay")
+          done <<< "$NOSTR_RELAYS"
+          server_args=()
+          while IFS= read -r server; do
+            [[ -z "${server//[[:space:]]/}" ]] && continue
+            server_args+=(--server "$server")
+          done <<< "$NOSTR_BLOSSOM_SERVERS"
+          test "${#relay_args[@]}" -gt 0
+          test "${#server_args[@]}" -gt 0
+          cargo run --quiet -- publish "$manifest" \
+            --secret-key "$NOSTR_SECRET_KEY" \
+            "${relay_args[@]}" \
+            "${server_args[@]}"
+
+      - name: Confirm publication boundary
+        run: |
+          echo "The signed artifact and release events were submitted to the configured Nostr relays."

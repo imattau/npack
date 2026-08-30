@@ -14,11 +14,17 @@ For a `v<version>` tag, the workflow:
 6. Uploads the bundle as a GitHub Release and workflow artifact.
 
 Set the repository variable `NOSTR_PUBLISHER` to the publisher's public key.
-This is public metadata, not a secret. The workflow deliberately does not
-store a Nostr private key in GitHub Secrets. The final Nostr step is an
-explicit handoff to an OIDC-authenticated signing service, which can verify
-the repository, workflow, tag, and commit before signing and invoking
-`npack publish`.
+Configure the protected `release` environment with the secret
+`NOSTR_SECRET_KEY`, containing a dedicated package-publisher private key. Add
+the repository variables `NOSTR_RELAYS` and `NOSTR_BLOSSOM_SERVERS`, one URL
+per line. The tag-only publish job downloads the attested bundle and invokes
+`npack publish` with those values.
+
+This first implementation uses GitHub Secrets because it is the simplest
+working deployment. The private key is available to the isolated release job
+only; it is not exposed to pull requests or printed in logs. Use a dedicated
+publisher key rather than a personal primary identity. A future NIP-46 or
+OIDC-backed signer can replace this job without changing the package format.
 
 The resulting trust claims remain separate:
 

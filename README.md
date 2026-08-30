@@ -77,7 +77,9 @@ The publish command uploads a verified `.npk` through `nostr-blossom`, creates a
 The tag-driven GitHub Actions reference pipeline is documented in
 [`docs/github-actions.md`](docs/github-actions.md). It builds a deterministic
 `.npk`, emits SHA-256 and SPDX SBOM metadata, creates a GitHub provenance
-attestation, and prepares the bundle for OIDC-backed Nostr signing and
-publication without placing a long-lived Nostr private key in the runner.
+attestation, and publishes the bundle to Blossom and Nostr when the protected
+`release` environment has `NOSTR_SECRET_KEY`, `NOSTR_RELAYS`, and
+`NOSTR_BLOSSOM_SERVERS` configured. Use a dedicated publisher key rather than
+a personal primary identity.
 
 Offline locked replay is available with `--locked --offline`. Online installs cache the verified v1 release and NIP-94 events under the package state directory and reuse the verified artifact cache; offline replay requires those cache entries and never queries relays or Blossom servers. Delegated/offline release keys remain a separate future extension.
