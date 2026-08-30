@@ -1333,9 +1333,18 @@ fn remove_package_at(package: &str, store: Option<&Path>, user: bool) -> Result<
     }
     let mut remaining = Vec::new();
     let mut removed = 0;
-    for installed in packages {
+    for installed in &packages {
         if installed.publisher == publisher && installed.name == name {
             for file in &installed.files {
+                let owned_by_other_package = packages.iter().any(|other| {
+                    !(other.publisher == installed.publisher
+                        && other.name == installed.name
+                        && other.version == installed.version)
+                        && other.files.iter().any(|other_file| other_file == file)
+                });
+                if owned_by_other_package {
+                    continue;
+                }
                 if file.is_file()
                     || fs::symlink_metadata(file)
                         .is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -1355,7 +1364,7 @@ fn remove_package_at(package: &str, store: Option<&Path>, user: bool) -> Result<
             }
             removed += 1;
         } else {
-            remaining.push(installed);
+            remaining.push(installed.clone());
         }
     }
     if removed == 0 {
@@ -1487,6 +1496,46 @@ mod tests {
             error.to_string().contains("No such file") || error.to_string().contains("not found")
         );
         assert!(!prefix.join("bin/one").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn removal_preserves_files_owned_by_another_package() -> Result<()> {
+        let dir = tempdir()?;
+        let store = dir.path().join("store");
+        let shared = dir.path().join("bin/shared");
+        fs::create_dir_all(shared.parent().unwrap())?;
+        fs::write(&shared, b"shared")?;
+        let packages = vec![
+            InstalledPackage {
+                publisher: "pub".into(),
+                name: "first".into(),
+                version: "1.0.0".into(),
+                sha256: "00".repeat(32),
+                artifact: store.join("first"),
+                dependencies: vec![],
+                files: vec![shared.clone()],
+                runtime_requires: vec![],
+                provides: vec![],
+            },
+            InstalledPackage {
+                publisher: "pub".into(),
+                name: "second".into(),
+                version: "1.0.0".into(),
+                sha256: "11".repeat(32),
+                artifact: store.join("second"),
+                dependencies: vec![],
+                files: vec![shared.clone()],
+                runtime_requires: vec![],
+                provides: vec![],
+            },
+        ];
+        fs::create_dir_all(&store)?;
+        fs::write(store.join("installed.json"), serde_json::to_vec(&packages)?)?;
+
+        remove_package("pub/first", Some(&store))?;
+
+        assert!(shared.exists());
         Ok(())
     }
 
