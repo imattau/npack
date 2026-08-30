@@ -15,6 +15,9 @@ Persistent defaults can be configured in `$XDG_CONFIG_HOME/npack/config.toml` (o
     [network]
     relays = ["wss://relay.example"]
 
+    [identity]
+    pubkey = "<user-pubkey-hex>"
+
     [trust]
     publishers = ["<publisher-hex>"]
 
@@ -22,6 +25,7 @@ Persistent defaults can be configured in `$XDG_CONFIG_HOME/npack/config.toml` (o
     user = true
 
 Command-line values take precedence over configuration values.
+When `identity.pubkey` is configured, npack reads the user's NIP-65 kind:10002 relay-list event from the configured relays and adds its read-capable relays to package discovery. The configured relays act as bootstrap relays.
 
     cargo run -- hash ./hello.tar.gz
     cargo run -- verify ./hello.npack.json

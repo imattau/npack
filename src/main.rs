@@ -32,6 +32,8 @@ struct Config {
     trust: TrustConfig,
     #[serde(default)]
     install: InstallConfig,
+    #[serde(default)]
+    identity: IdentityConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -50,6 +52,12 @@ struct TrustConfig {
 struct InstallConfig {
     #[serde(default)]
     user: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct IdentityConfig {
+    #[serde(default)]
+    pubkey: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -107,6 +115,8 @@ enum Command {
         relays: Vec<String>,
         #[arg(long = "trusted-publisher")]
         trusted_publishers: Vec<String>,
+        #[arg(long, help = "Nostr pubkey whose NIP-65 relay list should be used")]
+        pubkey: Option<String>,
     },
     Fetch {
         sha256: String,
@@ -126,6 +136,8 @@ enum Command {
         user: bool,
         #[arg(long = "trusted-publisher")]
         trusted_publishers: Vec<String>,
+        #[arg(long, help = "Nostr pubkey whose NIP-65 relay list should be used")]
+        pubkey: Option<String>,
         #[arg(long = "allow-capability")]
         allowed_capabilities: Vec<String>,
     },
@@ -320,10 +332,12 @@ async fn main() -> Result<()> {
             query,
             relays,
             trusted_publishers,
+            pubkey,
         } => {
             let relays = configured_relays(relays, &config)?;
             let trusted_publishers = configured_publishers(trusted_publishers, &config);
-            search_releases(&query, &relays, &trusted_publishers).await?
+            let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
+            search_releases(&query, &relays, &trusted_publishers, pubkey.as_deref()).await?
         }
         Command::Fetch {
             sha256,
@@ -336,10 +350,12 @@ async fn main() -> Result<()> {
             store,
             user,
             trusted_publishers,
+            pubkey,
             allowed_capabilities,
         } => {
             let relays = configured_relays(relays, &config)?;
             let trusted_publishers = configured_publishers(trusted_publishers, &config);
+            let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
             let (publisher, name) = package
                 .split_once('/')
                 .map_or((None, package.as_str()), |(p, n)| (Some(p.to_owned()), n));
@@ -350,6 +366,7 @@ async fn main() -> Result<()> {
                 store.as_deref(),
                 user || config.install.user,
                 &trusted_publishers,
+                pubkey.as_deref(),
                 &allowed_capabilities,
             )
             .await?
@@ -481,6 +498,7 @@ async fn install_ref(
     store: Option<&Path>,
     user: bool,
     trusted_publishers: &[String],
+    user_pubkey: Option<&str>,
     allowed_capabilities: &[String],
 ) -> Result<()> {
     let client = Client::default();
@@ -488,6 +506,7 @@ async fn install_ref(
         client.add_relay(relay).await?;
     }
     client.connect().await;
+    add_user_relays(&client, user_pubkey).await?;
     let (root, prefix) = install_paths(store, user);
     let mut visiting = Vec::new();
     let mut installed = Vec::new();
@@ -499,6 +518,7 @@ async fn install_ref(
         allowed_capabilities,
         user,
         trusted_publishers,
+        user_pubkey,
         &root,
         &prefix,
         &mut visiting,
@@ -521,6 +541,7 @@ fn install_remote_package<'a>(
     allowed_capabilities: &'a [String],
     user: bool,
     trusted_publishers: &'a [String],
+    user_pubkey: Option<&'a str>,
     root: &'a Path,
     prefix: &'a Path,
     visiting: &'a mut Vec<String>,
@@ -672,6 +693,7 @@ fn install_remote_package<'a>(
                 allowed_capabilities,
                 user,
                 trusted_publishers,
+                user_pubkey,
                 root,
                 prefix,
                 visiting,
@@ -705,6 +727,41 @@ fn release_matches_host(event: &Event) -> bool {
     let os = tag_value(event, "os").unwrap_or("any");
     let arch = tag_value(event, "arch").unwrap_or("any");
     (os == "any" || os == OS) && (arch == "any" || arch == ARCH)
+}
+
+async fn add_user_relays(client: &Client, user_pubkey: Option<&str>) -> Result<()> {
+    let Some(user_pubkey) = user_pubkey else {
+        return Ok(());
+    };
+    let pubkey = PublicKey::from_hex(user_pubkey)
+        .with_context(|| "NIP-65 pubkey must be 64-character hexadecimal")?;
+    let events = client
+        .fetch_events(
+            Filter::new()
+                .kind(Kind::Custom(10002))
+                .author(pubkey)
+                .limit(1),
+        )
+        .timeout(std::time::Duration::from_secs(10))
+        .await?;
+    let Some(event) = events
+        .into_iter()
+        .filter(|event| event.verify().is_ok())
+        .max_by_key(|event| event.created_at.as_secs())
+    else {
+        return Ok(());
+    };
+    for tag in event.tags.iter().filter(|tag| tag.kind() == "r") {
+        let values = tag.clone().to_vec();
+        let is_write_only = values.get(2).is_some_and(|marker| marker == "write");
+        if !is_write_only {
+            if let Some(relay) = values.get(1) {
+                client.add_relay(relay).await?;
+            }
+        }
+    }
+    client.connect().await;
+    Ok(())
 }
 
 fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result<Manifest> {
@@ -807,6 +864,7 @@ async fn search_releases(
     query: &str,
     relays: &[String],
     trusted_publishers: &[String],
+    user_pubkey: Option<&str>,
 ) -> Result<()> {
     let client = Client::default();
     for relay in relays {
@@ -816,6 +874,7 @@ async fn search_releases(
             .with_context(|| format!("adding relay {relay}"))?;
     }
     client.connect().await;
+    add_user_relays(&client, user_pubkey).await?;
     let filter = Filter::new().kind(Kind::Custom(9900)).limit(500);
     let events = client
         .fetch_events(filter)
