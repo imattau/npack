@@ -714,8 +714,23 @@ async fn search_releases(query: &str, relays: &[String]) -> Result<()> {
         .timeout(std::time::Duration::from_secs(10))
         .await
         .context("querying Nostr relays")?;
+    let revoked = client
+        .fetch_events(Filter::new().kind(Kind::Custom(9901)).limit(500))
+        .timeout(std::time::Duration::from_secs(10))
+        .await?
+        .into_iter()
+        .filter(|event| event.verify().is_ok())
+        .filter_map(|event| {
+            tag_value(&event, "e").map(|release| (event.pubkey.to_hex(), release.to_owned()))
+        })
+        .collect::<Vec<_>>();
     let query = query.to_ascii_lowercase();
     for event in events {
+        if revoked.iter().any(|(publisher, release_id)| {
+            publisher == &event.pubkey.to_hex() && release_id == &event.id.to_hex()
+        }) {
+            continue;
+        }
         let matches = event.tags.iter().any(|tag| {
             tag.kind() == "name"
                 && tag
