@@ -562,6 +562,9 @@ async fn install_ref(
     )
     .await?;
     client.disconnect().await;
+    if let Some(lockfile) = locked_packages {
+        verify_locked_install(lockfile, &root)?;
+    }
     if let Some(lockfile) = lockfile {
         write_lockfile(lockfile, &root, &installed)?;
     }
@@ -631,6 +634,27 @@ fn load_lockfile(path: &Path) -> Result<Lockfile> {
         }
     }
     Ok(lockfile)
+}
+
+fn verify_locked_install(lockfile: &Lockfile, root: &Path) -> Result<()> {
+    let installed = installed_packages(Some(root))?;
+    for locked in &lockfile.packages {
+        let found = installed.iter().any(|package| {
+            package.publisher == locked.publisher
+                && package.name == locked.name
+                && package.version == locked.version
+                && package.sha256 == locked.sha256
+        });
+        if !found {
+            bail!(
+                "locked package was not installed: {}/{} {}",
+                locked.publisher,
+                locked.name,
+                locked.version
+            );
+        }
+    }
+    Ok(())
 }
 
 use std::future::Future;
@@ -2080,6 +2104,7 @@ mod tests {
         let lockfile: Lockfile = serde_json::from_slice(&fs::read(lock_path)?)?;
         assert_eq!(lockfile.version, 1);
         assert_eq!(lockfile.packages[0].sha256, manifest.sha256);
+        verify_locked_install(&lockfile, &store)?;
         fs::write(
             store.join("packages/pub/hello/1.0.0/hello.bin"),
             b"tampered",
