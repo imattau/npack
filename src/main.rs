@@ -1692,13 +1692,25 @@ fn verify_release_event(event: &Event, manifest: &Manifest) -> Result<()> {
 }
 
 fn release_event_is_v1(event: &Event) -> bool {
-    event.kind.as_u16() == RELEASE_KIND
-        && tag_value(event, "v") == Some(PROTOCOL_VERSION)
-        && [
-            "d", "name", "version", "os", "arch", "format", "x", "artifact",
-        ]
-        .iter()
-        .all(|kind| tag_value(event, kind).is_some())
+    if event.kind.as_u16() != RELEASE_KIND || tag_value(event, "v") != Some(PROTOCOL_VERSION) {
+        return false;
+    }
+    if [
+        "d", "v", "name", "version", "os", "arch", "format", "x", "artifact", "repo", "commit",
+    ]
+    .iter()
+    .any(|kind| event.tags.iter().filter(|tag| tag.kind() == *kind).count() > 1)
+    {
+        return false;
+    }
+    let Some(hash) = tag_value(event, "x") else {
+        return false;
+    };
+    hash.len() == 64
+        && hash.chars().all(|character| character.is_ascii_hexdigit())
+        && ["d", "name", "version", "os", "arch", "format", "artifact"]
+            .iter()
+            .all(|kind| tag_value(event, kind).is_some())
 }
 
 fn revocation_event_is_v1(event: &Event) -> bool {
@@ -1706,6 +1718,9 @@ fn revocation_event_is_v1(event: &Event) -> bool {
         && ["v", "e", "name", "version", "x", "reason"]
             .iter()
             .all(|kind| tag_value(event, kind).is_some())
+        && tag_value(event, "v") == Some(PROTOCOL_VERSION)
+        && tag_value(event, "x")
+            .is_some_and(|hash| hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 fn validate_artifact_event(event: &Event, publisher: &PublicKey, sha256: &str) -> Result<()> {
@@ -3377,6 +3392,35 @@ mod tests {
         };
         let event = sign_artifact_event(&manifest, "https://blob.example/00", 1, &keys)?;
         validate_artifact_event(&event, &keys.public_key(), &manifest.sha256)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_malformed_release_event_candidates() -> Result<()> {
+        let manifest = Manifest {
+            publisher: "npub1test".into(),
+            name: "hello".into(),
+            version: "1.0.0".into(),
+            artifact: "hello.npk".into(),
+            sha256: "00".repeat(32),
+            dependencies: vec![],
+            conflicts: vec![],
+            artifact_event: Some("artifact-event-id".into()),
+            repo: None,
+            commit: None,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            format: "npk".into(),
+            runtime_requires: vec![],
+            provides: vec![],
+            post_install: vec![],
+        };
+        let mut event = sign_release_event(&manifest, &"11".repeat(32), 1)?;
+        assert!(release_event_is_v1(&event));
+        event
+            .tags
+            .push(Tag::parse(vec!["x".into(), "00".repeat(32)])?);
+        assert!(!release_event_is_v1(&event));
         Ok(())
     }
 
