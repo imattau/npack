@@ -140,6 +140,10 @@ struct InstalledPackage {
     dependencies: Vec<Dependency>,
     #[serde(default)]
     files: Vec<PathBuf>,
+    #[serde(default)]
+    runtime_requires: Vec<String>,
+    #[serde(default)]
+    provides: Vec<String>,
 }
 
 #[tokio::main]
@@ -771,6 +775,8 @@ fn install(
         artifact: destination,
         dependencies: manifest.dependencies.clone(),
         files,
+        runtime_requires: manifest.runtime_requires.clone(),
+        provides: manifest.provides.clone(),
     };
     let mut packages = installed_packages(Some(&root))?;
     packages.retain(|p| {
@@ -851,6 +857,19 @@ fn ensure_dependencies_available(manifest: &Manifest, store: &Path) -> Result<()
                 "missing dependency {} {} (install it before {})",
                 dependency.name,
                 dependency.requirement,
+                manifest.name
+            );
+        }
+    }
+    for requirement in &manifest.runtime_requires {
+        if !installed.iter().any(|package| {
+            package
+                .provides
+                .iter()
+                .any(|provided| provided == requirement)
+        }) {
+            bail!(
+                "missing runtime capability {requirement} (provide it before {})",
                 manifest.name
             );
         }
@@ -1082,6 +1101,8 @@ mod tests {
                 artifact: store.join("libfoo"),
                 dependencies: vec![],
                 files: vec![],
+                runtime_requires: vec![],
+                provides: vec!["libfoo.so.2".into()],
             },
             InstalledPackage {
                 publisher: "app-pub".into(),
@@ -1095,6 +1116,8 @@ mod tests {
                     requirement: ">=2.0.0".into(),
                 }],
                 files: vec![],
+                runtime_requires: vec![],
+                provides: vec![],
             },
         ];
         fs::write(
