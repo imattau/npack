@@ -608,8 +608,27 @@ fn load_lockfile(path: &Path) -> Result<Lockfile> {
     if lockfile.version != 1 {
         bail!("unsupported lockfile version: {}", lockfile.version);
     }
+    let mut identities = HashSet::new();
     for package in &mut lockfile.packages {
         package.publisher = normalize_publisher_reference(&package.publisher);
+        PublicKey::parse(&package.publisher)
+            .with_context(|| format!("invalid lockfile publisher: {}", package.publisher))?;
+        Version::parse(&package.version)
+            .with_context(|| format!("invalid lockfile version: {}", package.version))?;
+        if package.sha256.len() != 64 || !package.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!(
+                "invalid lockfile SHA-256 for {}/{}",
+                package.publisher,
+                package.name
+            );
+        }
+        if !identities.insert(format!("{}/{}", package.publisher, package.name)) {
+            bail!(
+                "duplicate package in lockfile: {}/{}",
+                package.publisher,
+                package.name
+            );
+        }
     }
     Ok(lockfile)
 }
