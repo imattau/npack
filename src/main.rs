@@ -35,6 +35,8 @@ enum Command {
         manifest: PathBuf,
         #[arg(long)]
         store: Option<PathBuf>,
+        #[arg(long = "allow-capability")]
+        allowed_capabilities: Vec<String>,
     },
     List {
         #[arg(long)]
@@ -69,6 +71,8 @@ enum Command {
         relays: Vec<String>,
         #[arg(long)]
         store: Option<PathBuf>,
+        #[arg(long = "allow-capability")]
+        allowed_capabilities: Vec<String>,
     },
     Pack {
         source: PathBuf,
@@ -167,10 +171,19 @@ async fn main() -> Result<()> {
                 package.publisher, package.name, package.version
             );
         }
-        Command::Install { manifest, store } => {
+        Command::Install {
+            manifest,
+            store,
+            allowed_capabilities,
+        } => {
             let package = load_manifest(&manifest)?;
             verify_manifest(&package, &manifest)?;
-            let installed = install(&package, &manifest, store.as_deref())?;
+            let installed = install_with_capabilities(
+                &package,
+                &manifest,
+                store.as_deref(),
+                &allowed_capabilities,
+            )?;
             println!(
                 "installed {}/{} {}",
                 installed.publisher, installed.name, installed.version
@@ -224,11 +237,19 @@ async fn main() -> Result<()> {
             package,
             relays,
             store,
+            allowed_capabilities,
         } => {
             let (publisher, name) = package
                 .split_once('/')
                 .map_or((None, package.as_str()), |(p, n)| (Some(p.to_owned()), n));
-            install_ref(&name, publisher, &relays, store.as_deref()).await?
+            install_ref(
+                &name,
+                publisher,
+                &relays,
+                store.as_deref(),
+                &allowed_capabilities,
+            )
+            .await?
         }
         Command::Pack { source, output } => pack_npk(&source, &output)?,
         Command::Remove { package, store } => remove_package(&package, store.as_deref())?,
@@ -351,6 +372,7 @@ async fn install_ref(
     publisher: Option<String>,
     relays: &[String],
     store: Option<&Path>,
+    allowed_capabilities: &[String],
 ) -> Result<()> {
     let client = Client::default();
     for relay in relays {
@@ -365,6 +387,7 @@ async fn install_ref(
         name,
         publisher,
         None,
+        allowed_capabilities,
         &root,
         &mut visiting,
         &mut installed,
@@ -383,6 +406,7 @@ fn install_remote_package<'a>(
     name: &'a str,
     publisher: Option<String>,
     requirement: Option<String>,
+    allowed_capabilities: &'a [String],
     root: &'a Path,
     visiting: &'a mut Vec<String>,
     installed: &'a mut Vec<String>,
@@ -477,13 +501,19 @@ fn install_remote_package<'a>(
                 &dependency.name,
                 dependency.publisher,
                 Some(dependency.requirement),
+                allowed_capabilities,
                 root,
                 visiting,
                 installed,
             )
             .await?;
         }
-        install(&manifest, &staging.join("manifest.json"), Some(&root))?;
+        install_with_capabilities(
+            &manifest,
+            &staging.join("manifest.json"),
+            Some(&root),
+            allowed_capabilities,
+        )?;
         visiting.pop();
         installed.push(install_key);
         Ok(())
@@ -781,6 +811,15 @@ fn install(
     manifest_path: &Path,
     store: Option<&Path>,
 ) -> Result<InstalledPackage> {
+    install_with_capabilities(manifest, manifest_path, store, &[])
+}
+
+fn install_with_capabilities(
+    manifest: &Manifest,
+    manifest_path: &Path,
+    store: Option<&Path>,
+    allowed_capabilities: &[String],
+) -> Result<InstalledPackage> {
     let root = store.map(Path::to_path_buf).unwrap_or_else(default_store);
     ensure_dependencies_available(manifest, &root)?;
     let package_dir = root
@@ -803,7 +842,7 @@ fn install(
     } else {
         vec![destination.clone()]
     };
-    run_post_install(&manifest.post_install, &package_dir)?;
+    run_post_install(&manifest.post_install, &package_dir, allowed_capabilities)?;
     let installed = InstalledPackage {
         publisher: manifest.publisher.clone(),
         name: manifest.name.clone(),
@@ -830,8 +869,24 @@ fn install(
     Ok(installed)
 }
 
-fn run_post_install(actions: &[PostInstallAction], package_dir: &Path) -> Result<()> {
+fn run_post_install(
+    actions: &[PostInstallAction],
+    package_dir: &Path,
+    allowed_capabilities: &[String],
+) -> Result<()> {
     for action in actions {
+        let capability = if action.action == "create-directory" {
+            "filesystem:package-store"
+        } else {
+            action.action.as_str()
+        };
+        if !allowed_capabilities.is_empty()
+            && !allowed_capabilities
+                .iter()
+                .any(|allowed| allowed == capability)
+        {
+            bail!("post-install action requires capability: {capability}");
+        }
         if action.action != "create-directory" {
             bail!("unsupported post-install action: {}", action.action);
         }
@@ -1252,6 +1307,7 @@ mod tests {
                 path: "var/cache".into(),
             }],
             dir.path(),
+            &[],
         )?;
         assert!(dir.path().join("var/cache").is_dir());
         let error = run_post_install(
@@ -1260,6 +1316,7 @@ mod tests {
                 path: "../escape".into(),
             }],
             dir.path(),
+            &[],
         )
         .unwrap_err();
         assert!(error.to_string().contains("unsafe post-install path"));

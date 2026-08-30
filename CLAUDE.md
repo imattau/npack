@@ -14,13 +14,13 @@ npack is an independent package manager whose registry metadata will be publishe
 
     npack hash <artifact>
     npack verify <manifest>
-    npack install <manifest> [--store <path>]
+    npack install <manifest> [--store <path>] [--allow-capability <capability>]
     npack list [--store <path>]
     npack release-event <manifest> --secret-key <hex-key>
     npack verify-event <event> <manifest>
     npack search <query> --relay <relay-url>
     npack fetch <sha256> --server <blossom-url> --output <path>
-    npack install-ref [<publisher-hex>/]<name> --relay <relay-url> [--store <path>]
+    npack install-ref [<publisher-hex>/]<name> --relay <relay-url> [--store <path>] [--allow-capability <capability>]
     npack pack <source-directory> --output <package.npk>
     npack remove <publisher-hex>/<name> [--store <path>]
     npack inspect <artifact>
