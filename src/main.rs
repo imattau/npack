@@ -21,6 +21,8 @@ const RELEASE_KIND: u16 = 9900;
 const REVOCATION_KIND: u16 = 9901;
 const PROTOCOL_VERSION: &str = "1";
 
+type ServiceBackup = (PathBuf, Option<(Vec<u8>, fs::Permissions)>);
+
 #[derive(Parser)]
 #[command(name = "npack", version, about = "A Nostr-native package manager")]
 struct Cli {
@@ -2085,30 +2087,104 @@ fn run_post_install(
 ) -> Result<Vec<PathBuf>> {
     validate_post_install_actions(actions, allowed_capabilities)?;
     let mut created = Vec::new();
+    let mut created_directories = Vec::new();
+    let mut service_backups: Vec<ServiceBackup> = Vec::new();
     for action in actions {
-        match action.action.as_str() {
-            "create-directory" => fs::create_dir_all(prefix.join(&action.path))?,
-            "register-service" => {
-                let source = prefix.join(&action.path);
-                if source.extension().and_then(|extension| extension.to_str()) != Some("service") {
-                    bail!("register-service requires a .service file");
+        let result = (|| -> Result<()> {
+            match action.action.as_str() {
+                "create-directory" => {
+                    let destination = prefix.join(&action.path);
+                    if !destination.exists() {
+                        fs::create_dir_all(&destination)?;
+                        created_directories.push(destination);
+                    }
                 }
-                let destination = if user {
-                    dirs::config_dir()
-                        .context("cannot determine user config directory")?
-                        .join("systemd/user")
-                } else {
-                    PathBuf::from("/etc/systemd/system")
+                "register-service" => {
+                    let source = prefix.join(&action.path);
+                    if source.extension().and_then(|extension| extension.to_str())
+                        != Some("service")
+                    {
+                        bail!("register-service requires a .service file");
+                    }
+                    let destination = if user {
+                        dirs::config_dir()
+                            .context("cannot determine user config directory")?
+                            .join("systemd/user")
+                    } else {
+                        PathBuf::from("/etc/systemd/system")
+                    }
+                    .join(source.file_name().context("service path has no filename")?);
+                    fs::create_dir_all(destination.parent().unwrap())?;
+                    let backup = match fs::symlink_metadata(&destination) {
+                        Ok(metadata) if metadata.file_type().is_file() => {
+                            Some((fs::read(&destination)?, metadata.permissions()))
+                        }
+                        Ok(_) => bail!(
+                            "service destination is not a regular file: {}",
+                            destination.display()
+                        ),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                        Err(error) => return Err(error.into()),
+                    };
+                    atomic_copy_service(&source, &destination)?;
+                    service_backups.push((destination.clone(), backup));
+                    created.push(destination);
                 }
-                .join(source.file_name().context("service path has no filename")?);
-                fs::create_dir_all(destination.parent().unwrap())?;
-                fs::copy(source, &destination)?;
-                created.push(destination);
+                _ => bail!("unsupported post-install action: {}", action.action),
             }
-            _ => bail!("unsupported post-install action: {}", action.action),
+            Ok(())
+        })();
+        if let Err(error) = result {
+            rollback_post_install(&created, &created_directories, &service_backups)?;
+            return Err(error);
         }
     }
     Ok(created)
+}
+
+fn atomic_copy_service(source: &Path, destination: &Path) -> Result<()> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary =
+        destination.with_extension(format!("service.npack-{}-{}", std::process::id(), nonce));
+    let result = (|| -> Result<()> {
+        fs::copy(source, &temporary)?;
+        fs::rename(&temporary, destination)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn rollback_post_install(
+    created: &[PathBuf],
+    created_directories: &[PathBuf],
+    service_backups: &[ServiceBackup],
+) -> Result<()> {
+    for path in created.iter().rev() {
+        if path.exists() || fs::symlink_metadata(path).is_ok() {
+            fs::remove_file(path)?;
+        }
+    }
+    for (path, backup) in service_backups.iter().rev() {
+        if let Some((contents, permissions)) = backup {
+            fs::write(path, contents)?;
+            fs::set_permissions(path, permissions.clone())?;
+        }
+    }
+    for directory in created_directories.iter().rev() {
+        match fs::remove_dir(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn validate_post_install_actions(
@@ -3379,6 +3455,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("service-manager"));
+        Ok(())
+    }
+
+    #[test]
+    fn rolls_back_post_install_service_and_directories() -> Result<()> {
+        let dir = tempdir()?;
+        let service = dir.path().join("example.service");
+        fs::write(&service, b"new service")?;
+        let permissions = fs::metadata(&service)?.permissions();
+        let created_directory = dir.path().join("created");
+        fs::create_dir(&created_directory)?;
+
+        rollback_post_install(
+            std::slice::from_ref(&service),
+            std::slice::from_ref(&created_directory),
+            &[(
+                service.clone(),
+                Some((b"old service".to_vec(), permissions)),
+            )],
+        )?;
+
+        assert_eq!(fs::read(&service)?, b"old service");
+        assert!(!created_directory.exists());
         Ok(())
     }
 
