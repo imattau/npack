@@ -174,7 +174,7 @@ enum Command {
     Fetch {
         sha256: String,
         #[arg(long)]
-        server: String,
+        server: Option<String>,
         #[arg(long)]
         output: PathBuf,
     },
@@ -429,7 +429,13 @@ async fn main() -> Result<()> {
             sha256,
             server,
             output,
-        } => fetch_blob(&sha256, &server, &output).await?,
+        } => {
+            let servers = server
+                .into_iter()
+                .chain(config.storage.blossom.iter().cloned())
+                .collect::<Vec<_>>();
+            fetch_blob(&sha256, &servers, &output).await?
+        }
         Command::InstallRef {
             package,
             relays,
@@ -515,16 +521,28 @@ fn inspect_artifact(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn fetch_blob(sha256: &str, server: &str, output: &Path) -> Result<()> {
+async fn fetch_blob(sha256: &str, servers: &[String], output: &Path) -> Result<()> {
     let expected: Sha256Hash = sha256
         .parse()
         .context("sha256 must be 64 hexadecimal characters")?;
-    let client = BlossomClient::new(Url::parse(server)?);
-    let bytes = client.get_blob::<Keys>(expected, None, None, None).await?;
-    let actual = Sha256Hash::hash(&bytes);
-    if actual != expected {
-        bail!("Blossom response hash mismatch: expected {expected}, got {actual}");
+    if servers.is_empty() {
+        bail!("no Blossom servers configured; pass --server or configure [storage].blossom");
     }
+    let mut bytes = None;
+    for server in servers {
+        let candidate = match BlossomClient::new(Url::parse(server)?)
+            .get_blob::<Keys>(expected, None, None, None)
+            .await
+        {
+            Ok(candidate) => candidate,
+            Err(_) => continue,
+        };
+        if Sha256Hash::hash(&candidate) == expected {
+            bytes = Some(candidate);
+            break;
+        }
+    }
+    let bytes = bytes.context("no Blossom server returned the expected SHA-256")?;
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }

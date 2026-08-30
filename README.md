@@ -42,6 +42,7 @@ When `identity.pubkey` is configured, npack reads the user's NIP-65 kind:10002 r
     cargo run -- search hello --relay wss://relay.example
     cargo run -- search hello --relay wss://relay.example --trusted-publisher <publisher-hex>
     cargo run -- fetch <sha256> --server https://blossom.example --output ./artifact
+    cargo run -- fetch <sha256> --output ./artifact
     cargo run -- install-ref <publisher-hex>/hello --relay wss://relay.example --user
     cargo run -- update <publisher-hex>/hello --relay wss://relay.example --user
     cargo run -- update hello --relay wss://relay.example --trusted-publisher <publisher-hex>
