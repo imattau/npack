@@ -1367,6 +1367,18 @@ fn verify_release_event(event: &Event, manifest: &Manifest) -> Result<()> {
             bail!("release event {kind} mismatch: expected {expected}, got {actual}");
         }
     }
+    let event_manifest = manifest_from_release(event, &manifest.artifact, &manifest.sha256)?;
+    if event_manifest.dependencies != manifest.dependencies
+        || event_manifest.conflicts != manifest.conflicts
+        || event_manifest.runtime_requires != manifest.runtime_requires
+        || event_manifest.provides != manifest.provides
+        || event_manifest.post_install != manifest.post_install
+        || event_manifest.artifact_event != manifest.artifact_event
+        || event_manifest.repo != manifest.repo
+        || event_manifest.commit != manifest.commit
+    {
+        bail!("release event metadata does not match the package manifest");
+    }
     Ok(())
 }
 
@@ -2726,6 +2738,9 @@ mod tests {
         assert!(event.verify().is_ok());
         assert!(serde_json::to_string(&event.tags)?.contains("libfoo"));
         verify_release_event(&event, &manifest)?;
+        let mut changed_manifest = manifest.clone();
+        changed_manifest.dependencies.clear();
+        assert!(verify_release_event(&event, &changed_manifest).is_err());
         Ok(())
     }
 
