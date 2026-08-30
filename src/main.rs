@@ -1184,6 +1184,11 @@ fn verify_release_event(event: &Event, manifest: &Manifest) -> Result<()> {
     event
         .verify()
         .context("invalid Nostr event ID or signature")?;
+    if let Ok(publisher) = PublicKey::parse(&manifest.publisher) {
+        if event.pubkey != publisher {
+            bail!("release event signer does not match manifest publisher");
+        }
+    }
     for (kind, expected) in [
         ("name", manifest.name.as_str()),
         ("version", manifest.version.as_str()),
@@ -1207,6 +1212,11 @@ fn verify_release_event(event: &Event, manifest: &Manifest) -> Result<()> {
 
 fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) -> Result<Event> {
     let keys = Keys::parse(secret_hex).context("secret key must be hex or nsec")?;
+    if let Ok(publisher) = PublicKey::parse(&manifest.publisher) {
+        if keys.public_key() != publisher {
+            bail!("release signer does not match manifest publisher");
+        }
+    }
     let mut tags = vec![
         vec![
             "d".into(),
@@ -2464,6 +2474,31 @@ mod tests {
         let release_id = release.id.to_hex();
         assert_eq!(tag_value(&revocation, "e"), Some(release_id.as_str()));
         assert!(revocation.verify().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_release_signed_by_the_wrong_publisher() -> Result<()> {
+        let keys = Keys::parse(&"11".repeat(32))?;
+        let manifest = Manifest {
+            publisher: keys.public_key().to_hex(),
+            name: "hello".into(),
+            version: "1.0.0".into(),
+            artifact: "hello.npk".into(),
+            sha256: "00".repeat(32),
+            dependencies: vec![],
+            conflicts: vec![],
+            artifact_event: None,
+            repo: None,
+            commit: None,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            format: "npk".into(),
+            runtime_requires: vec![],
+            provides: vec![],
+            post_install: vec![],
+        };
+        assert!(sign_release_event(&manifest, &"22".repeat(32), 1_700_000_000).is_err());
         Ok(())
     }
 
