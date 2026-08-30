@@ -21,6 +21,7 @@ use std::{
 const RELEASE_KIND: u16 = 9900;
 const REVOCATION_KIND: u16 = 9901;
 const PROTOCOL_VERSION: &str = "1";
+const NETWORK_TIMEOUT_SECS: u64 = 15;
 
 type ServiceBackup = (PathBuf, Option<(Vec<u8>, fs::Permissions)>);
 
@@ -593,6 +594,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn install_remote_command(
     package: &str,
     relays: Vec<String>,
@@ -645,6 +647,16 @@ async fn install_remote_command(
         },
     )
     .await
+}
+
+async fn connect_with_timeout(client: &Client) -> Result<()> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(NETWORK_TIMEOUT_SECS),
+        client.connect(),
+    )
+    .await
+    .context("timed out connecting to configured Nostr relays")?;
+    Ok(())
 }
 
 fn init_package(directory: &Path, name: &str, version: &str, publisher: &str) -> Result<()> {
@@ -851,7 +863,7 @@ async fn install_ref(
         for relay in relays {
             client.add_relay(relay).await?;
         }
-        client.connect().await;
+        connect_with_timeout(&client).await?;
         add_user_relays(&client, user_pubkey).await?;
     }
     let (root, prefix) = install_paths(store, user);
@@ -1505,7 +1517,7 @@ async fn add_user_relays(client: &Client, user_pubkey: Option<&str>) -> Result<(
             client.add_relay(relay).await?;
         }
     }
-    client.connect().await;
+    connect_with_timeout(client).await?;
     Ok(())
 }
 
@@ -1538,7 +1550,7 @@ async fn add_user_write_relays(client: &Client, user_pubkey: Option<&str>) -> Re
             client.add_relay(relay).await?;
         }
     }
-    client.connect().await;
+    connect_with_timeout(client).await?;
     Ok(())
 }
 
@@ -1715,7 +1727,7 @@ async fn search_releases(
             .await
             .with_context(|| format!("adding relay {relay}"))?;
     }
-    client.connect().await;
+    connect_with_timeout(&client).await?;
     add_user_relays(&client, user_pubkey).await?;
     let filter = Filter::new().kind(Kind::Custom(RELEASE_KIND)).limit(500);
     let events = client
@@ -1998,24 +2010,37 @@ async fn publish_release(
     let bytes = fs::read(artifact_path(&manifest, manifest_path))?;
     let expected = Sha256Hash::hash(&bytes);
     let mut descriptor = None;
+    let mut failures = Vec::new();
     for server in servers {
-        match BlossomClient::new(Url::parse(server)?)
-            .upload_blob(
+        let upload = tokio::time::timeout(
+            std::time::Duration::from_secs(NETWORK_TIMEOUT_SECS),
+            BlossomClient::new(Url::parse(server)?).upload_blob(
                 bytes.clone(),
                 Some("application/zstd".into()),
                 None,
                 Some(&keys),
-            )
-            .await
-        {
-            Ok(candidate) if candidate.sha256 == expected => {
+            ),
+        )
+        .await;
+        match upload {
+            Ok(Ok(candidate)) if candidate.sha256 == expected => {
                 descriptor = Some(candidate);
                 break;
             }
-            Ok(_) | Err(_) => continue,
+            Ok(Ok(candidate)) => failures.push(format!(
+                "{server}: returned hash {} instead of {}",
+                candidate.sha256, expected
+            )),
+            Ok(Err(error)) => failures.push(format!("{server}: {error}")),
+            Err(_) => failures.push(format!("{server}: timed out")),
         }
     }
-    let descriptor = descriptor.context("no Blossom server accepted the artifact upload")?;
+    let descriptor = descriptor.with_context(|| {
+        format!(
+            "no Blossom server accepted the artifact upload; attempts: {}",
+            failures.join("; ")
+        )
+    })?;
     let artifact_event =
         sign_artifact_event(&manifest, descriptor.url.as_ref(), bytes.len(), &keys)?;
     let mut release_manifest = manifest.clone();
@@ -2027,7 +2052,7 @@ async fn publish_release(
     for relay in relays {
         client.add_relay(relay).await?;
     }
-    client.connect().await;
+    connect_with_timeout(&client).await?;
     add_user_write_relays(&client, user_pubkey).await?;
     client
         .send_event(&artifact_event)
