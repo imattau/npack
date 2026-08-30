@@ -3,12 +3,24 @@
 This document defines the current npack wire format. It is a project
 protocol using Nostr custom event kinds; it is not yet a registered NIP.
 
+## Interoperability profile
+
+All events use the ordinary Nostr event envelope from NIP-01. The custom
+package event kinds are regular events, so relays may store and replicate
+them without special package support. Event IDs and signatures are computed
+by the normal Nostr serialization rules; clients must verify both before
+interpreting package data.
+
+The examples in [package-event-fixtures.md](package-event-fixtures.md) are
+canonical tag-shape fixtures. Values such as keys, hashes, and event IDs must
+be replaced with real values and then the complete event must be signed.
+
 ## Release events
 
 A package release is a signed Nostr event with kind 9900 and a required
 ["v", "1"] tag. The event author is the package publisher.
 
-Required singleton tags:
+Required singleton tags (exactly one of each):
 
 | Tag | Meaning |
 | --- | --- |
@@ -26,6 +38,11 @@ The artifact event must be signed by the same publisher and contain the
 same SHA-256 x tag. Its URL tags identify candidate download locations.
 Clients verify the downloaded bytes against x; URLs and Blossom servers are
 transport only.
+
+`x` is exactly 64 lowercase hexadecimal characters. `version` is SemVer.
+`d` is `<name>/<version>/<arch>`. The canonical artifact format for v1 is
+`npk`, a tar archive compressed with zstd. Package names and tag values that
+carry identifiers must not contain path traversal components.
 
 Optional singleton tags are repo and commit, linking the release to a NIP-34
 repository and source commit. When present, `repo` must be a valid
@@ -60,9 +77,11 @@ publisher, and containing:
     ["x", "<sha256>"]
     ["reason", "<human-readable-reason>"]
 
-Clients treat a valid revocation referencing a release event as authoritative
-and reject that release. Deleting or replacing the original event is not
-required.
+The required tags occur exactly once, `e` is a 64-character event ID, `x` is
+exactly 64 hexadecimal characters, `version` is SemVer, and `reason` is
+non-empty. Clients treat a valid revocation referencing a release event as
+authoritative and reject that release. Deleting or replacing the original
+event is not required.
 
 ## Identity and trust
 
