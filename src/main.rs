@@ -81,6 +81,8 @@ struct LockedPackage {
     version: String,
     sha256: String,
     dependencies: Vec<Dependency>,
+    #[serde(default)]
+    conflicts: Vec<Dependency>,
 }
 
 #[derive(Subcommand)]
@@ -299,6 +301,8 @@ struct InstalledPackage {
     artifact: PathBuf,
     #[serde(default)]
     dependencies: Vec<Dependency>,
+    #[serde(default)]
+    conflicts: Vec<Dependency>,
     #[serde(default)]
     files: Vec<PathBuf>,
     #[serde(default)]
@@ -684,6 +688,7 @@ fn write_lockfile(path: &Path, root: &Path, install_order: &[String]) -> Result<
             version: package.version.clone(),
             sha256: package.sha256.clone(),
             dependencies: package.dependencies.clone(),
+            conflicts: package.conflicts.clone(),
         });
     }
     let lockfile = Lockfile {
@@ -741,6 +746,7 @@ fn verify_locked_install(lockfile: &Lockfile, root: &Path) -> Result<()> {
                 && package.version == locked.version
                 && package.sha256 == locked.sha256
                 && package.dependencies == locked.dependencies
+                && package.conflicts == locked.conflicts
         });
         if !found {
             bail!(
@@ -1592,6 +1598,7 @@ fn install_with_capabilities_at(
         sha256: manifest.sha256.to_ascii_lowercase(),
         artifact: destination,
         dependencies: manifest.dependencies.clone(),
+        conflicts: manifest.conflicts.clone(),
         files,
         runtime_requires: manifest.runtime_requires.clone(),
         provides: manifest.provides.clone(),
@@ -2248,6 +2255,7 @@ mod tests {
             sha256: "00".repeat(32),
             artifact: package_dir.join("service.npk"),
             dependencies: vec![],
+            conflicts: vec![],
             files: vec![service.clone()],
             runtime_requires: vec![],
             provides: vec![],
@@ -2278,6 +2286,7 @@ mod tests {
             sha256: "00".repeat(32),
             artifact: dir.path().join("artifact.npk"),
             dependencies: vec![],
+            conflicts: vec![],
             files: vec![path.clone()],
             runtime_requires: vec![],
             provides: vec![],
@@ -2329,6 +2338,7 @@ mod tests {
                 sha256: "00".repeat(32),
                 artifact: store.join("first"),
                 dependencies: vec![],
+                conflicts: vec![],
                 files: vec![shared.clone()],
                 runtime_requires: vec![],
                 provides: vec![],
@@ -2340,6 +2350,7 @@ mod tests {
                 sha256: "11".repeat(32),
                 artifact: store.join("second"),
                 dependencies: vec![],
+                conflicts: vec![],
                 files: vec![shared.clone()],
                 runtime_requires: vec![],
                 provides: vec![],
@@ -2369,6 +2380,7 @@ mod tests {
             sha256: "00".repeat(32),
             artifact: dir.path().join("artifact"),
             dependencies: vec![],
+            conflicts: vec![],
             files: vec![stale.clone(), current.clone()],
             runtime_requires: vec![],
             provides: vec![],
@@ -2571,6 +2583,7 @@ mod tests {
                 sha256: "00".repeat(32),
                 artifact: store.join("old"),
                 dependencies: vec![],
+                conflicts: vec![],
                 files: vec![],
                 runtime_requires: vec![],
                 provides: vec![],
@@ -2637,6 +2650,7 @@ mod tests {
                 sha256: "00".repeat(32),
                 artifact: store.join("libfoo"),
                 dependencies: vec![],
+                conflicts: vec![],
                 files: vec![],
                 runtime_requires: vec![],
                 provides: vec!["libfoo.so.2".into()],
@@ -2652,6 +2666,7 @@ mod tests {
                     name: "libfoo".into(),
                     requirement: ">=2.0.0".into(),
                 }],
+                conflicts: vec![],
                 files: vec![],
                 runtime_requires: vec![],
                 provides: vec![],
