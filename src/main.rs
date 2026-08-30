@@ -216,63 +216,116 @@ async fn install_ref(name: &str, relays: &[String], store: Option<&Path>) -> Res
         client.add_relay(relay).await?;
     }
     client.connect().await;
-    let releases = client
-        .fetch_events(Filter::new().kind(Kind::Custom(9900)).limit(500))
-        .timeout(std::time::Duration::from_secs(10))
-        .await?;
-    let release = releases
-        .into_iter()
-        .filter(|event| event.verify().is_ok())
-        .filter(|event| tag_value(event, "name") == Some(name))
-        .max_by_key(|event| {
-            tag_value(event, "version")
-                .and_then(|version| Version::parse(version).ok())
-                .unwrap_or_else(|| Version::new(0, 0, 0))
-        })
-        .context("no verified release found")?;
-    let artifact_event_id = tag_value(&release, "artifact")
-        .context("release has no artifact event")?
-        .parse::<EventId>()?;
-    let artifact_events = client
-        .fetch_events(Filter::new().kind(Kind::Custom(1063)).id(artifact_event_id))
-        .timeout(std::time::Duration::from_secs(10))
-        .await?;
-    let artifact_event = artifact_events
-        .into_iter()
-        .find(|event| event.verify().is_ok())
-        .context("no verified NIP-94 artifact event found")?;
-    if artifact_event.pubkey != release.pubkey {
-        bail!("release and artifact event publishers do not match");
-    }
-    let sha256 = tag_value(&release, "x").context("release has no artifact hash")?;
-    if tag_value(&artifact_event, "x") != Some(sha256) {
-        bail!("release and artifact event hashes do not match");
-    }
-    let url = tag_value(&artifact_event, "url").context("artifact event has no URL")?;
-    let mut server_url = Url::parse(url)?;
-    server_url.set_path("/");
-    server_url.set_query(None);
-    server_url.set_fragment(None);
-    let expected: Sha256Hash = sha256.parse()?;
-    let bytes = BlossomClient::new(server_url)
-        .get_blob::<Keys>(expected, None, None, None)
-        .await?;
-    if Sha256Hash::hash(&bytes) != expected {
-        bail!("downloaded artifact hash does not match release");
-    }
     let root = store.map(Path::to_path_buf).unwrap_or_else(default_store);
-    let staging = root.join("downloads").join(sha256);
-    fs::create_dir_all(&staging)?;
-    let artifact_path = staging.join("artifact");
-    fs::write(&artifact_path, bytes)?;
-    let manifest = manifest_from_release(&release, &artifact_path, sha256)?;
-    install(&manifest, &staging.join("manifest.json"), Some(&root))?;
+    let mut visiting = Vec::new();
+    let mut installed = Vec::new();
+    install_remote_package(&client, name, None, &root, &mut visiting, &mut installed).await?;
     client.disconnect().await;
-    println!(
-        "installed {}/{} {}",
-        release.pubkey, manifest.name, manifest.version
-    );
+    println!("install order: {}", installed.join(" -> "));
     Ok(())
+}
+
+use std::future::Future;
+use std::pin::Pin;
+
+fn install_remote_package<'a>(
+    client: &'a Client,
+    name: &'a str,
+    requirement: Option<String>,
+    root: &'a Path,
+    visiting: &'a mut Vec<String>,
+    installed: &'a mut Vec<String>,
+) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        if installed
+            .iter()
+            .any(|installed_name| installed_name == name)
+        {
+            return Ok(());
+        }
+        if visiting.iter().any(|visiting_name| visiting_name == name) {
+            bail!(
+                "dependency cycle detected: {} -> {}",
+                visiting.join(" -> "),
+                name
+            );
+        }
+        visiting.push(name.to_owned());
+        let releases = client
+            .fetch_events(Filter::new().kind(Kind::Custom(9900)).limit(500))
+            .timeout(std::time::Duration::from_secs(10))
+            .await?;
+        let release = releases
+            .into_iter()
+            .filter(|event| event.verify().is_ok())
+            .filter(|event| tag_value(event, "name") == Some(name))
+            .filter(|event| {
+                requirement.as_deref().map_or(true, |req| {
+                    VersionReq::parse(req)
+                        .ok()
+                        .zip(tag_value(event, "version").and_then(|v| Version::parse(v).ok()))
+                        .map(|(req, version)| req.matches(&version))
+                        .unwrap_or(false)
+                })
+            })
+            .max_by_key(|event| {
+                tag_value(event, "version")
+                    .and_then(|v| Version::parse(v).ok())
+                    .unwrap_or_else(|| Version::new(0, 0, 0))
+            })
+            .with_context(|| format!("no verified release found for {name}"))?;
+        let artifact_event_id = tag_value(&release, "artifact")
+            .context("release has no artifact event")?
+            .parse::<EventId>()?;
+        let artifact_events = client
+            .fetch_events(Filter::new().kind(Kind::Custom(1063)).id(artifact_event_id))
+            .timeout(std::time::Duration::from_secs(10))
+            .await?;
+        let artifact_event = artifact_events
+            .into_iter()
+            .find(|event| event.verify().is_ok())
+            .context("no verified NIP-94 artifact event found")?;
+        if artifact_event.pubkey != release.pubkey {
+            bail!("release and artifact event publishers do not match");
+        }
+        let sha256 = tag_value(&release, "x").context("release has no artifact hash")?;
+        if tag_value(&artifact_event, "x") != Some(sha256) {
+            bail!("release and artifact event hashes do not match");
+        }
+        let url = tag_value(&artifact_event, "url").context("artifact event has no URL")?;
+        let mut server_url = Url::parse(url)?;
+        server_url.set_path("/");
+        server_url.set_query(None);
+        server_url.set_fragment(None);
+        let expected: Sha256Hash = sha256.parse()?;
+        let bytes = BlossomClient::new(server_url)
+            .get_blob::<Keys>(expected, None, None, None)
+            .await?;
+        if Sha256Hash::hash(&bytes) != expected {
+            bail!("downloaded artifact hash does not match release");
+        }
+        let staging = root.join("downloads").join(sha256);
+        fs::create_dir_all(&staging)?;
+        let artifact_path = staging.join("artifact");
+        fs::write(&artifact_path, bytes)?;
+        let manifest = manifest_from_release(&release, &artifact_path, sha256)?;
+        let dependencies = manifest.dependencies.clone();
+        for dependency in dependencies {
+            install_remote_package(
+                client,
+                &dependency.name,
+                Some(dependency.requirement),
+                root,
+                visiting,
+                installed,
+            )
+            .await?;
+        }
+        install(&manifest, &staging.join("manifest.json"), Some(&root))?;
+        visiting.pop();
+        installed.push(manifest.name.clone());
+        Ok(())
+    })
 }
 
 fn tag_value<'a>(event: &'a Event, kind: &str) -> Option<&'a str> {

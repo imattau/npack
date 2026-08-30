@@ -8,7 +8,7 @@ npack is an independent package manager whose registry metadata will be publishe
 - Local package manifests and artifacts are the first vertical slice.
 - SHA-256 verification is mandatory before installation.
 - Installation is into an npack-managed store; native package managers are not required.
-- Automatic dependency fetching is a planned interface; relay-backed release discovery, Blossom retrieval, declared dependency validation, and signed release-event generation are implemented with official crates.
+- Relay-backed release discovery, Blossom retrieval, recursive dependency-first remote installation, declared dependency validation, and signed release-event generation are implemented with official crates. More advanced solving and publisher selection remain planned.
 
 ## Commands
 
