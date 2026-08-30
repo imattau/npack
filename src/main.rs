@@ -603,10 +603,13 @@ fn write_lockfile(path: &Path, root: &Path, install_order: &[String]) -> Result<
 
 fn load_lockfile(path: &Path) -> Result<Lockfile> {
     let bytes = fs::read(path).with_context(|| format!("reading lockfile {}", path.display()))?;
-    let lockfile: Lockfile = serde_json::from_slice(&bytes)
+    let mut lockfile: Lockfile = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing lockfile {}", path.display()))?;
     if lockfile.version != 1 {
         bail!("unsupported lockfile version: {}", lockfile.version);
+    }
+    for package in &mut lockfile.packages {
+        package.publisher = normalize_publisher_reference(&package.publisher);
     }
     Ok(lockfile)
 }
@@ -708,7 +711,8 @@ fn install_remote_package<'a>(
             })
             .filter(|event| {
                 locked_package.map_or(true, |package| {
-                    tag_value(event, "version") == Some(package.version.as_str())
+                    event.pubkey.to_hex() == package.publisher
+                        && tag_value(event, "version") == Some(package.version.as_str())
                         && tag_value(event, "x") == Some(package.sha256.as_str())
                 })
             })
