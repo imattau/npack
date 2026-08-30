@@ -29,6 +29,8 @@ struct Config {
     #[serde(default)]
     network: NetworkConfig,
     #[serde(default)]
+    storage: StorageConfig,
+    #[serde(default)]
     trust: TrustConfig,
     #[serde(default)]
     install: InstallConfig,
@@ -40,6 +42,12 @@ struct Config {
 struct NetworkConfig {
     #[serde(default)]
     relays: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StorageConfig {
+    #[serde(default)]
+    blossom: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -461,6 +469,7 @@ async fn main() -> Result<()> {
                 pubkey.as_deref(),
                 lockfile.as_deref(),
                 locked_packages.as_ref(),
+                &config.storage.blossom,
                 &allowed_capabilities,
             )
             .await?
@@ -600,6 +609,7 @@ async fn install_ref(
     user_pubkey: Option<&str>,
     lockfile: Option<&Path>,
     locked_packages: Option<&Lockfile>,
+    blossom_servers: &[String],
     allowed_capabilities: &[String],
 ) -> Result<()> {
     let client = Client::default();
@@ -620,6 +630,7 @@ async fn install_ref(
         user,
         trusted_publishers,
         user_pubkey,
+        blossom_servers,
         &root,
         &prefix,
         locked_packages,
@@ -737,6 +748,7 @@ fn install_remote_package<'a>(
     user: bool,
     trusted_publishers: &'a [String],
     user_pubkey: Option<&'a str>,
+    blossom_servers: &'a [String],
     root: &'a Path,
     prefix: &'a Path,
     locked_packages: Option<&'a Lockfile>,
@@ -861,18 +873,22 @@ fn install_remote_package<'a>(
             bail!("release and artifact event hashes do not match");
         }
         let expected: Sha256Hash = sha256.parse()?;
-        let urls = artifact_event
+        let mut urls = artifact_event
             .tags
             .iter()
             .filter(|tag| tag.kind() == "url")
             .filter_map(Tag::content)
+            .map(str::to_owned)
             .collect::<Vec<_>>();
+        urls.extend(blossom_servers.iter().cloned());
+        urls.sort();
+        urls.dedup();
         if urls.is_empty() {
             bail!("artifact event has no URL");
         }
         let mut bytes = None;
         for url in urls {
-            let mut server_url = match Url::parse(url) {
+            let mut server_url = match Url::parse(&url) {
                 Ok(url) => url,
                 Err(_) => continue,
             };
@@ -908,6 +924,7 @@ fn install_remote_package<'a>(
                 user,
                 trusted_publishers,
                 user_pubkey,
+                blossom_servers,
                 root,
                 prefix,
                 locked_packages,
