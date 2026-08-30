@@ -214,6 +214,15 @@ enum Command {
         #[arg(long, help = "Nostr pubkey whose NIP-65 write relays should be used")]
         pubkey: Option<String>,
     },
+    Init {
+        directory: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "0.1.0")]
+        version: String,
+        #[arg(long, help = "Publisher npub or hexadecimal public key")]
+        publisher: String,
+    },
     #[command(alias = "update")]
     InstallRef {
         package: String,
@@ -533,6 +542,12 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::Init {
+            directory,
+            name,
+            version,
+            publisher,
+        } => init_package(&directory, &name, &version, &publisher)?,
         Command::InstallRef {
             package,
             relays,
@@ -630,6 +645,54 @@ async fn install_remote_command(
         },
     )
     .await
+}
+
+fn init_package(directory: &Path, name: &str, version: &str, publisher: &str) -> Result<()> {
+    validate_package_name(name, "package name")?;
+    Version::parse(version).context("package version must be valid SemVer")?;
+    if publisher.is_empty()
+        || publisher.contains('/')
+        || publisher.contains('\\')
+        || publisher == "."
+        || publisher == ".."
+    {
+        bail!("publisher must be a single safe path component");
+    }
+    let metadata_dir = directory.join(".npack");
+    let manifest_path = metadata_dir.join("manifest.json");
+    if manifest_path.exists() {
+        bail!(
+            "package manifest already exists: {}",
+            manifest_path.display()
+        );
+    }
+    fs::create_dir_all(&metadata_dir)?;
+    let manifest = Manifest {
+        publisher: publisher.to_owned(),
+        name: name.to_owned(),
+        version: version.to_owned(),
+        artifact: format!("{name}-{version}-{OS}-{ARCH}.npk").into(),
+        sha256: String::new(),
+        dependencies: vec![],
+        conflicts: vec![],
+        artifact_event: None,
+        repo: None,
+        commit: None,
+        os: OS.into(),
+        arch: ARCH.into(),
+        format: "npk".into(),
+        runtime_requires: vec![],
+        provides: vec![],
+        post_install: vec![],
+    };
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    println!("created package scaffold at {}", directory.display());
+    println!(
+        "add payload files, then run: npack pack {} --output {}",
+        directory.display(),
+        manifest.artifact.display()
+    );
+    Ok(())
 }
 
 fn inspect_artifact(path: &Path) -> Result<()> {

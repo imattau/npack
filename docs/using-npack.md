@@ -88,6 +88,22 @@ Nostr using a signed release event.
 
 ## Creating an `.npk`
 
+Start a package scaffold with:
+
+```bash
+npack init ./myapp \
+  --name myapp \
+  --version 1.0.0 \
+  --publisher npub1...
+```
+
+This creates `.npack/manifest.json` with the host OS and architecture. Add
+payload files beneath the scaffold, then pack it:
+
+```bash
+npack pack ./myapp --output ./myapp-1.0.0-linux-x86_64.npk
+```
+
 Create a package root using normal host paths:
 
 ```text
@@ -421,6 +437,7 @@ OS and architecture.
 
 ```text
 npack pack <directory> --output <file.npk>
+npack init <directory> --name <name> --publisher <npub-or-hex> [--version <semver>]
 npack install <file.npk> [--user|--system|--store <path>]
 npack search <query> [--relay <url>]
 npack install <publisher>/<name> [options]
