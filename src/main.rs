@@ -785,7 +785,7 @@ fn validate_lockfile_graph(lockfile: &Lockfile) -> Result<()> {
                     && dependency
                         .publisher
                         .as_deref()
-                        .map_or(true, |publisher| candidate.publisher == publisher)
+                        .is_none_or(|publisher| candidate.publisher == publisher)
             });
             let candidates = matches.collect::<Vec<_>>();
             let candidate = match candidates.as_slice() {
@@ -822,7 +822,7 @@ fn validate_lockfile_graph(lockfile: &Lockfile) -> Result<()> {
                     && conflict
                         .publisher
                         .as_deref()
-                        .map_or(true, |publisher| candidate.publisher == publisher)
+                        .is_none_or(|publisher| candidate.publisher == publisher)
                     && VersionReq::parse(&conflict.requirement)
                         .ok()
                         .and_then(|requirement| {
@@ -923,7 +923,7 @@ fn install_remote_package<'a>(
             return Ok(());
         }
         if !trusted_publishers.is_empty()
-            && publisher.as_deref().map_or(false, |publisher| {
+            && publisher.as_deref().is_some_and(|publisher| {
                 !trusted_publishers
                     .iter()
                     .any(|trusted| trusted == publisher)
@@ -939,7 +939,7 @@ fn install_remote_package<'a>(
                     package.name == name
                         && publisher
                             .as_deref()
-                            .map_or(true, |publisher| package.publisher == publisher)
+                            .is_none_or(|publisher| package.publisher == publisher)
                 })
                 .collect::<Vec<_>>();
             match matches.as_slice() {
@@ -997,17 +997,17 @@ fn install_remote_package<'a>(
             .filter(|event| {
                 publisher
                     .as_deref()
-                    .map_or(true, |publisher| event.pubkey.to_hex() == publisher)
+                    .is_none_or(|publisher| event.pubkey.to_hex() == publisher)
             })
             .filter(|event| {
-                locked_package.map_or(true, |package| {
+                locked_package.is_none_or(|package| {
                     event.pubkey.to_hex() == package.publisher
                         && tag_value(event, "version") == Some(package.version.as_str())
                         && tag_value(event, "x") == Some(package.sha256.as_str())
                 })
             })
             .filter(|event| {
-                requirement.as_deref().map_or(true, |req| {
+                requirement.as_deref().is_none_or(|req| {
                     VersionReq::parse(req)
                         .ok()
                         .zip(tag_value(event, "version").and_then(|v| Version::parse(v).ok()))
@@ -1113,7 +1113,7 @@ fn install_remote_package<'a>(
         install_with_capabilities_at(
             &manifest,
             &staging.join("manifest.json"),
-            Some(&root),
+            Some(root),
             Some(prefix),
             user,
             allowed_capabilities,
@@ -1163,10 +1163,8 @@ async fn add_user_relays(client: &Client, user_pubkey: Option<&str>) -> Result<(
     for tag in event.tags.iter().filter(|tag| tag.kind() == "r") {
         let values = tag.clone().to_vec();
         let is_write_only = values.get(2).is_some_and(|marker| marker == "write");
-        if !is_write_only {
-            if let Some(relay) = values.get(1) {
-                client.add_relay(relay).await?;
-            }
+        if !is_write_only && let Some(relay) = values.get(1) {
+            client.add_relay(relay).await?;
         }
     }
     client.connect().await;
@@ -1363,10 +1361,10 @@ fn verify_release_event(event: &Event, manifest: &Manifest) -> Result<()> {
     event
         .verify()
         .context("invalid Nostr event ID or signature")?;
-    if let Ok(publisher) = PublicKey::parse(&manifest.publisher) {
-        if event.pubkey != publisher {
-            bail!("release event signer does not match manifest publisher");
-        }
+    if let Ok(publisher) = PublicKey::parse(&manifest.publisher)
+        && event.pubkey != publisher
+    {
+        bail!("release event signer does not match manifest publisher");
     }
     for (kind, expected) in [
         ("name", manifest.name.as_str()),
@@ -1403,10 +1401,10 @@ fn verify_release_event(event: &Event, manifest: &Manifest) -> Result<()> {
 
 fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) -> Result<Event> {
     let keys = Keys::parse(secret_hex).context("secret key must be hex or nsec")?;
-    if let Ok(publisher) = PublicKey::parse(&manifest.publisher) {
-        if keys.public_key() != publisher {
-            bail!("release signer does not match manifest publisher");
-        }
+    if let Ok(publisher) = PublicKey::parse(&manifest.publisher)
+        && keys.public_key() != publisher
+    {
+        bail!("release signer does not match manifest publisher");
     }
     let mut tags = vec![
         vec![
@@ -1555,15 +1553,14 @@ fn validate_package_name(name: &str, label: &str) -> Result<()> {
 fn validate_dependency_declarations(dependencies: &[Dependency]) -> Result<()> {
     for dependency in dependencies {
         validate_package_name(&dependency.name, "dependency name")?;
-        if let Some(publisher) = &dependency.publisher {
-            if publisher.is_empty()
+        if let Some(publisher) = &dependency.publisher
+            && (publisher.is_empty()
                 || publisher.contains('/')
                 || publisher.contains('\\')
                 || publisher == "."
-                || publisher == ".."
-            {
-                bail!("dependency publisher must be a single safe path component");
-            }
+                || publisher == "..")
+        {
+            bail!("dependency publisher must be a single safe path component");
         }
         VersionReq::parse(&dependency.requirement).with_context(|| {
             format!(
@@ -1798,14 +1795,14 @@ fn install_with_capabilities_at(
             fs::remove_dir_all(&staging)?;
         }
         extract_npk(&destination, &staging)?;
-        install_staged_npk(&staging, &prefix, &npk_entry_paths(&destination)?)?
+        install_staged_npk(&staging, prefix, &npk_entry_paths(&destination)?)?
     } else {
         vec![destination.clone()]
     };
     let mut files = files;
     files.extend(run_post_install(
         &manifest.post_install,
-        &prefix,
+        prefix,
         user,
         allowed_capabilities,
     )?);
@@ -2073,17 +2070,17 @@ fn rollback_entries(entries: &[(PathBuf, Option<PathBuf>)]) -> Result<()> {
         if destination.exists() || fs::symlink_metadata(destination).is_ok() {
             fs::remove_file(destination)?;
         }
-        if let Some(backup) = backup {
-            if backup.exists() || fs::symlink_metadata(backup).is_ok() {
-                if let Some(parent) = destination.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                if fs::symlink_metadata(backup)?.file_type().is_symlink() {
-                    symlink(fs::read_link(backup)?, destination)?;
-                } else {
-                    fs::copy(backup, destination)?;
-                    fs::set_permissions(destination, fs::metadata(backup)?.permissions())?;
-                }
+        if let Some(backup) = backup
+            && (backup.exists() || fs::symlink_metadata(backup).is_ok())
+        {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if fs::symlink_metadata(backup)?.file_type().is_symlink() {
+                symlink(fs::read_link(backup)?, destination)?;
+            } else {
+                fs::copy(backup, destination)?;
+                fs::set_permissions(destination, fs::metadata(backup)?.permissions())?;
             }
         }
     }
@@ -2177,7 +2174,7 @@ fn ensure_dependencies_available(manifest: &Manifest, store: &Path) -> Result<()
                 && conflict
                     .publisher
                     .as_deref()
-                    .map_or(true, |publisher| package.publisher == publisher)
+                    .is_none_or(|publisher| package.publisher == publisher)
                 && Version::parse(&package.version)
                     .map(|version| requirement.matches(&version))
                     .unwrap_or(false)
@@ -2202,7 +2199,7 @@ fn ensure_dependencies_available(manifest: &Manifest, store: &Path) -> Result<()
                 && dependency
                     .publisher
                     .as_deref()
-                    .map_or(true, |publisher| package.publisher == publisher)
+                    .is_none_or(|publisher| package.publisher == publisher)
                 && Version::parse(&package.version)
                     .map(|version| requirement.matches(&version))
                     .unwrap_or(false)
@@ -2365,9 +2362,7 @@ fn remove_package_at(package: &str, store: Option<&Path>, user: bool) -> Result<
                 && dependency
                     .publisher
                     .as_deref()
-                    .map_or(true, |dependency_publisher| {
-                        dependency_publisher == publisher
-                    })
+                    .is_none_or(|dependency_publisher| dependency_publisher == publisher)
         })
     }) {
         bail!("cannot remove {package}: it is required by an installed package");
@@ -2420,13 +2415,12 @@ fn remove_package_at(package: &str, store: Option<&Path>, user: bool) -> Result<
                 if owned_by_other_package {
                     continue;
                 }
-                if file.is_file()
+                if (file.is_file()
                     || fs::symlink_metadata(file)
-                        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                        .is_ok_and(|metadata| metadata.file_type().is_symlink()))
+                    && (file.exists() || fs::symlink_metadata(file).is_ok())
                 {
-                    if file.exists() || fs::symlink_metadata(file).is_ok() {
-                        fs::remove_file(file)?;
-                    }
+                    fs::remove_file(file)?;
                 }
             }
             let package_dir = root
