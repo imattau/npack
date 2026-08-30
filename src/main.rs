@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
+    env::consts::{ARCH, OS},
     fs, io,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -835,6 +836,7 @@ fn extract_npk(archive_path: &Path, destination: &Path) -> Result<Vec<PathBuf>> 
 
 fn ensure_dependencies_available(manifest: &Manifest, store: &Path) -> Result<()> {
     let installed = installed_packages(Some(store))?;
+    let system = system_capabilities();
     for dependency in &manifest.dependencies {
         let requirement = VersionReq::parse(&dependency.requirement).with_context(|| {
             format!(
@@ -867,7 +869,8 @@ fn ensure_dependencies_available(manifest: &Manifest, store: &Path) -> Result<()
                 .provides
                 .iter()
                 .any(|provided| provided == requirement)
-        }) {
+        }) && !system.contains(requirement)
+        {
             bail!(
                 "missing runtime capability {requirement} (provide it before {})",
                 manifest.name
@@ -875,6 +878,21 @@ fn ensure_dependencies_available(manifest: &Manifest, store: &Path) -> Result<()
         }
     }
     Ok(())
+}
+
+fn system_capabilities() -> HashSet<String> {
+    let mut capabilities = HashSet::from([format!("system:{OS}"), format!("system:{ARCH}")]);
+    for directory in ["/lib", "/lib64", "/usr/lib", "/usr/lib64"] {
+        if let Ok(entries) = fs::read_dir(directory) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("lib") && name.contains(".so") {
+                    capabilities.insert(name);
+                }
+            }
+        }
+    }
+    capabilities
 }
 
 fn installed_packages(store: Option<&Path>) -> Result<Vec<InstalledPackage>> {
