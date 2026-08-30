@@ -16,7 +16,7 @@ Persistent defaults can be configured in `$XDG_CONFIG_HOME/npack/config.toml` (o
     relays = ["wss://relay.example"]
 
     [identity]
-    pubkey = "<user-pubkey-hex>"
+    pubkey = "npub1..."
 
     [trust]
     publishers = ["<publisher-hex>"]

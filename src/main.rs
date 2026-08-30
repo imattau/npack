@@ -733,8 +733,8 @@ async fn add_user_relays(client: &Client, user_pubkey: Option<&str>) -> Result<(
     let Some(user_pubkey) = user_pubkey else {
         return Ok(());
     };
-    let pubkey = PublicKey::from_hex(user_pubkey)
-        .with_context(|| "NIP-65 pubkey must be 64-character hexadecimal")?;
+    let pubkey = PublicKey::parse(user_pubkey)
+        .with_context(|| "NIP-65 pubkey must be an npub or 64-character hexadecimal key")?;
     let events = client
         .fetch_events(
             Filter::new()
@@ -2186,6 +2186,18 @@ mod tests {
         let release_id = release.id.to_hex();
         assert_eq!(tag_value(&revocation, "e"), Some(release_id.as_str()));
         assert!(revocation.verify().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_user_facing_npub_relay_identity() -> Result<()> {
+        let keys = Keys::parse(&"11".repeat(32))?;
+        let npub = keys.public_key().to_bech32()?;
+        assert_eq!(PublicKey::parse(&npub)?, keys.public_key());
+        assert_eq!(
+            PublicKey::parse(&keys.public_key().to_hex())?,
+            keys.public_key()
+        );
         Ok(())
     }
 
