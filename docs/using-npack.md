@@ -265,6 +265,18 @@ older command name. The remote installation process is:
 Relays and storage servers are transport. They do not become package
 authorities merely because they served an event or file.
 
+To check every package in the selected install store for a newer release:
+
+```bash
+npack update --user
+npack update --system
+```
+
+The global update command uses the installed publisher/name and requires a
+strictly newer version, then reuses normal dependency resolution, artifact
+hash verification, and install ordering. A targeted update remains available
+with `npack update <publisher>/package`.
+
 Search displays progress on stderr while querying relays. Successful search
 results are cached locally for five minutes. The cache key includes the query,
 relay set, trusted-publisher filter, and NIP-65 identity, keeping results from

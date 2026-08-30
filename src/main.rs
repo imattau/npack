@@ -254,7 +254,7 @@ enum Command {
     },
     #[command(alias = "update")]
     InstallRef {
-        package: String,
+        package: Option<String>,
         #[arg(long = "relay")]
         relays: Vec<String>,
         #[arg(long = "server")]
@@ -447,6 +447,7 @@ async fn main() -> Result<()> {
             } else {
                 install_remote_command(
                     &target,
+                    None,
                     relays,
                     servers,
                     store,
@@ -639,22 +640,38 @@ async fn main() -> Result<()> {
             offline,
             allowed_capabilities,
         } => {
-            install_remote_command(
-                &package,
-                relays,
-                servers,
-                store,
-                user,
-                system,
-                trusted_publishers,
-                pubkey,
-                lockfile,
-                locked,
-                offline,
-                allowed_capabilities,
-                &config,
-            )
-            .await?
+            if let Some(package) = package {
+                install_remote_command(
+                    &package,
+                    None,
+                    relays,
+                    servers,
+                    store,
+                    user,
+                    system,
+                    trusted_publishers,
+                    pubkey,
+                    lockfile,
+                    locked,
+                    offline,
+                    allowed_capabilities,
+                    &config,
+                )
+                .await?
+            } else {
+                update_all_command(
+                    relays,
+                    servers,
+                    store,
+                    user,
+                    system,
+                    trusted_publishers,
+                    pubkey,
+                    allowed_capabilities,
+                    &config,
+                )
+                .await?
+            }
         }
         Command::Pack { source, output } => pack_npk(&source, &output)?,
         Command::Remove {
@@ -676,6 +693,7 @@ async fn main() -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn install_remote_command(
     package: &str,
+    requirement: Option<String>,
     relays: Vec<String>,
     servers: Vec<String>,
     store: Option<PathBuf>,
@@ -726,8 +744,68 @@ async fn install_remote_command(
             allowed_capabilities: &allowed_capabilities,
             offline,
         },
+        requirement,
     )
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_all_command(
+    relays: Vec<String>,
+    servers: Vec<String>,
+    store: Option<PathBuf>,
+    user: bool,
+    system: bool,
+    trusted_publishers: Vec<String>,
+    pubkey: Option<String>,
+    allowed_capabilities: Vec<String>,
+    config: &Config,
+) -> Result<()> {
+    let use_user = user || (!system && config.install.user);
+    let root = install_paths(store.as_deref(), use_user).0;
+    let mut installed = installed_packages(Some(&root))?;
+    installed.sort_by(|left, right| {
+        installed_package_reference(left).cmp(&installed_package_reference(right))
+    });
+    if installed.is_empty() {
+        println!("No installed packages to update.");
+        return Ok(());
+    }
+
+    let mut updated = 0;
+    for package in installed {
+        let reference = installed_package_reference(&package);
+        println!("Checking {reference} {}...", package.version);
+        let result = install_remote_command(
+            &reference,
+            Some(format!(">{}", package.version)),
+            relays.clone(),
+            servers.clone(),
+            store.clone(),
+            user,
+            system,
+            trusted_publishers.clone(),
+            pubkey.clone(),
+            None,
+            false,
+            false,
+            allowed_capabilities.clone(),
+            config,
+        )
+        .await;
+        match result {
+            Ok(()) => updated += 1,
+            Err(error)
+                if error.to_string()
+                    == format!("no verified release found for {}", package.name) =>
+            {
+                println!("  up to date");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    println!("Updated {updated} package(s).");
+    Ok(())
 }
 
 async fn connect_with_timeout(client: &Client) -> Result<()> {
@@ -1017,6 +1095,7 @@ async fn install_ref(
     name: &str,
     publisher: Option<String>,
     options: InstallRefOptions<'_>,
+    requirement: Option<String>,
 ) -> Result<()> {
     let InstallRefOptions {
         relays,
@@ -1053,7 +1132,7 @@ async fn install_ref(
         selected: HashMap::new(),
         offline,
     };
-    install_remote_package(&mut state, name.to_owned(), publisher, None).await?;
+    install_remote_package(&mut state, name.to_owned(), publisher, requirement).await?;
     if !offline {
         client.disconnect().await;
     }
@@ -2686,6 +2765,10 @@ fn display_package_reference(package: &str) -> String {
         .split_once('/')
         .map(|(publisher, name)| format!("{}/{}", display_publisher(publisher), name))
         .unwrap_or_else(|| package.to_owned())
+}
+
+fn installed_package_reference(package: &InstalledPackage) -> String {
+    format!("{}/{}", display_publisher(&package.publisher), package.name)
 }
 
 fn default_system_store() -> PathBuf {

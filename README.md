@@ -94,6 +94,7 @@ npack search myapp --relay wss://relay.example
 npack search myapp --refresh   # bypass the local search cache
 npack install <publisher>/myapp --relay wss://relay.example --user
 npack update <publisher>/myapp --relay wss://relay.example --user
+npack update --user                 # check all installed packages
 
 # Publish an artifact and its Nostr events
 npack publish ./myapp.manifest.json \
