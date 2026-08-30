@@ -1018,9 +1018,13 @@ fn install_remote_package<'a>(
                 })
             })
             .max_by_key(|event| {
-                tag_value(event, "version")
-                    .and_then(|v| Version::parse(v).ok())
-                    .unwrap_or_else(|| Version::new(0, 0, 0))
+                (
+                    tag_value(event, "version")
+                        .and_then(|v| Version::parse(v).ok())
+                        .unwrap_or_else(|| Version::new(0, 0, 0)),
+                    event.created_at.as_secs(),
+                    event.id.to_hex(),
+                )
             })
             .with_context(|| format!("no verified release found for {name}"))?;
         let artifact_event_id = tag_value(&release, "artifact")
