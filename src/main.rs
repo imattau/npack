@@ -1531,6 +1531,16 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
     validate_dependency_declarations(&conflicts)?;
     validate_capability_declarations(&runtime_requires, "runtime requirement")?;
     validate_capability_declarations(&provides, "provided capability")?;
+    let repo = tag_value(event, "repo").map(str::to_owned);
+    if let Some(repo) = &repo {
+        validate_repo_reference(repo)?;
+    }
+    let commit = tag_value(event, "commit").map(str::to_owned);
+    if let Some(commit) = &commit
+        && (commit.is_empty() || commit.chars().any(char::is_whitespace))
+    {
+        bail!("release commit must be a non-empty commit identifier");
+    }
     Ok(Manifest {
         publisher: event.pubkey.to_hex(),
         name: tag_value(event, "name")
@@ -1547,8 +1557,8 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
         dependencies,
         conflicts,
         artifact_event: tag_value(event, "artifact").map(str::to_owned),
-        repo: tag_value(event, "repo").map(str::to_owned),
-        commit: tag_value(event, "commit").map(str::to_owned),
+        repo,
+        commit,
         os: tag_value(event, "os").unwrap_or("any").into(),
         arch: tag_value(event, "arch").unwrap_or("any").into(),
         format: tag_value(event, "format").unwrap_or("opaque").into(),
@@ -1918,7 +1928,30 @@ fn load_manifest(path: &Path) -> Result<Manifest> {
     validate_dependency_declarations(&manifest.conflicts)?;
     validate_capability_declarations(&manifest.runtime_requires, "runtime requirement")?;
     validate_capability_declarations(&manifest.provides, "provided capability")?;
+    if let Some(repo) = &manifest.repo {
+        validate_repo_reference(repo)?;
+    }
+    if let Some(commit) = &manifest.commit
+        && (commit.is_empty() || commit.chars().any(char::is_whitespace))
+    {
+        bail!("manifest commit must be a non-empty commit identifier");
+    }
     Ok(manifest)
+}
+
+fn validate_repo_reference(repo: &str) -> Result<()> {
+    let mut parts = repo.splitn(3, ':');
+    let kind = parts.next();
+    let publisher = parts.next();
+    let identifier = parts.next();
+    if kind != Some("30617") {
+        bail!("manifest repo must be a NIP-34 kind:30617 address");
+    }
+    let publisher = publisher.context("manifest repo is missing its publisher")?;
+    PublicKey::parse(publisher).context("manifest repo publisher is not a valid Nostr key")?;
+    let identifier = identifier.context("manifest repo is missing its identifier")?;
+    validate_package_name(identifier, "manifest repo identifier")?;
+    Ok(())
 }
 
 fn validate_package_name(name: &str, label: &str) -> Result<()> {
@@ -3232,7 +3265,7 @@ mod tests {
             }],
             conflicts: vec![],
             artifact_event: Some("artifact-event-id".into()),
-            repo: Some("30617:publisher:hello".into()),
+            repo: Some(format!("30617:{}:hello", "11".repeat(32))),
             commit: Some("commit-sha".into()),
             os: "linux".into(),
             arch: "x86_64".into(),
@@ -3284,6 +3317,15 @@ mod tests {
         assert!(
             manifest_from_release(&duplicate, Path::new("artifact"), &manifest.sha256).is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn validates_nip34_repository_references() -> Result<()> {
+        let publisher = "11".repeat(32);
+        validate_repo_reference(&format!("30617:{publisher}:npack"))?;
+        assert!(validate_repo_reference("30617:not-a-key:npack").is_err());
+        assert!(validate_repo_reference(&format!("30617:{publisher}:../npack")).is_err());
         Ok(())
     }
 

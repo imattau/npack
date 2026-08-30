@@ -28,7 +28,11 @@ Clients verify the downloaded bytes against x; URLs and Blossom servers are
 transport only.
 
 Optional singleton tags are repo and commit, linking the release to a NIP-34
-repository and source commit.
+repository and source commit. When present, `repo` must be a valid
+`30617:<pubkey>:<identifier>` repository address and `commit` must be a
+non-empty commit identifier. Clients may use these values for provenance
+display and later repository-state verification; source availability is not
+required to install an otherwise valid artifact.
 
 Repeatable tags:
 
