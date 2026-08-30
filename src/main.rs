@@ -190,6 +190,17 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    Publish {
+        manifest: PathBuf,
+        #[arg(long, help = "32-byte hex-encoded Nostr secret key")]
+        secret_key: String,
+        #[arg(long = "relay")]
+        relays: Vec<String>,
+        #[arg(long = "server")]
+        servers: Vec<String>,
+        #[arg(long, help = "Nostr pubkey whose NIP-65 write relays should be used")]
+        pubkey: Option<String>,
+    },
     #[command(alias = "update")]
     InstallRef {
         package: String,
@@ -461,6 +472,24 @@ async fn main() -> Result<()> {
                 .chain(config.storage.blossom.iter().cloned())
                 .collect::<Vec<_>>();
             fetch_blob(&sha256, &servers, &output).await?
+        }
+        Command::Publish {
+            manifest,
+            secret_key,
+            relays,
+            servers,
+            pubkey,
+        } => {
+            let relays = configured_relays(relays, &config)?;
+            let servers = configured_servers(servers, &config)?;
+            publish_release(
+                &manifest,
+                &secret_key,
+                &relays,
+                &servers,
+                pubkey.or_else(|| config.identity.pubkey.clone()).as_deref(),
+            )
+            .await?
         }
         Command::InstallRef {
             package,
@@ -1213,6 +1242,9 @@ fn install_remote_package<'a, 'b>(
             if state.offline {
                 bail!("offline artifact cache is missing for SHA-256 {sha256}");
             }
+            let publisher_blossom_servers = discover_blossom_servers(state.client, &release.pubkey)
+                .await
+                .unwrap_or_default();
             let mut urls = artifact_event
                 .tags
                 .iter()
@@ -1220,6 +1252,7 @@ fn install_remote_package<'a, 'b>(
                 .filter_map(Tag::content)
                 .map(str::to_owned)
                 .collect::<Vec<String>>();
+            urls.extend(publisher_blossom_servers);
             urls.extend(state.blossom_servers.iter().cloned());
             urls.sort();
             urls.dedup();
@@ -1340,6 +1373,71 @@ async fn add_user_relays(client: &Client, user_pubkey: Option<&str>) -> Result<(
     }
     client.connect().await;
     Ok(())
+}
+
+async fn add_user_write_relays(client: &Client, user_pubkey: Option<&str>) -> Result<()> {
+    let Some(user_pubkey) = user_pubkey else {
+        return Ok(());
+    };
+    let pubkey = PublicKey::parse(user_pubkey)
+        .with_context(|| "NIP-65 pubkey must be an npub or 64-character hexadecimal key")?;
+    let events = client
+        .fetch_events(
+            Filter::new()
+                .kind(Kind::Custom(10002))
+                .author(pubkey)
+                .limit(1),
+        )
+        .timeout(std::time::Duration::from_secs(10))
+        .await?;
+    let Some(event) = events
+        .into_iter()
+        .filter(|event| event.verify().is_ok())
+        .max_by_key(|event| event.created_at.as_secs())
+    else {
+        return Ok(());
+    };
+    for tag in event.tags.iter().filter(|tag| tag.kind() == "r") {
+        let values = tag.clone().to_vec();
+        let is_read_only = values.get(2).is_some_and(|marker| marker == "read");
+        if !is_read_only && let Some(relay) = values.get(1) {
+            client.add_relay(relay).await?;
+        }
+    }
+    client.connect().await;
+    Ok(())
+}
+
+async fn discover_blossom_servers(client: &Client, publisher: &PublicKey) -> Result<Vec<String>> {
+    let events = client
+        .fetch_events(
+            Filter::new()
+                .kind(Kind::Custom(10063))
+                .author(*publisher)
+                .limit(10),
+        )
+        .timeout(std::time::Duration::from_secs(10))
+        .await?;
+    let Some(event) = events
+        .into_iter()
+        .filter(|event| event.verify().is_ok())
+        .max_by_key(|event| (event.created_at.as_secs(), event.id.to_hex()))
+    else {
+        return Ok(Vec::new());
+    };
+    let mut servers = event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind() == "server")
+        .filter_map(Tag::content)
+        .filter_map(|server| {
+            let server = server.trim();
+            (!server.is_empty()).then(|| server.trim_end_matches('/').to_owned())
+        })
+        .collect::<Vec<_>>();
+    servers.sort();
+    servers.dedup();
+    Ok(servers)
 }
 
 fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result<Manifest> {
@@ -1679,6 +1777,82 @@ fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) ->
         .map_err(Into::into)
 }
 
+async fn publish_release(
+    manifest_path: &Path,
+    secret_hex: &str,
+    relays: &[String],
+    servers: &[String],
+    user_pubkey: Option<&str>,
+) -> Result<()> {
+    let manifest = load_manifest(manifest_path)?;
+    verify_manifest(&manifest, manifest_path)?;
+    let keys = Keys::parse(secret_hex).context("secret key must be hex or nsec")?;
+    let publisher = PublicKey::parse(&manifest.publisher)
+        .context("publish manifest publisher must be an npub or hex public key")?;
+    if keys.public_key() != publisher {
+        bail!("publish signer does not match manifest publisher");
+    }
+    let bytes = fs::read(artifact_path(&manifest, manifest_path))?;
+    let expected = Sha256Hash::hash(&bytes);
+    let mut descriptor = None;
+    for server in servers {
+        match BlossomClient::new(Url::parse(server)?)
+            .upload_blob(
+                bytes.clone(),
+                Some("application/zstd".into()),
+                None,
+                Some(&keys),
+            )
+            .await
+        {
+            Ok(candidate) if candidate.sha256 == expected => {
+                descriptor = Some(candidate);
+                break;
+            }
+            Ok(_) | Err(_) => continue,
+        }
+    }
+    let descriptor = descriptor.context("no Blossom server accepted the artifact upload")?;
+    let artifact_event =
+        sign_artifact_event(&manifest, descriptor.url.as_ref(), bytes.len(), &keys)?;
+    let mut release_manifest = manifest.clone();
+    release_manifest.artifact_event = Some(artifact_event.id.to_hex());
+    let created_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let release_event = sign_release_event(&release_manifest, secret_hex, created_at)?;
+
+    let client = Client::default();
+    for relay in relays {
+        client.add_relay(relay).await?;
+    }
+    client.connect().await;
+    add_user_write_relays(&client, user_pubkey).await?;
+    client
+        .send_event(&artifact_event)
+        .await
+        .context("publishing NIP-94 artifact event")?;
+    client
+        .send_event(&release_event)
+        .await
+        .context("publishing package release event")?;
+    client.disconnect().await;
+    println!("artifact event: {}", artifact_event.id);
+    println!("release event: {}", release_event.id);
+    Ok(())
+}
+
+fn sign_artifact_event(manifest: &Manifest, url: &str, size: usize, keys: &Keys) -> Result<Event> {
+    let tags = vec![
+        Tag::parse(vec!["url".to_owned(), url.to_owned()])?,
+        Tag::parse(vec!["m".to_owned(), "application/zstd".to_owned()])?,
+        Tag::parse(vec!["x".to_owned(), manifest.sha256.to_ascii_lowercase()])?,
+        Tag::parse(vec!["size".to_owned(), size.to_string()])?,
+    ];
+    EventBuilder::new(Kind::Custom(1063), manifest.name.clone())
+        .tags(tags)
+        .finalize(keys)
+        .map_err(Into::into)
+}
+
 fn sign_revocation_event(
     release: &Event,
     secret_hex: &str,
@@ -1869,10 +2043,35 @@ fn configured_relays(cli_relays: Vec<String>, config: &Config) -> Result<Vec<Str
     } else {
         cli_relays
     };
+    let mut relays = relays
+        .into_iter()
+        .map(|relay| relay.trim().trim_end_matches('/').to_owned())
+        .filter(|relay| !relay.is_empty())
+        .collect::<Vec<_>>();
+    relays.sort();
+    relays.dedup();
     if relays.is_empty() {
         bail!("no relays configured; pass --relay or configure [network].relays");
     }
     Ok(relays)
+}
+
+fn configured_servers(cli_servers: Vec<String>, config: &Config) -> Result<Vec<String>> {
+    let mut servers = if cli_servers.is_empty() {
+        config.storage.blossom.clone()
+    } else {
+        cli_servers
+    }
+    .into_iter()
+    .map(|server| server.trim().trim_end_matches('/').to_owned())
+    .filter(|server| !server.is_empty())
+    .collect::<Vec<_>>();
+    servers.sort();
+    servers.dedup();
+    if servers.is_empty() {
+        bail!("no Blossom servers configured; pass --server or configure [storage].blossom");
+    }
+    Ok(servers)
 }
 
 fn configured_publishers(cli_publishers: Vec<String>, config: &Config) -> Result<Vec<String>> {
