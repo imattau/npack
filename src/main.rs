@@ -103,7 +103,7 @@ enum Command {
         artifact: PathBuf,
     },
     Verify {
-        manifest: PathBuf,
+        target: PathBuf,
     },
     Install {
         target: String,
@@ -371,9 +371,13 @@ async fn main() -> Result<()> {
     let config = load_config()?;
     match Cli::parse().command {
         Command::Hash { artifact } => println!("{}", hash_file(&artifact)?),
-        Command::Verify { manifest } => {
-            let package = load_manifest(&manifest)?;
-            verify_manifest(&package, &manifest)?;
+        Command::Verify { target } => {
+            let package = if target.extension().and_then(|ext| ext.to_str()) == Some("npk") {
+                load_embedded_manifest(&target)?
+            } else {
+                load_manifest(&target)?
+            };
+            verify_manifest(&package, &target)?;
             println!(
                 "verified {}/{} {}",
                 package.publisher, package.name, package.version

@@ -74,6 +74,7 @@ npack inspect ./myapp-1.0.0.npk
 # Install and inspect local packages
 # The package metadata is embedded in the .npk.
 npack install ./myapp-1.0.0.npk --user
+npack verify ./myapp-1.0.0.npk
 npack list --user
 npack verify-installed --user
 npack remove <publisher>/myapp --user

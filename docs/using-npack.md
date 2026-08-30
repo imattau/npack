@@ -146,6 +146,7 @@ npack manifest ./myapp-1.0.0.npk \
   --output ./myapp-1.0.0.manifest.json
 npack hash ./myapp-1.0.0.npk
 npack inspect ./myapp-1.0.0.npk
+npack verify ./myapp-1.0.0.npk
 ```
 
 `npack pack` preserves directory structure, executable permissions and
@@ -183,7 +184,7 @@ sha256=$(npack hash ./myapp-1.0.0.npk)
 The external manifest is used by the publishing and verification commands;
 end users normally receive equivalent release metadata from Nostr.
 
-Generate it from a completed archive instead of copying the embedded
+Generate an external release manifest from a completed archive instead of copying the embedded
 metadata by hand:
 
 ```bash
@@ -450,6 +451,7 @@ npack pack <directory> --output <file.npk>
 npack init <directory> --name <name> --publisher <npub-or-hex> [--version <semver>]
 npack manifest <file.npk> --output <manifest.json>
 npack install <file.npk> [--user|--system|--store <path>]
+npack verify <file.npk-or-manifest.json>
 npack search <query> [--relay <url>]
 npack install <publisher>/<name> [options]
 npack install-ref <publisher>/<name> [options]  # compatibility alias
