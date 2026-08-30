@@ -917,6 +917,7 @@ fn install_with_capabilities_at(
             &manifest.version,
         )?;
     }
+    validate_post_install_actions(&manifest.post_install, allowed_capabilities)?;
     let files = if manifest.format == "npk" {
         let staging = package_dir.join("payload");
         if staging.exists() {
@@ -966,30 +967,9 @@ fn run_post_install(
     user: bool,
     allowed_capabilities: &[String],
 ) -> Result<Vec<PathBuf>> {
+    validate_post_install_actions(actions, allowed_capabilities)?;
     let mut created = Vec::new();
     for action in actions {
-        let capability = if action.action == "create-directory" {
-            "filesystem:install-prefix"
-        } else if action.action == "register-service" {
-            "service-manager"
-        } else {
-            action.action.as_str()
-        };
-        if action.action != "create-directory"
-            && !allowed_capabilities
-                .iter()
-                .any(|allowed| allowed == capability)
-        {
-            bail!("post-install action requires capability: {capability}");
-        }
-        if action.path.is_absolute()
-            || action
-                .path
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
-            bail!("unsafe post-install path: {}", action.path.display());
-        }
         match action.action.as_str() {
             "create-directory" => fs::create_dir_all(prefix.join(&action.path))?,
             "register-service" => {
@@ -1013,6 +993,49 @@ fn run_post_install(
         }
     }
     Ok(created)
+}
+
+fn validate_post_install_actions(
+    actions: &[PostInstallAction],
+    allowed_capabilities: &[String],
+) -> Result<()> {
+    for action in actions {
+        let capability = if action.action == "create-directory" {
+            "filesystem:install-prefix"
+        } else if action.action == "register-service" {
+            "service-manager"
+        } else {
+            action.action.as_str()
+        };
+        if action.action != "create-directory"
+            && !allowed_capabilities
+                .iter()
+                .any(|allowed| allowed == capability)
+        {
+            bail!("post-install action requires capability: {capability}");
+        }
+        if action.path.is_absolute()
+            || action
+                .path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            bail!("unsafe post-install path: {}", action.path.display());
+        }
+        if action.action == "register-service"
+            && action
+                .path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("service")
+        {
+            bail!("register-service requires a .service file");
+        }
+        if action.action != "create-directory" && action.action != "register-service" {
+            bail!("unsupported post-install action: {}", action.action);
+        }
+    }
+    Ok(())
 }
 
 fn npk_entry_paths(archive_path: &Path) -> Result<Vec<PathBuf>> {
