@@ -82,4 +82,8 @@ attestation, and publishes the bundle to Blossom and Nostr when the protected
 `NOSTR_BLOSSOM_SERVERS` configured. Use a dedicated publisher key rather than
 a personal primary identity.
 
+The reference release workflow derives `runtime_requires` for the first
+`npack` package from the built executable's ELF dependencies before publishing
+its manifest.
+
 Offline locked replay is available with `--locked --offline`. Online installs cache the verified v1 release and NIP-94 events under the package state directory and reuse the verified artifact cache; offline replay requires those cache entries and never queries relays or Blossom servers. Delegated/offline release keys remain a separate future extension.

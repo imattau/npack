@@ -56,13 +56,17 @@ jobs:
           }
           artifact="npack-${VERSION}-linux-x86_64.npk"
           sha256=$(sha256sum "package-output/$artifact" | cut -d ' ' -f 1)
+          runtime_requires=$(cargo run --quiet -- inspect target/release/npack \
+            | awk '/^needed: / { sub(/^needed: /, ""); if ($0 != "none") print }' \
+            | jq -R -s 'split("\n") | map(select(length > 0))')
           jq -n \
             --arg publisher "$PUBLISHER" \
             --arg name npack \
             --arg version "$VERSION" \
             --arg artifact "$artifact" \
             --arg sha256 "$sha256" \
-            '{publisher:$publisher,name:$name,version:$version,artifact:$artifact,sha256:$sha256,dependencies:[],conflicts:[],os:"linux",arch:"x86_64",format:"npk",runtime_requires:[],provides:[]}' \
+            --argjson runtime_requires "$runtime_requires" \
+            '{publisher:$publisher,name:$name,version:$version,artifact:$artifact,sha256:$sha256,dependencies:[],conflicts:[],os:"linux",arch:"x86_64",format:"npk",runtime_requires:$runtime_requires,provides:[]}' \
             > package-output/npack-${VERSION}.manifest.json
           sha256sum "package-output/$artifact" > package-output/SHA256SUMS
 

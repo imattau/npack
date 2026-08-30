@@ -8,10 +8,12 @@ For a `v<version>` tag, the workflow:
 
 1. Builds `npack` in release mode.
 2. Creates a deterministic Linux x86-64 `.npk` archive.
-3. Writes a package manifest and SHA-256 checksum file.
-4. Generates an SPDX SBOM.
-5. Creates a GitHub build-provenance attestation for the `.npk`.
-6. Uploads the bundle as a GitHub Release and workflow artifact.
+3. Inspects the built executable's ELF `DT_NEEDED` entries and writes them as
+   `runtime_requires` in the package manifest.
+4. Writes a package manifest and SHA-256 checksum file.
+5. Generates an SPDX SBOM.
+6. Creates a GitHub build-provenance attestation for the `.npk`.
+7. Uploads the bundle as a GitHub Release and workflow artifact.
 
 Set the repository variable `NOSTR_PUBLISHER` to the publisher's public key.
 Configure the protected `release` environment with the secret
