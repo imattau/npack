@@ -35,12 +35,16 @@ enum Command {
         manifest: PathBuf,
         #[arg(long)]
         store: Option<PathBuf>,
+        #[arg(long, help = "Install into the current user's ~/.local prefix")]
+        user: bool,
         #[arg(long = "allow-capability")]
         allowed_capabilities: Vec<String>,
     },
     List {
         #[arg(long)]
         store: Option<PathBuf>,
+        #[arg(long, help = "List packages installed in the user's prefix")]
+        user: bool,
     },
     ReleaseEvent {
         manifest: PathBuf,
@@ -71,6 +75,8 @@ enum Command {
         relays: Vec<String>,
         #[arg(long)]
         store: Option<PathBuf>,
+        #[arg(long, help = "Install into the current user's ~/.local prefix")]
+        user: bool,
         #[arg(long = "allow-capability")]
         allowed_capabilities: Vec<String>,
     },
@@ -83,6 +89,8 @@ enum Command {
         package: String,
         #[arg(long)]
         store: Option<PathBuf>,
+        #[arg(long, help = "Remove a package from the user's prefix")]
+        user: bool,
     },
     Inspect {
         artifact: PathBuf,
@@ -174,6 +182,7 @@ async fn main() -> Result<()> {
         Command::Install {
             manifest,
             store,
+            user,
             allowed_capabilities,
         } => {
             let package = load_manifest(&manifest)?;
@@ -182,6 +191,7 @@ async fn main() -> Result<()> {
                 &package,
                 &manifest,
                 store.as_deref(),
+                user,
                 &allowed_capabilities,
             )?;
             println!(
@@ -189,8 +199,8 @@ async fn main() -> Result<()> {
                 installed.publisher, installed.name, installed.version
             );
         }
-        Command::List { store } => {
-            for package in installed_packages(store.as_deref())? {
+        Command::List { store, user } => {
+            for package in installed_packages(Some(&install_paths(store.as_deref(), user).0))? {
                 println!("{}/{} {}", package.publisher, package.name, package.version);
             }
         }
@@ -237,6 +247,7 @@ async fn main() -> Result<()> {
             package,
             relays,
             store,
+            user,
             allowed_capabilities,
         } => {
             let (publisher, name) = package
@@ -247,12 +258,17 @@ async fn main() -> Result<()> {
                 publisher,
                 &relays,
                 store.as_deref(),
+                user,
                 &allowed_capabilities,
             )
             .await?
         }
         Command::Pack { source, output } => pack_npk(&source, &output)?,
-        Command::Remove { package, store } => remove_package(&package, store.as_deref())?,
+        Command::Remove {
+            package,
+            store,
+            user,
+        } => remove_package_at(&package, store.as_deref(), user)?,
         Command::Inspect { artifact } => inspect_artifact(&artifact)?,
     }
     Ok(())
@@ -372,6 +388,7 @@ async fn install_ref(
     publisher: Option<String>,
     relays: &[String],
     store: Option<&Path>,
+    user: bool,
     allowed_capabilities: &[String],
 ) -> Result<()> {
     let client = Client::default();
@@ -379,7 +396,7 @@ async fn install_ref(
         client.add_relay(relay).await?;
     }
     client.connect().await;
-    let root = store.map(Path::to_path_buf).unwrap_or_else(default_store);
+    let (root, prefix) = install_paths(store, user);
     let mut visiting = Vec::new();
     let mut installed = Vec::new();
     install_remote_package(
@@ -388,7 +405,9 @@ async fn install_ref(
         publisher,
         None,
         allowed_capabilities,
+        user,
         &root,
+        &prefix,
         &mut visiting,
         &mut installed,
     )
@@ -407,7 +426,9 @@ fn install_remote_package<'a>(
     publisher: Option<String>,
     requirement: Option<String>,
     allowed_capabilities: &'a [String],
+    user: bool,
     root: &'a Path,
+    prefix: &'a Path,
     visiting: &'a mut Vec<String>,
     installed: &'a mut Vec<String>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
@@ -502,16 +523,20 @@ fn install_remote_package<'a>(
                 dependency.publisher,
                 Some(dependency.requirement),
                 allowed_capabilities,
+                user,
                 root,
+                prefix,
                 visiting,
                 installed,
             )
             .await?;
         }
-        install_with_capabilities(
+        install_with_capabilities_at(
             &manifest,
             &staging.join("manifest.json"),
             Some(&root),
+            Some(prefix),
+            user,
             allowed_capabilities,
         )?;
         visiting.pop();
@@ -806,21 +831,61 @@ fn default_store() -> PathBuf {
         .join("npack")
 }
 
+fn default_system_store() -> PathBuf {
+    PathBuf::from("/var/lib/npack")
+}
+
+fn install_paths(store: Option<&Path>, user: bool) -> (PathBuf, PathBuf) {
+    if let Some(store) = store {
+        return (store.to_path_buf(), store.join("packages"));
+    }
+    if user {
+        let state = default_store();
+        let prefix = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".local");
+        (state, prefix)
+    } else {
+        (default_system_store(), PathBuf::from("/"))
+    }
+}
+
+#[cfg(test)]
 fn install(
     manifest: &Manifest,
     manifest_path: &Path,
     store: Option<&Path>,
 ) -> Result<InstalledPackage> {
-    install_with_capabilities(manifest, manifest_path, store, &[])
+    install_with_capabilities(manifest, manifest_path, store, false, &[])
 }
 
 fn install_with_capabilities(
     manifest: &Manifest,
     manifest_path: &Path,
     store: Option<&Path>,
+    user: bool,
     allowed_capabilities: &[String],
 ) -> Result<InstalledPackage> {
-    let root = store.map(Path::to_path_buf).unwrap_or_else(default_store);
+    install_with_capabilities_at(
+        manifest,
+        manifest_path,
+        store,
+        None,
+        user,
+        allowed_capabilities,
+    )
+}
+
+fn install_with_capabilities_at(
+    manifest: &Manifest,
+    manifest_path: &Path,
+    store: Option<&Path>,
+    prefix_override: Option<&Path>,
+    user: bool,
+    allowed_capabilities: &[String],
+) -> Result<InstalledPackage> {
+    let (root, default_prefix) = install_paths(store, user);
+    let prefix = prefix_override.unwrap_or(&default_prefix);
     ensure_dependencies_available(manifest, &root)?;
     let package_dir = root
         .join("packages")
@@ -838,14 +903,15 @@ fn install_with_capabilities(
     fs::copy(artifact_path(manifest, manifest_path), &destination)
         .context("copying verified artifact")?;
     let files = if manifest.format == "npk" {
-        extract_npk(&destination, &package_dir)?
+        extract_npk(&destination, &prefix)?
     } else {
         vec![destination.clone()]
     };
     let mut files = files;
     files.extend(run_post_install(
         &manifest.post_install,
-        &package_dir,
+        &prefix,
+        user,
         allowed_capabilities,
     )?);
     let installed = InstalledPackage {
@@ -876,13 +942,14 @@ fn install_with_capabilities(
 
 fn run_post_install(
     actions: &[PostInstallAction],
-    package_dir: &Path,
+    prefix: &Path,
+    user: bool,
     allowed_capabilities: &[String],
 ) -> Result<Vec<PathBuf>> {
     let mut created = Vec::new();
     for action in actions {
         let capability = if action.action == "create-directory" {
-            "filesystem:package-store"
+            "filesystem:install-prefix"
         } else if action.action == "register-service" {
             "service-manager"
         } else {
@@ -904,16 +971,20 @@ fn run_post_install(
             bail!("unsafe post-install path: {}", action.path.display());
         }
         match action.action.as_str() {
-            "create-directory" => fs::create_dir_all(package_dir.join(&action.path))?,
+            "create-directory" => fs::create_dir_all(prefix.join(&action.path))?,
             "register-service" => {
-                let source = package_dir.join(&action.path);
+                let source = prefix.join(&action.path);
                 if source.extension().and_then(|extension| extension.to_str()) != Some("service") {
                     bail!("register-service requires a .service file");
                 }
-                let destination = dirs::config_dir()
-                    .context("cannot determine user config directory")?
-                    .join("systemd/user")
-                    .join(source.file_name().context("service path has no filename")?);
+                let destination = if user {
+                    dirs::config_dir()
+                        .context("cannot determine user config directory")?
+                        .join("systemd/user")
+                } else {
+                    PathBuf::from("/etc/systemd/system")
+                }
+                .join(source.file_name().context("service path has no filename")?);
                 fs::create_dir_all(destination.parent().unwrap())?;
                 fs::copy(source, &destination)?;
                 created.push(destination);
@@ -1047,7 +1118,9 @@ fn system_capabilities() -> HashSet<String> {
 }
 
 fn installed_packages(store: Option<&Path>) -> Result<Vec<InstalledPackage>> {
-    let root = store.map(Path::to_path_buf).unwrap_or_else(default_store);
+    let root = store
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_system_store);
     let path = root.join("installed.json");
     if !path.exists() {
         return Ok(Vec::new());
@@ -1055,14 +1128,19 @@ fn installed_packages(store: Option<&Path>) -> Result<Vec<InstalledPackage>> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
+#[cfg(test)]
 fn remove_package(package: &str, store: Option<&Path>) -> Result<()> {
+    remove_package_at(package, store, false)
+}
+
+fn remove_package_at(package: &str, store: Option<&Path>, user: bool) -> Result<()> {
     let (publisher, name) = package
         .split_once('/')
         .context("package reference must be publisher/name")?;
     if publisher.is_empty() || name.is_empty() || publisher.contains('/') || name.contains('/') {
         bail!("package reference must be publisher/name");
     }
-    let root = store.map(Path::to_path_buf).unwrap_or_else(default_store);
+    let root = install_paths(store, user).0;
     let packages = installed_packages(Some(&root))?;
     if packages.iter().any(|installed| {
         installed.dependencies.iter().any(|dependency| {
@@ -1370,6 +1448,7 @@ mod tests {
                 path: "var/cache".into(),
             }],
             dir.path(),
+            true,
             &[],
         )?;
         assert!(dir.path().join("var/cache").is_dir());
@@ -1379,6 +1458,7 @@ mod tests {
                 path: "../escape".into(),
             }],
             dir.path(),
+            true,
             &[],
         )
         .unwrap_err();
@@ -1389,6 +1469,7 @@ mod tests {
                 path: "hello.service".into(),
             }],
             dir.path(),
+            true,
             &[],
         )
         .unwrap_err();
