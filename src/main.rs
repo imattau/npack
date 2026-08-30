@@ -1714,13 +1714,30 @@ fn release_event_is_v1(event: &Event) -> bool {
 }
 
 fn revocation_event_is_v1(event: &Event) -> bool {
-    event.kind.as_u16() == REVOCATION_KIND
-        && ["v", "e", "name", "version", "x", "reason"]
+    if event.kind.as_u16() != REVOCATION_KIND
+        || tag_value(event, "v") != Some(PROTOCOL_VERSION)
+        || ["v", "e", "name", "version", "x", "reason"]
             .iter()
-            .all(|kind| tag_value(event, kind).is_some())
-        && tag_value(event, "v") == Some(PROTOCOL_VERSION)
+            .any(|kind| event.tags.iter().filter(|tag| tag.kind() == *kind).count() != 1)
+    {
+        return false;
+    }
+    let Some(release_id) = tag_value(event, "e") else {
+        return false;
+    };
+    if release_id.parse::<EventId>().is_err() {
+        return false;
+    }
+    let Some(name) = tag_value(event, "name") else {
+        return false;
+    };
+    if validate_package_name(name, "revocation package name").is_err() {
+        return false;
+    }
+    tag_value(event, "version").is_some_and(|version| Version::parse(version).is_ok())
         && tag_value(event, "x")
             .is_some_and(|hash| hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+        && tag_value(event, "reason").is_some_and(|reason| !reason.trim().is_empty())
 }
 
 fn validate_artifact_event(event: &Event, publisher: &PublicKey, sha256: &str) -> Result<()> {
