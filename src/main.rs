@@ -2204,7 +2204,7 @@ fn capability_satisfies(requirement: &str, provided: &str) -> bool {
 
 fn system_capabilities() -> HashSet<String> {
     let mut capabilities = HashSet::from([format!("system:{OS}"), format!("system:{ARCH}")]);
-    for directory in ["/lib", "/lib64", "/usr/lib", "/usr/lib64"] {
+    for directory in host_library_directories() {
         if let Ok(entries) = fs::read_dir(directory) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
@@ -2215,6 +2215,29 @@ fn system_capabilities() -> HashSet<String> {
         }
     }
     capabilities
+}
+
+fn host_library_directories() -> Vec<PathBuf> {
+    let mut directories = vec![
+        PathBuf::from("/lib"),
+        PathBuf::from("/lib64"),
+        PathBuf::from("/usr/lib"),
+        PathBuf::from("/usr/lib64"),
+    ];
+    let multiarch = match ARCH {
+        "x86_64" => Some("x86_64-linux-gnu"),
+        "aarch64" => Some("aarch64-linux-gnu"),
+        "x86" => Some("i386-linux-gnu"),
+        "arm" => Some("arm-linux-gnueabihf"),
+        _ => None,
+    };
+    if let Some(multiarch) = multiarch {
+        directories.extend([
+            PathBuf::from("/lib").join(multiarch),
+            PathBuf::from("/usr/lib").join(multiarch),
+        ]);
+    }
+    directories
 }
 
 fn installed_packages(store: Option<&Path>) -> Result<Vec<InstalledPackage>> {
@@ -2951,6 +2974,23 @@ mod tests {
             "libfoo-api@2.4.1"
         ));
         assert!(capability_satisfies("libfoo.so.2", "libfoo.so.2"));
+    }
+
+    #[test]
+    fn includes_host_multiarch_library_paths() {
+        let directories = host_library_directories();
+        assert!(
+            directories
+                .iter()
+                .any(|directory| directory == Path::new("/lib"))
+        );
+        if ARCH == "x86_64" {
+            assert!(
+                directories
+                    .iter()
+                    .any(|directory| directory == Path::new("/lib/x86_64-linux-gnu"))
+            );
+        }
     }
 
     #[test]
