@@ -2170,7 +2170,7 @@ fn ensure_dependencies_available(manifest: &Manifest, store: &Path) -> Result<()
                 .provides
                 .iter()
                 .any(|provided| capability_satisfies(requirement, provided))
-        }) && system
+        }) && !system
             .iter()
             .any(|provided| capability_satisfies(requirement, provided))
         {
@@ -2292,6 +2292,40 @@ fn remove_package_at(package: &str, store: Option<&Path>, user: bool) -> Result<
         })
     }) {
         bail!("cannot remove {package}: it is required by an installed package");
+    }
+    let removed = packages
+        .iter()
+        .filter(|installed| installed.publisher == publisher && installed.name == name)
+        .collect::<Vec<_>>();
+    let remaining_candidates = packages
+        .iter()
+        .filter(|installed| !(installed.publisher == publisher && installed.name == name))
+        .collect::<Vec<_>>();
+    let system = system_capabilities();
+    for dependent in &remaining_candidates {
+        for requirement in &dependent.runtime_requires {
+            let target_provides = removed.iter().any(|installed| {
+                installed
+                    .provides
+                    .iter()
+                    .any(|provided| capability_satisfies(requirement, provided))
+            });
+            let alternative_exists = remaining_candidates.iter().any(|installed| {
+                installed
+                    .provides
+                    .iter()
+                    .any(|provided| capability_satisfies(requirement, provided))
+            }) || system
+                .iter()
+                .any(|provided| capability_satisfies(requirement, provided));
+            if target_provides && !alternative_exists {
+                bail!(
+                    "cannot remove {package}: it provides runtime capability {requirement} required by {}/{}",
+                    dependent.publisher,
+                    dependent.name
+                );
+            }
+        }
     }
     let mut remaining = Vec::new();
     let mut removed = 0;
@@ -2866,6 +2900,43 @@ mod tests {
                 .to_string()
                 .contains("required by an installed package")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_removing_required_runtime_provider() -> Result<()> {
+        let dir = tempdir()?;
+        let store = dir.path().join("store");
+        fs::create_dir_all(&store)?;
+        let packages = vec![
+            InstalledPackage {
+                publisher: "pub".into(),
+                name: "libfoo".into(),
+                version: "2.0.0".into(),
+                sha256: "00".repeat(32),
+                artifact: store.join("libfoo"),
+                dependencies: vec![],
+                conflicts: vec![],
+                files: vec![],
+                runtime_requires: vec![],
+                provides: vec!["libfoo.so.2".into()],
+            },
+            InstalledPackage {
+                publisher: "app-pub".into(),
+                name: "app".into(),
+                version: "1.0.0".into(),
+                sha256: "11".repeat(32),
+                artifact: store.join("app"),
+                dependencies: vec![],
+                conflicts: vec![],
+                files: vec![],
+                runtime_requires: vec!["libfoo.so.2".into()],
+                provides: vec![],
+            },
+        ];
+        fs::write(store.join("installed.json"), serde_json::to_vec(&packages)?)?;
+        let error = remove_package("pub/libfoo", Some(&store)).unwrap_err();
+        assert!(error.to_string().contains("runtime capability"));
         Ok(())
     }
 
