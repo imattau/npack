@@ -63,6 +63,15 @@ state. Use `--store` for isolated development or test installations.
 
 ## Common commands
 
+Generate or view the command reference:
+
+```bash
+npack man > npack.1
+man ./npack.1
+```
+
+The `.npk` release also installs the page at `share/man/man1/npack.1`.
+
 ```bash
 # Build and inspect an artifact
 npack init ./myapp --name myapp --version 1.0.0 --publisher npub1...

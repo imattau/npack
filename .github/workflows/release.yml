@@ -41,8 +41,9 @@ jobs:
           VERSION: ${{ steps.release.outputs.version }}
           PUBLISHER: ${{ vars.NOSTR_PUBLISHER }}
         run: |
-          mkdir -p package-root/bin package-root/.npack package-output
+          mkdir -p package-root/bin package-root/.npack package-root/share/man/man1 package-output
           install -m 0755 target/release/npack package-root/bin/npack
+          cargo run --quiet -- man > package-root/share/man/man1/npack.1
           if [[ "$GITHUB_REF_TYPE" != tag ]]; then
             PUBLISHER="manual-test-publisher"
           fi

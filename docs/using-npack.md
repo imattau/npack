@@ -491,6 +491,15 @@ OS and architecture.
 
 ## Command summary
 
+Generate the installed command reference:
+
+```bash
+npack man > npack.1
+man ./npack.1
+```
+
+Release packages install the same page as `share/man/man1/npack.1`.
+
 ```text
 npack pack <directory> --output <file.npk>
 npack init <directory> --name <name> --publisher <npub-or-hex> [--version <semver>] [--os <os>] [--arch <arch>]

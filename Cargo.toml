@@ -9,6 +9,7 @@ license = "MIT"
 anyhow = "1"
 bitcoin_hashes = "1.2"
 clap = { version = "4", features = ["derive"] }
+clap_mangen = "0.3"
 dirs = "6"
 goblin = "0.10"
 hex = "0.4"

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use bitcoin_hashes::sha256::Hash as Sha256Hash;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_mangen::Man;
 use goblin::Object;
 use nostr_blossom::prelude::BlossomClient;
 use nostr_sdk::prelude::*;
@@ -252,6 +253,8 @@ enum Command {
         #[arg(long, help = "Target architecture; defaults to the host architecture")]
         arch: Option<String>,
     },
+    /// Render the complete command reference as a man page
+    Man,
     #[command(alias = "update")]
     InstallRef {
         package: Option<String>,
@@ -626,6 +629,10 @@ async fn main() -> Result<()> {
             os.as_deref().unwrap_or(OS),
             arch.as_deref().unwrap_or(ARCH),
         )?,
+        Command::Man => {
+            let command = Cli::command();
+            Man::new(command).render(&mut io::stdout())?;
+        }
         Command::InstallRef {
             package,
             relays,
