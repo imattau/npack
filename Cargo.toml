@@ -1,6 +1,6 @@
 [package]
 name = "npack"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2024"
 description = "A Nostr-native package manager"
 license = "MIT"
