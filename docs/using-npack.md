@@ -338,6 +338,29 @@ Review package metadata and publisher identity before granting capabilities.
 
 ## Publishing a release
 
+### Registering a publisher key
+
+Register a dedicated publisher key once in the operating system credential
+store:
+
+```bash
+npack register --stdin < publisher.nsec
+```
+
+The key is stored through the platform credential APIs: Secret Service on
+Linux, Keychain on macOS, or Credential Manager on Windows. It is not written
+to `config.toml`. The `--stdin` form avoids exposing the nsec in shell history
+or the process list. A positional form is also available, but is less safe:
+
+```bash
+npack register nsec1...
+```
+
+After registration, `release-event`, `publish`, and `revoke-event` can omit
+`--secret-key`. Supplying `--secret-key` explicitly always overrides the
+registered key. Registering another key replaces the previous `npack`
+publisher credential for the current user.
+
 Prepare an external manifest whose `artifact` and `sha256` identify the final
 `.npk`, then create and verify the release metadata:
 
@@ -354,7 +377,6 @@ Publish the artifact and both Nostr events:
 
 ```bash
 npack publish ./myapp.manifest.json \
-  --secret-key <publisher-secret-key> \
   --relay wss://relay.example \
   --server https://blossom.example
 ```

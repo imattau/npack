@@ -172,8 +172,11 @@ enum Command {
     },
     ReleaseEvent {
         manifest: PathBuf,
-        #[arg(long, help = "32-byte hex-encoded Nostr secret key")]
-        secret_key: String,
+        #[arg(
+            long,
+            help = "32-byte hex-encoded Nostr secret key; defaults to the registered key"
+        )]
+        secret_key: Option<String>,
         #[arg(long, default_value_t = 0)]
         created_at: u64,
     },
@@ -183,8 +186,11 @@ enum Command {
     },
     RevokeEvent {
         event: PathBuf,
-        #[arg(long, help = "32-byte hex-encoded Nostr secret key")]
-        secret_key: String,
+        #[arg(
+            long,
+            help = "32-byte hex-encoded Nostr secret key; defaults to the registered key"
+        )]
+        secret_key: Option<String>,
         #[arg(long)]
         reason: String,
         #[arg(long, default_value_t = 0)]
@@ -208,14 +214,26 @@ enum Command {
     },
     Publish {
         manifest: PathBuf,
-        #[arg(long, help = "32-byte hex-encoded Nostr secret key")]
-        secret_key: String,
+        #[arg(
+            long,
+            help = "32-byte hex-encoded Nostr secret key; defaults to the registered key"
+        )]
+        secret_key: Option<String>,
         #[arg(long = "relay")]
         relays: Vec<String>,
         #[arg(long = "server")]
         servers: Vec<String>,
         #[arg(long, help = "Nostr pubkey whose NIP-65 write relays should be used")]
         pubkey: Option<String>,
+    },
+    Register {
+        #[arg(
+            help = "Nostr secret key in nsec or 32-byte hexadecimal form",
+            conflicts_with = "stdin"
+        )]
+        secret_key: Option<String>,
+        #[arg(long, help = "Read the secret key from standard input")]
+        stdin: bool,
     },
     Init {
         directory: PathBuf,
@@ -468,6 +486,7 @@ async fn main() -> Result<()> {
             secret_key,
             created_at,
         } => {
+            let secret_key = resolve_secret_key(secret_key.as_deref())?;
             let package = load_manifest(&manifest)?;
             verify_manifest(&package, &manifest)?;
             let timestamp = if created_at == 0 {
@@ -505,6 +524,7 @@ async fn main() -> Result<()> {
             reason,
             created_at,
         } => {
+            let secret_key = resolve_secret_key(secret_key.as_deref())?;
             let event_json = fs::read(&event)?;
             let release: Event = serde_json::from_slice(&event_json)?;
             let timestamp = if created_at == 0 {
@@ -551,6 +571,7 @@ async fn main() -> Result<()> {
             servers,
             pubkey,
         } => {
+            let secret_key = resolve_secret_key(secret_key.as_deref())?;
             let relays = configured_relays(relays, &config)?;
             let servers = configured_servers(servers, &config)?;
             publish_release(
@@ -561,6 +582,16 @@ async fn main() -> Result<()> {
                 pubkey.or_else(|| config.identity.pubkey.clone()).as_deref(),
             )
             .await?
+        }
+        Command::Register { secret_key, stdin } => {
+            let secret_key = if stdin {
+                let mut secret_key = String::new();
+                io::stdin().read_to_string(&mut secret_key)?;
+                secret_key.trim().to_owned()
+            } else {
+                secret_key.context("provide a secret key or use --stdin")?
+            };
+            register_secret_key(&secret_key)?;
         }
         Command::Init {
             directory,
@@ -690,6 +721,35 @@ async fn connect_with_timeout(client: &Client) -> Result<()> {
     .await
     .context("timed out connecting to configured Nostr relays")?;
     Ok(())
+}
+
+const KEYRING_SERVICE: &str = "npack";
+const KEYRING_ACCOUNT: &str = "publisher";
+
+fn publisher_keyring_entry() -> Result<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+        .context("opening the npack OS credential-store entry")
+}
+
+fn register_secret_key(secret_key: &str) -> Result<()> {
+    let keys = Keys::parse(secret_key).context("secret key must be hex or nsec")?;
+    publisher_keyring_entry()?
+        .set_password(secret_key)
+        .context("storing the publisher key in the OS credential store")?;
+    println!(
+        "registered publisher {}",
+        display_publisher(&keys.public_key().to_hex())
+    );
+    Ok(())
+}
+
+fn resolve_secret_key(cli_secret_key: Option<&str>) -> Result<String> {
+    if let Some(secret_key) = cli_secret_key {
+        return Ok(secret_key.to_owned());
+    }
+    publisher_keyring_entry()?
+        .get_password()
+        .context("no --secret-key supplied and no registered publisher key was found")
 }
 
 fn init_package(
