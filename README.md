@@ -12,6 +12,7 @@ The current prototype works entirely locally. It defines a package manifest, cal
     cargo run -- verify ./hello.npack.json
     cargo run -- install ./hello.npack.json --store /tmp/npack-store
     cargo run -- list --store /tmp/npack-store
+    cargo run -- release-event ./hello.npack.json --secret-key <32-byte-hex-key>
 
 Example manifest:
 
@@ -24,4 +25,6 @@ Example manifest:
       "dependencies": []
     }
 
-The manifest is deliberately format-neutral. Signature and Nostr event fields will be added while preserving this local package lifecycle.
+The manifest is deliberately format-neutral. The release-event command uses the official Rust Nostr library for event IDs, tags, key handling, and Schnorr signatures while preserving this local package lifecycle.
+
+The release-event command emits a signed, provisional kind:9900 Nostr package-release event. It is currently an offline event generator; relay publishing, Blossom upload, and release-event signature verification are the next integration steps.

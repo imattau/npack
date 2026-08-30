@@ -8,7 +8,7 @@ npack is an independent package manager whose registry metadata will be publishe
 - Local package manifests and artifacts are the first vertical slice.
 - SHA-256 verification is mandatory before installation.
 - Installation is into an npack-managed store; native package managers are not required.
-- Nostr relay, Blossom transport, signatures, and dependency solving are planned interfaces, not yet implemented.
+- Nostr relay, Blossom transport, and dependency solving are planned interfaces; signed release-event generation is implemented with the official nostr crate.
 
 ## Commands
 
@@ -16,6 +16,7 @@ npack is an independent package manager whose registry metadata will be publishe
     npack verify <manifest>
     npack install <manifest> [--store <path>]
     npack list [--store <path>]
+    npack release-event <manifest> --secret-key <hex-key>
 
 ## Conventions
 
@@ -23,3 +24,4 @@ npack is an independent package manager whose registry metadata will be publishe
 - Never trust a mirror URL without checking the declared SHA-256.
 - Prefer small, testable domain types over CLI-specific logic.
 - Run cargo fmt --check and cargo test before committing.
+- Provisional release events use kind 9900 and Nostr Schnorr signatures over the canonical event array.
