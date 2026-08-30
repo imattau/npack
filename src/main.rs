@@ -490,15 +490,17 @@ async fn main() -> Result<()> {
             install_ref(
                 name,
                 publisher,
-                &relays,
-                store.as_deref(),
-                user || (!system && config.install.user),
-                &trusted_publishers,
-                pubkey.as_deref(),
-                lockfile.as_deref(),
-                locked_packages.as_ref(),
-                &config.storage.blossom,
-                &allowed_capabilities,
+                InstallRefOptions {
+                    relays: &relays,
+                    store: store.as_deref(),
+                    user: user || (!system && config.install.user),
+                    trusted_publishers: &trusted_publishers,
+                    user_pubkey: pubkey.as_deref(),
+                    lockfile: lockfile.as_deref(),
+                    locked_packages: locked_packages.as_ref(),
+                    blossom_servers: &config.storage.blossom,
+                    allowed_capabilities: &allowed_capabilities,
+                },
             )
             .await?
         }
@@ -639,19 +641,34 @@ fn collect_package_entries(current: &Path, entries: &mut Vec<PathBuf>) -> Result
     Ok(())
 }
 
+struct InstallRefOptions<'a> {
+    relays: &'a [String],
+    store: Option<&'a Path>,
+    user: bool,
+    trusted_publishers: &'a [String],
+    user_pubkey: Option<&'a str>,
+    lockfile: Option<&'a Path>,
+    locked_packages: Option<&'a Lockfile>,
+    blossom_servers: &'a [String],
+    allowed_capabilities: &'a [String],
+}
+
 async fn install_ref(
     name: &str,
     publisher: Option<String>,
-    relays: &[String],
-    store: Option<&Path>,
-    user: bool,
-    trusted_publishers: &[String],
-    user_pubkey: Option<&str>,
-    lockfile: Option<&Path>,
-    locked_packages: Option<&Lockfile>,
-    blossom_servers: &[String],
-    allowed_capabilities: &[String],
+    options: InstallRefOptions<'_>,
 ) -> Result<()> {
+    let InstallRefOptions {
+        relays,
+        store,
+        user,
+        trusted_publishers,
+        user_pubkey,
+        lockfile,
+        locked_packages,
+        blossom_servers,
+        allowed_capabilities,
+    } = options;
     let client = Client::default();
     for relay in relays {
         client.add_relay(relay).await?;
