@@ -902,6 +902,20 @@ fn install_with_capabilities_at(
     );
     fs::copy(artifact_path(manifest, manifest_path), &destination)
         .context("copying verified artifact")?;
+    let existing_packages = installed_packages(Some(&root))?;
+    if manifest.format == "npk" {
+        let payload_paths = npk_entry_paths(&destination)?
+            .into_iter()
+            .map(|path| prefix.join(path))
+            .collect::<Vec<_>>();
+        ensure_install_paths_available(
+            &payload_paths,
+            &existing_packages,
+            &manifest.publisher,
+            &manifest.name,
+            &manifest.version,
+        )?;
+    }
     let files = if manifest.format == "npk" {
         extract_npk(&destination, &prefix)?
     } else {
@@ -925,7 +939,7 @@ fn install_with_capabilities_at(
         runtime_requires: manifest.runtime_requires.clone(),
         provides: manifest.provides.clone(),
     };
-    let mut packages = installed_packages(Some(&root))?;
+    let mut packages = existing_packages;
     packages.retain(|p| {
         !(p.publisher == installed.publisher
             && p.name == installed.name
@@ -993,6 +1007,75 @@ fn run_post_install(
         }
     }
     Ok(created)
+}
+
+fn npk_entry_paths(archive_path: &Path) -> Result<Vec<PathBuf>> {
+    let file = fs::File::open(archive_path)?;
+    let decoder = zstd::Decoder::new(file)?;
+    let mut archive = tar::Archive::new(decoder);
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in archive.entries()? {
+        let entry = entry?;
+        let relative = entry.path()?.into_owned();
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            bail!("unsafe path in .npk archive: {}", relative.display());
+        }
+        if !seen.insert(relative.clone()) {
+            bail!("duplicate path in .npk archive: {}", relative.display());
+        }
+        if entry.header().entry_type().is_symlink() {
+            let target = entry.link_name()?.context("symlink entry has no target")?;
+            if target.is_absolute()
+                || target
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                bail!(
+                    "unsafe symlink target in .npk archive: {}",
+                    target.display()
+                );
+            }
+        }
+        paths.push(relative);
+    }
+    Ok(paths)
+}
+
+fn ensure_install_paths_available(
+    paths: &[PathBuf],
+    installed: &[InstalledPackage],
+    publisher: &str,
+    name: &str,
+    version: &str,
+) -> Result<()> {
+    for path in paths {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+            continue;
+        }
+        let owned_by_this_package = installed.iter().any(|package| {
+            package.publisher == publisher
+                && package.name == name
+                && package.version == version
+                && package.files.iter().any(|file| file == path)
+        });
+        if !owned_by_this_package {
+            bail!(
+                "refusing to overwrite unowned installed file: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn extract_npk(archive_path: &Path, destination: &Path) -> Result<Vec<PathBuf>> {
@@ -1262,6 +1345,35 @@ mod tests {
 
         assert!(!service.exists());
         assert!(!package_dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_overwriting_another_packages_file() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("bin/hello");
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(&path, b"owned")?;
+        let installed = InstalledPackage {
+            publisher: "other".into(),
+            name: "hello".into(),
+            version: "1.0.0".into(),
+            sha256: "00".repeat(32),
+            artifact: dir.path().join("artifact.npk"),
+            dependencies: vec![],
+            files: vec![path.clone()],
+            runtime_requires: vec![],
+            provides: vec![],
+        };
+        let error = ensure_install_paths_available(
+            &[path],
+            &[installed],
+            "new-publisher",
+            "hello",
+            "2.0.0",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unowned installed file"));
         Ok(())
     }
 
