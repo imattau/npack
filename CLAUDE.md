@@ -7,22 +7,22 @@ npack is an independent package manager whose registry metadata will be publishe
 - Rust CLI, terminal-first.
 - Local package manifests and .npk artifacts are the first vertical slice.
 - SHA-256 verification is mandatory before installation.
-- Installation is into an npack-managed store; native package managers are not required.
-- Relay-backed release discovery, Blossom retrieval, recursive dependency-first remote installation, declared dependency validation, and signed release-event generation are implemented with official crates. More advanced solving and publisher selection remain planned.
+- System installation targets `/` with state in `/var/lib/npack`; `--user` targets `$HOME/.local`. Native package managers are not required.
+- Relay-backed release discovery, NIP-65 relay-list discovery, Blossom retrieval with mirror fallback and caching, recursive dependency-first remote installation, lockfiles, conflicts, revocations, trusted publishers, declared dependency validation, and signed release-event generation are implemented with official crates. More advanced solving and publisher selection remain planned.
 
 ## Commands
 
     npack hash <artifact>
     npack verify <manifest>
-    npack install <manifest> [--store <path>] [--allow-capability <capability>]
-    npack list [--store <path>]
+    npack install <manifest> [--user|--system] [--store <path>] [--allow-capability <capability>]
+    npack list [--user|--system] [--store <path>]
     npack release-event <manifest> --secret-key <hex-key>
     npack verify-event <event> <manifest>
     npack search <query> --relay <relay-url>
     npack fetch <sha256> --server <blossom-url> --output <path>
-    npack install-ref [<publisher-hex>/]<name> --relay <relay-url> [--store <path>] [--allow-capability <capability>]
+    npack install-ref [<publisher>/]<name> --relay <relay-url> [--user|--system] [--store <path>] [--lockfile <path>] [--locked] [--allow-capability <capability>]
     npack pack <source-directory> --output <package.npk>
-    npack remove <publisher-hex>/<name> [--store <path>]
+    npack remove <publisher>/<name> [--user|--system] [--store <path>]
     npack inspect <artifact>
 
 ## Conventions
@@ -39,4 +39,4 @@ npack is an independent package manager whose registry metadata will be publishe
 - Remote release selection must filter os and arch tags against the current host, accepting any as a wildcard.
 - Runtime capabilities may be exact names or semver constraints matched against name@version provisions.
 - Post-install hooks are declarative and signed; create-directory is package-local, while register-service is explicitly capability-gated.
-- register-service is approved by the service-manager capability and installs a user systemd unit without enabling or starting it.
+- register-service is approved by the service-manager capability and installs a system or user systemd unit without enabling or starting it.
