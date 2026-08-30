@@ -891,45 +891,52 @@ fn install_remote_package<'a>(
             bail!("release and artifact event hashes do not match");
         }
         let expected: Sha256Hash = sha256.parse()?;
-        let mut urls = artifact_event
-            .tags
-            .iter()
-            .filter(|tag| tag.kind() == "url")
-            .filter_map(Tag::content)
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        urls.extend(blossom_servers.iter().cloned());
-        urls.sort();
-        urls.dedup();
-        if urls.is_empty() {
-            bail!("artifact event has no URL");
-        }
-        let mut bytes = None;
-        for url in urls {
-            let mut server_url = match Url::parse(&url) {
-                Ok(url) => url,
-                Err(_) => continue,
-            };
-            server_url.set_path("/");
-            server_url.set_query(None);
-            server_url.set_fragment(None);
-            let candidate = match BlossomClient::new(server_url)
-                .get_blob::<Keys>(expected, None, None, None)
-                .await
-            {
-                Ok(candidate) => candidate,
-                Err(_) => continue,
-            };
-            if Sha256Hash::hash(&candidate) == expected {
-                bytes = Some(candidate);
-                break;
-            }
-        }
-        let bytes = bytes.context("no artifact mirror returned the expected SHA-256")?;
         let staging = root.join("downloads").join(sha256);
         fs::create_dir_all(&staging)?;
         let artifact_path = staging.join("artifact");
-        fs::write(&artifact_path, bytes)?;
+        if !artifact_path.exists() {
+            let mut urls = artifact_event
+                .tags
+                .iter()
+                .filter(|tag| tag.kind() == "url")
+                .filter_map(Tag::content)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            urls.extend(blossom_servers.iter().cloned());
+            urls.sort();
+            urls.dedup();
+            if urls.is_empty() {
+                bail!("artifact event has no URL");
+            }
+            let mut bytes = None;
+            for url in urls {
+                let mut server_url = match Url::parse(&url) {
+                    Ok(url) => url,
+                    Err(_) => continue,
+                };
+                server_url.set_path("/");
+                server_url.set_query(None);
+                server_url.set_fragment(None);
+                let candidate = match BlossomClient::new(server_url)
+                    .get_blob::<Keys>(expected, None, None, None)
+                    .await
+                {
+                    Ok(candidate) => candidate,
+                    Err(_) => continue,
+                };
+                if Sha256Hash::hash(&candidate) == expected {
+                    bytes = Some(candidate);
+                    break;
+                }
+            }
+            fs::write(
+                &artifact_path,
+                bytes.context("no artifact mirror returned the expected SHA-256")?,
+            )?;
+        }
+        if Sha256Hash::hash(&fs::read(&artifact_path)?) != expected {
+            bail!("cached artifact hash does not match release");
+        }
         let manifest = manifest_from_release(&release, &artifact_path, sha256)?;
         let dependencies = manifest.dependencies.clone();
         for dependency in dependencies {
