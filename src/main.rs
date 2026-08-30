@@ -2102,6 +2102,11 @@ fn sign_revocation_event(
 fn load_manifest(path: &Path) -> Result<Manifest> {
     let bytes = fs::read(path).with_context(|| format!("reading manifest {}", path.display()))?;
     let manifest: Manifest = serde_json::from_slice(&bytes).context("parsing JSON manifest")?;
+    validate_manifest_metadata(&manifest, true)?;
+    Ok(manifest)
+}
+
+fn validate_manifest_metadata(manifest: &Manifest, require_hash: bool) -> Result<()> {
     if manifest.publisher.is_empty() || manifest.name.is_empty() || manifest.version.is_empty() {
         bail!("manifest publisher, name, and version must not be empty");
     }
@@ -2114,7 +2119,9 @@ fn load_manifest(path: &Path) -> Result<Manifest> {
             bail!("manifest {label} must be a single safe path component");
         }
     }
-    if manifest.sha256.len() != 64 || !manifest.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+    if require_hash
+        && (manifest.sha256.len() != 64 || !manifest.sha256.chars().all(|c| c.is_ascii_hexdigit()))
+    {
         bail!("manifest sha256 must be 64 hexadecimal characters");
     }
     validate_dependency_declarations(&manifest.dependencies)?;
@@ -2129,7 +2136,7 @@ fn load_manifest(path: &Path) -> Result<Manifest> {
     {
         bail!("manifest commit must be a non-empty commit identifier");
     }
-    Ok(manifest)
+    Ok(())
 }
 
 fn load_embedded_manifest(archive_path: &Path) -> Result<Manifest> {
@@ -2156,6 +2163,7 @@ fn load_embedded_manifest(archive_path: &Path) -> Result<Manifest> {
         .context("package path has no filename")?
         .into();
     manifest.sha256 = hash_file(archive_path)?;
+    validate_manifest_metadata(&manifest, true)?;
     Ok(manifest)
 }
 
