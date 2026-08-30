@@ -154,6 +154,8 @@ enum Command {
         pubkey: Option<String>,
         #[arg(long, help = "Write the resolved dependency graph to a lockfile")]
         lockfile: Option<PathBuf>,
+        #[arg(long, requires = "lockfile")]
+        locked: bool,
         #[arg(long = "allow-capability")]
         allowed_capabilities: Vec<String>,
     },
@@ -368,11 +370,21 @@ async fn main() -> Result<()> {
             trusted_publishers,
             pubkey,
             lockfile,
+            locked,
             allowed_capabilities,
         } => {
             let relays = configured_relays(relays, &config)?;
             let trusted_publishers = configured_publishers(trusted_publishers, &config)?;
             let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
+            let locked_packages = if locked {
+                Some(load_lockfile(
+                    lockfile
+                        .as_deref()
+                        .context("--locked requires --lockfile")?,
+                )?)
+            } else {
+                None
+            };
             let (publisher, name) = package
                 .split_once('/')
                 .map_or((None, package.as_str()), |(p, n)| {
@@ -387,6 +399,7 @@ async fn main() -> Result<()> {
                 &trusted_publishers,
                 pubkey.as_deref(),
                 lockfile.as_deref(),
+                locked_packages.as_ref(),
                 &allowed_capabilities,
             )
             .await?
@@ -520,6 +533,7 @@ async fn install_ref(
     trusted_publishers: &[String],
     user_pubkey: Option<&str>,
     lockfile: Option<&Path>,
+    locked_packages: Option<&Lockfile>,
     allowed_capabilities: &[String],
 ) -> Result<()> {
     let client = Client::default();
@@ -542,6 +556,7 @@ async fn install_ref(
         user_pubkey,
         &root,
         &prefix,
+        locked_packages,
         &mut visiting,
         &mut installed,
     )
@@ -586,6 +601,16 @@ fn write_lockfile(path: &Path, root: &Path, install_order: &[String]) -> Result<
     Ok(())
 }
 
+fn load_lockfile(path: &Path) -> Result<Lockfile> {
+    let bytes = fs::read(path).with_context(|| format!("reading lockfile {}", path.display()))?;
+    let lockfile: Lockfile = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing lockfile {}", path.display()))?;
+    if lockfile.version != 1 {
+        bail!("unsupported lockfile version: {}", lockfile.version);
+    }
+    Ok(lockfile)
+}
+
 use std::future::Future;
 use std::pin::Pin;
 
@@ -600,6 +625,7 @@ fn install_remote_package<'a>(
     user_pubkey: Option<&'a str>,
     root: &'a Path,
     prefix: &'a Path,
+    locked_packages: Option<&'a Lockfile>,
     visiting: &'a mut Vec<String>,
     installed: &'a mut Vec<String>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
@@ -622,6 +648,17 @@ fn install_remote_package<'a>(
             })
         {
             bail!("publisher is not in the trusted publisher list");
+        }
+        let locked_package = locked_packages.and_then(|lockfile| {
+            lockfile.packages.iter().find(|package| {
+                package.name == name
+                    && publisher
+                        .as_deref()
+                        .map_or(true, |publisher| package.publisher == publisher)
+            })
+        });
+        if locked_packages.is_some() && locked_package.is_none() {
+            bail!("package {install_key} is not present in the lockfile");
         }
         if visiting
             .iter()
@@ -668,6 +705,12 @@ fn install_remote_package<'a>(
                 publisher
                     .as_deref()
                     .map_or(true, |publisher| event.pubkey.to_hex() == publisher)
+            })
+            .filter(|event| {
+                locked_package.map_or(true, |package| {
+                    tag_value(event, "version") == Some(package.version.as_str())
+                        && tag_value(event, "x") == Some(package.sha256.as_str())
+                })
             })
             .filter(|event| {
                 requirement.as_deref().map_or(true, |req| {
@@ -752,6 +795,7 @@ fn install_remote_package<'a>(
                 user_pubkey,
                 root,
                 prefix,
+                locked_packages,
                 visiting,
                 installed,
             )
