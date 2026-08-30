@@ -875,8 +875,10 @@ fn ensure_dependencies_available(manifest: &Manifest, store: &Path) -> Result<()
             package
                 .provides
                 .iter()
-                .any(|provided| provided == requirement)
-        }) && !system.contains(requirement)
+                .any(|provided| capability_satisfies(requirement, provided))
+        }) && system
+            .iter()
+            .any(|provided| capability_satisfies(requirement, provided))
         {
             bail!(
                 "missing runtime capability {requirement} (provide it before {})",
@@ -885,6 +887,25 @@ fn ensure_dependencies_available(manifest: &Manifest, store: &Path) -> Result<()
         }
     }
     Ok(())
+}
+
+fn capability_satisfies(requirement: &str, provided: &str) -> bool {
+    let Some((name, constraint)) = requirement.split_once(' ') else {
+        return requirement == provided;
+    };
+    let Some((provided_name, provided_version)) = provided.rsplit_once('@') else {
+        return false;
+    };
+    if name != provided_name {
+        return false;
+    }
+    let Ok(requirement) = VersionReq::parse(constraint) else {
+        return false;
+    };
+    let Ok(version) = Version::parse(provided_version) else {
+        return false;
+    };
+    requirement.matches(&version)
 }
 
 fn system_capabilities() -> HashSet<String> {
@@ -1156,5 +1177,18 @@ mod tests {
                 .contains("required by an installed package")
         );
         Ok(())
+    }
+
+    #[test]
+    fn matches_versioned_capabilities() {
+        assert!(capability_satisfies(
+            "libfoo-api >=2.0.0",
+            "libfoo-api@2.4.1"
+        ));
+        assert!(!capability_satisfies(
+            "libfoo-api >=3.0.0",
+            "libfoo-api@2.4.1"
+        ));
+        assert!(capability_satisfies("libfoo.so.2", "libfoo.so.2"));
     }
 }

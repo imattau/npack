@@ -37,3 +37,4 @@ npack is an independent package manager whose registry metadata will be publishe
 - ELF DT_NEEDED entries must be declared in runtime_requires when verifying an ELF artifact; symbol-version and capability resolution are future work.
 - Runtime capability requirements are matched against installed package provides or host OS/architecture and standard shared-library capabilities; symbol-version and richer system capability providers are future work.
 - Remote release selection must filter os and arch tags against the current host, accepting any as a wildcard.
+- Runtime capabilities may be exact names or semver constraints matched against name@version provisions.
