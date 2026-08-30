@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use bitcoin_hashes::sha256::Hash as Sha256Hash;
 use clap::{Parser, Subcommand};
+use goblin::Object;
 use nostr_blossom::prelude::BlossomClient;
 use nostr_sdk::prelude::*;
 use semver::{Version, VersionReq};
@@ -77,6 +78,9 @@ enum Command {
         package: String,
         #[arg(long)]
         store: Option<PathBuf>,
+    },
+    Inspect {
+        artifact: PathBuf,
     },
 }
 
@@ -211,6 +215,32 @@ async fn main() -> Result<()> {
         }
         Command::Pack { source, output } => pack_npk(&source, &output)?,
         Command::Remove { package, store } => remove_package(&package, store.as_deref())?,
+        Command::Inspect { artifact } => inspect_artifact(&artifact)?,
+    }
+    Ok(())
+}
+
+fn inspect_artifact(path: &Path) -> Result<()> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    match Object::parse(&bytes).context("parsing executable")? {
+        Object::Elf(elf) => {
+            println!("format: elf");
+            if let Some(interpreter) = elf.interpreter {
+                println!("interpreter: {interpreter}");
+            }
+            if elf.libraries.is_empty() {
+                println!("needed: none");
+            } else {
+                for library in elf.libraries {
+                    println!("needed: {library}");
+                }
+            }
+        }
+        Object::PE(_) => println!("format: pe"),
+        Object::Mach(_) => println!("format: mach-o"),
+        Object::Archive(_) => println!("format: archive"),
+        Object::Unknown(magic) => println!("format: unknown ({magic:?})"),
+        _ => println!("format: unknown"),
     }
     Ok(())
 }

@@ -23,6 +23,7 @@ npack is an independent package manager whose registry metadata will be publishe
     npack install-ref [<publisher-hex>/]<name> --relay <relay-url> [--store <path>]
     npack pack <source-directory> --output <package.npk>
     npack remove <publisher-hex>/<name> [--store <path>]
+    npack inspect <artifact>
 
 ## Conventions
 
@@ -32,3 +33,4 @@ npack is an independent package manager whose registry metadata will be publishe
 - Run cargo fmt --check and cargo test before committing.
 - Provisional release events use kind 9900 and Nostr Schnorr signatures over the canonical event array.
 - The canonical artifact format is .npk, a tar archive compressed with zstd; Nostr event metadata remains authoritative.
+- ELF inspection is metadata-only; never execute an untrusted artifact to discover dependencies.

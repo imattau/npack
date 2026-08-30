@@ -19,6 +19,7 @@ The current prototype works entirely locally. It defines a package manifest, cal
     cargo run -- install-ref <publisher-hex>/hello --relay wss://relay.example --store /tmp/npack-store
     cargo run -- pack ./package-root --output ./hello-1.0.0.npk
     cargo run -- remove <publisher-hex>/hello --store /tmp/npack-store
+    cargo run -- inspect ./package-root/bin/hello
 
 Example manifest:
 
@@ -33,4 +34,4 @@ Example manifest:
 
 The canonical transport artifact is .npk: a tar archive compressed with zstd. The manifest is deliberately format-neutral. The release-event command uses the official Rust Nostr library for event IDs, tags, key handling, and Schnorr signatures while preserving this local package lifecycle.
 
-The release-event command emits a signed, provisional kind:9900 Nostr package-release event. The verify-event command validates the event signature and checks it against the package manifest. The search command queries configured relays and displays only cryptographically valid release events. The fetch command retrieves a hash-addressed blob through nostr-blossom and verifies its SHA-256 before writing it. The pack command creates .npk archives, and installation safely extracts them into the npack-managed store. The install-ref command connects these pieces for a verified remote release, recursively installing dependencies before dependents and printing the resulting install order. The remove command deletes all installed versions for a publisher-qualified package reference. Publisher-qualified references constrain selection to a specific event author.
+The release-event command emits a signed, provisional kind:9900 Nostr package-release event. The verify-event command validates the event signature and checks it against the package manifest. The search command queries configured relays and displays only cryptographically valid release events. The fetch command retrieves a hash-addressed blob through nostr-blossom and verifies its SHA-256 before writing it. The pack command creates .npk archives, and installation safely extracts them into the npack-managed store. The inspect command reads ELF dependency metadata without executing the artifact. The install-ref command connects these pieces for a verified remote release, recursively installing dependencies before dependents and printing the resulting install order. The remove command deletes all installed versions for a publisher-qualified package reference. Publisher-qualified references constrain selection to a specific event author.
