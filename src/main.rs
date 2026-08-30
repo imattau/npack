@@ -1054,31 +1054,89 @@ fn npk_entry_paths(archive_path: &Path) -> Result<Vec<PathBuf>> {
 
 fn install_staged_npk(staging: &Path, prefix: &Path, entries: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut installed = Vec::new();
+    let mut applied = Vec::new();
+    let backup_root = staging.join(".npack-backups");
     for relative in entries {
-        let source = staging.join(relative);
-        let destination = prefix.join(relative);
-        let metadata = fs::symlink_metadata(&source)?;
-        if metadata.file_type().is_dir() {
-            fs::create_dir_all(&destination)?;
-            continue;
+        let result = (|| -> Result<()> {
+            let source = staging.join(relative);
+            let destination = prefix.join(relative);
+            let metadata = fs::symlink_metadata(&source)?;
+            if metadata.file_type().is_dir() {
+                fs::create_dir_all(&destination)?;
+                return Ok(());
+            }
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let backup = if destination.exists() || fs::symlink_metadata(&destination).is_ok() {
+                let backup = backup_root.join(applied.len().to_string());
+                backup_entry(&destination, &backup)?;
+                Some(backup)
+            } else {
+                None
+            };
+            applied.push((destination.clone(), backup));
+            if destination.exists() || fs::symlink_metadata(&destination).is_ok() {
+                fs::remove_file(&destination)?;
+            }
+            if metadata.file_type().is_symlink() {
+                symlink(fs::read_link(&source)?, &destination)?;
+            } else if metadata.file_type().is_file() {
+                fs::copy(&source, &destination)?;
+                fs::set_permissions(&destination, metadata.permissions())?;
+            } else {
+                bail!("unsupported staged package entry: {}", relative.display());
+            }
+            installed.push(destination);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            rollback_entries(&applied)?;
+            return Err(error);
         }
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        if destination.exists() || fs::symlink_metadata(&destination).is_ok() {
-            fs::remove_file(&destination)?;
-        }
-        if metadata.file_type().is_symlink() {
-            symlink(fs::read_link(&source)?, &destination)?;
-        } else if metadata.file_type().is_file() {
-            fs::copy(&source, &destination)?;
-            fs::set_permissions(&destination, metadata.permissions())?;
-        } else {
-            bail!("unsupported staged package entry: {}", relative.display());
-        }
-        installed.push(destination);
     }
     Ok(installed)
+}
+
+fn backup_entry(source: &Path, destination: &Path) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() {
+        symlink(fs::read_link(source)?, destination)?;
+    } else if metadata.file_type().is_file() {
+        fs::copy(source, destination)?;
+        fs::set_permissions(destination, metadata.permissions())?;
+    } else {
+        bail!(
+            "cannot back up non-file installation path: {}",
+            source.display()
+        );
+    }
+    Ok(())
+}
+
+fn rollback_entries(entries: &[(PathBuf, Option<PathBuf>)]) -> Result<()> {
+    for (destination, backup) in entries.iter().rev() {
+        if destination.exists() || fs::symlink_metadata(destination).is_ok() {
+            fs::remove_file(destination)?;
+        }
+        if let Some(backup) = backup {
+            if backup.exists() || fs::symlink_metadata(backup).is_ok() {
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if fs::symlink_metadata(backup)?.file_type().is_symlink() {
+                    symlink(fs::read_link(backup)?, destination)?;
+                } else {
+                    fs::copy(backup, destination)?;
+                    fs::set_permissions(destination, fs::metadata(backup)?.permissions())?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ensure_install_paths_available(
@@ -1409,6 +1467,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("unowned installed file"));
+        Ok(())
+    }
+
+    #[test]
+    fn rolls_back_partial_host_materialization() -> Result<()> {
+        let dir = tempdir()?;
+        let staging = dir.path().join("staging");
+        fs::create_dir_all(staging.join("bin"))?;
+        fs::write(staging.join("bin/one"), b"one")?;
+        let prefix = dir.path().join("prefix");
+        let error = install_staged_npk(
+            &staging,
+            &prefix,
+            &[PathBuf::from("bin/one"), PathBuf::from("bin/missing")],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("No such file") || error.to_string().contains("not found")
+        );
+        assert!(!prefix.join("bin/one").exists());
         Ok(())
     }
 
