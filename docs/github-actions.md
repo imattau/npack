@@ -1,0 +1,33 @@
+# GitHub Actions release pipeline
+
+The repository includes a tag-driven reference workflow at
+`.github/workflows/release.yml`. It treats GitHub Actions as a builder and
+provenance source, while keeping the package protocol independent of GitHub.
+
+For a `v<version>` tag, the workflow:
+
+1. Builds `npack` in release mode.
+2. Creates a deterministic Linux x86-64 `.npk` archive.
+3. Writes a package manifest and SHA-256 checksum file.
+4. Generates an SPDX SBOM.
+5. Creates a GitHub build-provenance attestation for the `.npk`.
+6. Uploads the bundle as a GitHub Release and workflow artifact.
+
+Set the repository variable `NOSTR_PUBLISHER` to the publisher's public key.
+This is public metadata, not a secret. The workflow deliberately does not
+store a Nostr private key in GitHub Secrets. The final Nostr step is an
+explicit handoff to an OIDC-authenticated signing service, which can verify
+the repository, workflow, tag, and commit before signing and invoking
+`npack publish`.
+
+The resulting trust claims remain separate:
+
+- GitHub attestation: this exact artifact came from this repository/workflow
+  and commit.
+- Nostr signature: the publisher authorizes this package release.
+- SHA-256: every Blossom, GitHub, or other transport copy has identical bytes.
+
+The workflow is intentionally a reference implementation rather than a
+protocol dependency. Other builders may produce the same `.npk`, manifest,
+and event shape from GitLab, Forgejo, a local build, or a reproducible-build
+service.

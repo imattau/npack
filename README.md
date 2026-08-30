@@ -74,4 +74,10 @@ The release-event command emits a signed v1 kind:9900 Nostr package-release even
 
 The publish command uploads a verified `.npk` through `nostr-blossom`, creates and publishes a signed NIP-94 `kind:1063` artifact event, then publishes the signed package-release event through `nostr-sdk`. It uses configured relays plus NIP-65 write relays when `--pubkey` is supplied. Remote installation also consults the publisher's verified Blossom `kind:10063` server list before configured storage fallbacks.
 
+The tag-driven GitHub Actions reference pipeline is documented in
+[`docs/github-actions.md`](docs/github-actions.md). It builds a deterministic
+`.npk`, emits SHA-256 and SPDX SBOM metadata, creates a GitHub provenance
+attestation, and prepares the bundle for OIDC-backed Nostr signing and
+publication without placing a long-lived Nostr private key in the runner.
+
 Offline locked replay is available with `--locked --offline`. Online installs cache the verified v1 release and NIP-94 events under the package state directory and reuse the verified artifact cache; offline replay requires those cache entries and never queries relays or Blossom servers. Delegated/offline release keys remain a separate future extension.

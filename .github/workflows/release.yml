@@ -1,0 +1,119 @@
+name: Release package
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  package:
+    name: Build deterministic npk
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build npack
+        run: cargo build --release --locked
+
+      - name: Determine release version
+        id: release
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.0-ci.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create package root
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          mkdir -p package-root/bin package-output
+          install -m 0755 target/release/npack package-root/bin/npack
+          cargo run --quiet -- pack package-root \
+            --output "package-output/npack-${VERSION}-linux-x86_64.npk"
+
+      - name: Create package manifest and hash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          PUBLISHER: ${{ vars.NOSTR_PUBLISHER }}
+        run: |
+          test -n "$PUBLISHER" || {
+            echo "Repository variable NOSTR_PUBLISHER must contain the release publisher key" >&2
+            exit 1
+          }
+          artifact="npack-${VERSION}-linux-x86_64.npk"
+          sha256=$(sha256sum "package-output/$artifact" | cut -d ' ' -f 1)
+          jq -n \
+            --arg publisher "$PUBLISHER" \
+            --arg name npack \
+            --arg version "$VERSION" \
+            --arg artifact "$artifact" \
+            --arg sha256 "$sha256" \
+            '{publisher:$publisher,name:$name,version:$version,artifact:$artifact,sha256:$sha256,dependencies:[],conflicts:[],os:"linux",arch:"x86_64",format:"npk",runtime_requires:[],provides:[]}' \
+            > package-output/npack-${VERSION}.manifest.json
+          sha256sum "package-output/$artifact" > package-output/SHA256SUMS
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: package-root
+          format: spdx-json
+          output-file: package-output/npack.spdx.json
+
+      - name: Verify package output
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          artifact="package-output/npack-${VERSION}-linux-x86_64.npk"
+          expected=$(cut -d ' ' -f 1 package-output/SHA256SUMS)
+          actual=$(sha256sum "$artifact" | cut -d ' ' -f 1)
+          test "$expected" = "$actual"
+          cargo run --quiet -- verify "package-output/npack-${VERSION}.manifest.json"
+
+      - name: Attest package provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: package-output/*.npk
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: npack-release-bundle
+          path: package-output
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            package-output/*.npk
+            package-output/*.manifest.json
+            package-output/SHA256SUMS
+            package-output/npack.spdx.json
+
+  nostr-handoff:
+    name: Nostr publication handoff
+    needs: package
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Explain publication boundary
+        run: |
+          echo "The release bundle and GitHub provenance are ready for Nostr publication."
+          echo "Use an OIDC-authenticated signing service to invoke:"
+          echo "  npack publish <manifest> --relay <write-relay> --server <blossom-server>"
+          echo "No Nostr private key is stored in or exposed to this workflow."
