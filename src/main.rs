@@ -1954,6 +1954,7 @@ fn npk_entry_paths(archive_path: &Path) -> Result<Vec<PathBuf>> {
 fn install_staged_npk(staging: &Path, prefix: &Path, entries: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut installed = Vec::new();
     let mut applied = Vec::new();
+    let mut created_directories = Vec::new();
     let backup_root = staging.join(".npack-backups");
     for relative in entries {
         let result = (|| -> Result<()> {
@@ -1961,7 +1962,10 @@ fn install_staged_npk(staging: &Path, prefix: &Path, entries: &[PathBuf]) -> Res
             let destination = prefix.join(relative);
             let metadata = fs::symlink_metadata(&source)?;
             if metadata.file_type().is_dir() {
-                fs::create_dir_all(&destination)?;
+                if !destination.exists() {
+                    fs::create_dir_all(&destination)?;
+                    created_directories.push(destination.clone());
+                }
                 return Ok(());
             }
             if let Some(parent) = destination.parent() {
@@ -1991,10 +1995,23 @@ fn install_staged_npk(staging: &Path, prefix: &Path, entries: &[PathBuf]) -> Res
         })();
         if let Err(error) = result {
             rollback_entries(&applied)?;
+            rollback_directories(&created_directories)?;
             return Err(error);
         }
     }
     Ok(installed)
+}
+
+fn rollback_directories(directories: &[PathBuf]) -> Result<()> {
+    for directory in directories.iter().rev() {
+        match fs::remove_dir(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn backup_entry(source: &Path, destination: &Path) -> Result<()> {
@@ -2553,13 +2570,18 @@ mod tests {
         let error = install_staged_npk(
             &staging,
             &prefix,
-            &[PathBuf::from("bin/one"), PathBuf::from("bin/missing")],
+            &[
+                PathBuf::from("bin"),
+                PathBuf::from("bin/one"),
+                PathBuf::from("bin/missing"),
+            ],
         )
         .unwrap_err();
         assert!(
             error.to_string().contains("No such file") || error.to_string().contains("not found")
         );
         assert!(!prefix.join("bin/one").exists());
+        assert!(!prefix.join("bin").exists());
         Ok(())
     }
 
