@@ -1112,6 +1112,7 @@ fn install_with_capabilities_at(
         runtime_requires: manifest.runtime_requires.clone(),
         provides: manifest.provides.clone(),
     };
+    remove_stale_files(&existing_packages, &installed)?;
     let mut packages = existing_packages;
     packages.retain(|p| {
         !(p.publisher == installed.publisher
@@ -1125,6 +1126,41 @@ fn install_with_capabilities_at(
         serde_json::to_vec_pretty(&packages)?,
     )?;
     Ok(installed)
+}
+
+fn remove_stale_files(existing: &[InstalledPackage], replacement: &InstalledPackage) -> Result<()> {
+    let previous = existing.iter().find(|package| {
+        package.publisher == replacement.publisher
+            && package.name == replacement.name
+            && package.version == replacement.version
+    });
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    for file in &previous.files {
+        if replacement
+            .files
+            .iter()
+            .any(|replacement_file| replacement_file == file)
+        {
+            continue;
+        }
+        let owned_by_other_package = existing.iter().any(|package| {
+            !(package.publisher == previous.publisher
+                && package.name == previous.name
+                && package.version == previous.version)
+                && package.files.iter().any(|other_file| other_file == file)
+        });
+        if owned_by_other_package {
+            continue;
+        }
+        if file.is_file()
+            || fs::symlink_metadata(file).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            fs::remove_file(file)?;
+        }
+    }
+    Ok(())
 }
 
 fn run_post_install(
@@ -1824,6 +1860,35 @@ mod tests {
         remove_package("pub/first", Some(&store))?;
 
         assert!(shared.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn reinstall_removes_stale_files() -> Result<()> {
+        let dir = tempdir()?;
+        let stale = dir.path().join("bin/stale");
+        let current = dir.path().join("bin/current");
+        fs::create_dir_all(stale.parent().unwrap())?;
+        fs::write(&stale, b"stale")?;
+        fs::write(&current, b"current")?;
+        let previous = InstalledPackage {
+            publisher: "pub".into(),
+            name: "app".into(),
+            version: "1.0.0".into(),
+            sha256: "00".repeat(32),
+            artifact: dir.path().join("artifact"),
+            dependencies: vec![],
+            files: vec![stale.clone(), current.clone()],
+            runtime_requires: vec![],
+            provides: vec![],
+        };
+        let replacement = InstalledPackage {
+            files: vec![current.clone()],
+            ..previous.clone()
+        };
+        remove_stale_files(&[previous], &replacement)?;
+        assert!(!stale.exists());
+        assert!(current.exists());
         Ok(())
     }
 
