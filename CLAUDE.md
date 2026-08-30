@@ -38,4 +38,5 @@ npack is an independent package manager whose registry metadata will be publishe
 - Runtime capability requirements are matched against installed package provides or host OS/architecture and standard shared-library capabilities; symbol-version and richer system capability providers are future work.
 - Remote release selection must filter os and arch tags against the current host, accepting any as a wildcard.
 - Runtime capabilities may be exact names or semver constraints matched against name@version provisions.
-- Post-install hooks are declarative and signed; only create-directory is currently supported, and paths remain inside the package store.
+- Post-install hooks are declarative and signed; create-directory is package-local, while register-service is explicitly capability-gated.
+- register-service is approved by the service-manager capability and installs a user systemd unit without enabling or starting it.

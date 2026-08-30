@@ -877,18 +877,17 @@ fn run_post_install(
     for action in actions {
         let capability = if action.action == "create-directory" {
             "filesystem:package-store"
+        } else if action.action == "register-service" {
+            "service-manager"
         } else {
             action.action.as_str()
         };
-        if !allowed_capabilities.is_empty()
+        if action.action != "create-directory"
             && !allowed_capabilities
                 .iter()
                 .any(|allowed| allowed == capability)
         {
             bail!("post-install action requires capability: {capability}");
-        }
-        if action.action != "create-directory" {
-            bail!("unsupported post-install action: {}", action.action);
         }
         if action.path.is_absolute()
             || action
@@ -898,7 +897,22 @@ fn run_post_install(
         {
             bail!("unsafe post-install path: {}", action.path.display());
         }
-        fs::create_dir_all(package_dir.join(&action.path))?;
+        match action.action.as_str() {
+            "create-directory" => fs::create_dir_all(package_dir.join(&action.path))?,
+            "register-service" => {
+                let source = package_dir.join(&action.path);
+                if source.extension().and_then(|extension| extension.to_str()) != Some("service") {
+                    bail!("register-service requires a .service file");
+                }
+                let destination = dirs::config_dir()
+                    .context("cannot determine user config directory")?
+                    .join("systemd/user")
+                    .join(source.file_name().context("service path has no filename")?);
+                fs::create_dir_all(destination.parent().unwrap())?;
+                fs::copy(source, &destination)?;
+            }
+            _ => bail!("unsupported post-install action: {}", action.action),
+        }
     }
     Ok(())
 }
@@ -1320,6 +1334,16 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("unsafe post-install path"));
+        let error = run_post_install(
+            &[PostInstallAction {
+                action: "register-service".into(),
+                path: "hello.service".into(),
+            }],
+            dir.path(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("service-manager"));
         Ok(())
     }
 }
