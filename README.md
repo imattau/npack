@@ -14,6 +14,7 @@ The current prototype works entirely locally. It defines a package manifest, cal
     cargo run -- list --store /tmp/npack-store
     cargo run -- release-event ./hello.npack.json --secret-key <32-byte-hex-key>
     cargo run -- verify-event ./release.json ./hello.npack.json
+    cargo run -- search hello --relay wss://relay.example
 
 Example manifest:
 
@@ -28,4 +29,4 @@ Example manifest:
 
 The manifest is deliberately format-neutral. The release-event command uses the official Rust Nostr library for event IDs, tags, key handling, and Schnorr signatures while preserving this local package lifecycle.
 
-The release-event command emits a signed, provisional kind:9900 Nostr package-release event. The verify-event command validates the event signature and checks it against the package manifest. Relay publishing and Blossom upload are the next integration steps.
+The release-event command emits a signed, provisional kind:9900 Nostr package-release event. The verify-event command validates the event signature and checks it against the package manifest. The search command queries configured relays and displays only cryptographically valid release events.

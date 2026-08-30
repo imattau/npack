@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use nostr::prelude::*;
+use nostr_sdk::prelude::*;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -44,6 +44,11 @@ enum Command {
     VerifyEvent {
         event: PathBuf,
         manifest: PathBuf,
+    },
+    Search {
+        query: String,
+        #[arg(long = "relay", required = true)]
+        relays: Vec<String>,
     },
 }
 
@@ -97,7 +102,8 @@ struct InstalledPackage {
     dependencies: Vec<Dependency>,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Hash { artifact } => println!("{}", hash_file(&artifact)?),
         Command::Verify { manifest } => {
@@ -155,7 +161,32 @@ fn main() -> Result<()> {
                 nostr_event.id, package.publisher, package.name, package.version
             );
         }
+        Command::Search { query, relays } => search_releases(&query, &relays).await?,
     }
+    Ok(())
+}
+
+async fn search_releases(query: &str, relays: &[String]) -> Result<()> {
+    let client = Client::default();
+    for relay in relays {
+        client
+            .add_relay(relay)
+            .await
+            .with_context(|| format!("adding relay {relay}"))?;
+    }
+    client.connect().await;
+    let filter = Filter::new().kind(Kind::Custom(9900)).search(query);
+    let events = client
+        .fetch_events(filter)
+        .timeout(std::time::Duration::from_secs(10))
+        .await
+        .context("querying Nostr relays")?;
+    for event in events {
+        if event.verify().is_ok() {
+            println!("{} {} {}", event.id, event.pubkey, event.content);
+        }
+    }
+    client.disconnect().await;
     Ok(())
 }
 
