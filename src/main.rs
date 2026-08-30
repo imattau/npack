@@ -110,6 +110,14 @@ struct Manifest {
     runtime_requires: Vec<String>,
     #[serde(default)]
     provides: Vec<String>,
+    #[serde(default)]
+    post_install: Vec<PostInstallAction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PostInstallAction {
+    action: String,
+    path: PathBuf,
 }
 
 fn default_os() -> String {
@@ -530,6 +538,18 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
         .filter_map(Tag::content)
         .map(str::to_owned)
         .collect();
+    let post_install = event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind() == "post-install")
+        .filter_map(|tag| {
+            let values = tag.clone().to_vec();
+            (values.len() >= 3).then(|| PostInstallAction {
+                action: values[1].clone(),
+                path: values[2].clone().into(),
+            })
+        })
+        .collect();
     Ok(Manifest {
         publisher: event.pubkey.to_hex(),
         name: tag_value(event, "name")
@@ -552,6 +572,7 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
         format: tag_value(event, "format").unwrap_or("opaque").into(),
         runtime_requires,
         provides,
+        post_install,
     })
 }
 
@@ -652,6 +673,13 @@ fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) ->
     }
     for provided in &manifest.provides {
         tags.push(vec!["provides".into(), provided.clone()]);
+    }
+    for action in &manifest.post_install {
+        tags.push(vec![
+            "post-install".into(),
+            action.action.clone(),
+            action.path.to_string_lossy().into_owned(),
+        ]);
     }
     let content = format!(
         "npack release {}/{} {}",
@@ -775,6 +803,7 @@ fn install(
     } else {
         vec![destination.clone()]
     };
+    run_post_install(&manifest.post_install, &package_dir)?;
     let installed = InstalledPackage {
         publisher: manifest.publisher.clone(),
         name: manifest.name.clone(),
@@ -799,6 +828,24 @@ fn install(
         serde_json::to_vec_pretty(&packages)?,
     )?;
     Ok(installed)
+}
+
+fn run_post_install(actions: &[PostInstallAction], package_dir: &Path) -> Result<()> {
+    for action in actions {
+        if action.action != "create-directory" {
+            bail!("unsupported post-install action: {}", action.action);
+        }
+        if action.path.is_absolute()
+            || action
+                .path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            bail!("unsafe post-install path: {}", action.path.display());
+        }
+        fs::create_dir_all(package_dir.join(&action.path))?;
+    }
+    Ok(())
 }
 
 fn extract_npk(archive_path: &Path, destination: &Path) -> Result<Vec<PathBuf>> {
@@ -1008,6 +1055,7 @@ mod tests {
             format: "opaque".into(),
             runtime_requires: vec![],
             provides: vec![],
+            post_install: vec![],
         };
         fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
         verify_manifest(&manifest, &manifest_path)?;
@@ -1041,6 +1089,7 @@ mod tests {
             format: "opaque".into(),
             runtime_requires: vec![],
             provides: vec![],
+            post_install: vec![],
         };
         fs::write(&artifact, b"tampered")?;
         assert!(verify_manifest(&manifest, &dir.path().join("manifest.json")).is_err());
@@ -1068,6 +1117,7 @@ mod tests {
             format: "tar.zst".into(),
             runtime_requires: vec![],
             provides: vec![],
+            post_install: vec![],
         };
         let event = sign_release_event(&manifest, &"11".repeat(32), 1_700_000_000)?;
         assert_eq!(event.kind.as_u16(), 9900);
@@ -1106,6 +1156,7 @@ mod tests {
             format: default_format(),
             runtime_requires: vec![],
             provides: vec![],
+            post_install: vec![],
         };
         fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
         let error =
