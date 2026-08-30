@@ -83,6 +83,10 @@ struct LockedPackage {
     dependencies: Vec<Dependency>,
     #[serde(default)]
     conflicts: Vec<Dependency>,
+    #[serde(default)]
+    runtime_requires: Vec<String>,
+    #[serde(default)]
+    provides: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -690,6 +694,8 @@ fn write_lockfile(path: &Path, root: &Path, install_order: &[String]) -> Result<
             sha256: package.sha256.clone(),
             dependencies: package.dependencies.clone(),
             conflicts: package.conflicts.clone(),
+            runtime_requires: package.runtime_requires.clone(),
+            provides: package.provides.clone(),
         });
     }
     let lockfile = Lockfile {
@@ -854,6 +860,8 @@ fn verify_locked_install(lockfile: &Lockfile, root: &Path) -> Result<()> {
                 && package.sha256 == locked.sha256
                 && package.dependencies == locked.dependencies
                 && package.conflicts == locked.conflicts
+                && package.runtime_requires == locked.runtime_requires
+                && package.provides == locked.provides
         });
         if !found {
             bail!(
@@ -2867,6 +2875,8 @@ mod tests {
                     sha256: "aa".repeat(32),
                     dependencies: vec![],
                     conflicts: vec![],
+                    runtime_requires: vec![],
+                    provides: vec![],
                 },
                 LockedPackage {
                     publisher: "22".repeat(32),
@@ -2879,6 +2889,8 @@ mod tests {
                         requirement: ">=2.0.0".into(),
                     }],
                     conflicts: vec![],
+                    runtime_requires: vec!["libc.so.6".into()],
+                    provides: vec![],
                 },
             ],
         };
@@ -2887,6 +2899,48 @@ mod tests {
         let mut invalid = lockfile.clone();
         invalid.packages[1].dependencies[0].requirement = ">=3.0.0".into();
         assert!(validate_lockfile_graph(&invalid).is_err());
+
+        let mut capabilities = lockfile.clone();
+        capabilities.packages[1]
+            .runtime_requires
+            .push("libssl.so.3".into());
+        let installed = vec![
+            format!("{}/{}", publisher, "libfoo"),
+            format!("{}/{}", "22".repeat(32), "app"),
+        ];
+        let root = tempdir()?;
+        fs::create_dir_all(root.path().join("packages"))?;
+        fs::write(
+            root.path().join("installed.json"),
+            serde_json::to_vec(&[
+                InstalledPackage {
+                    publisher: publisher.clone(),
+                    name: "libfoo".into(),
+                    version: "2.1.0".into(),
+                    sha256: "aa".repeat(32),
+                    artifact: root.path().join("libfoo"),
+                    dependencies: vec![],
+                    conflicts: vec![],
+                    files: vec![],
+                    runtime_requires: vec![],
+                    provides: vec![],
+                },
+                InstalledPackage {
+                    publisher: "22".repeat(32),
+                    name: "app".into(),
+                    version: "1.0.0".into(),
+                    sha256: "bb".repeat(32),
+                    artifact: root.path().join("app"),
+                    dependencies: lockfile.packages[1].dependencies.clone(),
+                    conflicts: vec![],
+                    files: vec![],
+                    runtime_requires: vec![],
+                    provides: vec![],
+                },
+            ])?,
+        )?;
+        verify_locked_order(&lockfile, &installed)?;
+        assert!(verify_locked_install(&capabilities, root.path()).is_err());
         Ok(())
     }
 }
