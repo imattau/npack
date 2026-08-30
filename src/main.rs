@@ -484,7 +484,7 @@ async fn main() -> Result<()> {
                     (Some(normalize_publisher_reference(p)), n)
                 });
             install_ref(
-                &name,
+                name,
                 publisher,
                 &relays,
                 store.as_deref(),
@@ -665,7 +665,6 @@ async fn install_ref(
         allowed_capabilities,
         user,
         trusted_publishers,
-        user_pubkey,
         blossom_servers,
         &root,
         &prefix,
@@ -905,7 +904,6 @@ fn install_remote_package<'a>(
     allowed_capabilities: &'a [String],
     user: bool,
     trusted_publishers: &'a [String],
-    user_pubkey: Option<&'a str>,
     blossom_servers: &'a [String],
     root: &'a Path,
     prefix: &'a Path,
@@ -1103,7 +1101,6 @@ fn install_remote_package<'a>(
                 allowed_capabilities,
                 user,
                 trusted_publishers,
-                user_pubkey,
                 blossom_servers,
                 root,
                 prefix,
