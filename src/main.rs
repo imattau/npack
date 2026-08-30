@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use nostr::prelude::*;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -39,6 +40,10 @@ enum Command {
         secret_key: String,
         #[arg(long, default_value_t = 0)]
         created_at: u64,
+    },
+    VerifyEvent {
+        event: PathBuf,
+        manifest: PathBuf,
     },
 }
 
@@ -88,6 +93,8 @@ struct InstalledPackage {
     version: String,
     sha256: String,
     artifact: PathBuf,
+    #[serde(default)]
+    dependencies: Vec<Dependency>,
 }
 
 fn main() -> Result<()> {
@@ -135,6 +142,46 @@ fn main() -> Result<()> {
                     timestamp
                 )?)?
             );
+        }
+        Command::VerifyEvent { event, manifest } => {
+            let package = load_manifest(&manifest)?;
+            let event_json =
+                fs::read(&event).with_context(|| format!("reading event {}", event.display()))?;
+            let nostr_event: Event =
+                serde_json::from_slice(&event_json).context("parsing Nostr event JSON")?;
+            verify_release_event(&nostr_event, &package)?;
+            println!(
+                "verified release event {} for {}/{} {}",
+                nostr_event.id, package.publisher, package.name, package.version
+            );
+        }
+    }
+    Ok(())
+}
+
+fn verify_release_event(event: &Event, manifest: &Manifest) -> Result<()> {
+    if event.kind.as_u16() != 9900 {
+        bail!("expected npack release event kind 9900, got {}", event.kind);
+    }
+    event
+        .verify()
+        .context("invalid Nostr event ID or signature")?;
+    for (kind, expected) in [
+        ("name", manifest.name.as_str()),
+        ("version", manifest.version.as_str()),
+        ("os", manifest.os.as_str()),
+        ("arch", manifest.arch.as_str()),
+        ("format", manifest.format.as_str()),
+        ("x", manifest.sha256.to_ascii_lowercase().as_str()),
+    ] {
+        let actual = event
+            .tags
+            .iter()
+            .find(|tag| tag.kind() == kind)
+            .and_then(Tag::content)
+            .with_context(|| format!("release event is missing {kind} tag"))?;
+        if actual != expected {
+            bail!("release event {kind} mismatch: expected {expected}, got {actual}");
         }
     }
     Ok(())
@@ -235,6 +282,7 @@ fn install(
     store: Option<&Path>,
 ) -> Result<InstalledPackage> {
     let root = store.map(Path::to_path_buf).unwrap_or_else(default_store);
+    ensure_dependencies_available(manifest, &root)?;
     let package_dir = root
         .join("packages")
         .join(&manifest.publisher)
@@ -256,6 +304,7 @@ fn install(
         version: manifest.version.clone(),
         sha256: manifest.sha256.to_ascii_lowercase(),
         artifact: destination,
+        dependencies: manifest.dependencies.clone(),
     };
     let mut packages = installed_packages(Some(&root))?;
     packages.retain(|p| {
@@ -270,6 +319,33 @@ fn install(
         serde_json::to_vec_pretty(&packages)?,
     )?;
     Ok(installed)
+}
+
+fn ensure_dependencies_available(manifest: &Manifest, store: &Path) -> Result<()> {
+    let installed = installed_packages(Some(store))?;
+    for dependency in &manifest.dependencies {
+        let requirement = VersionReq::parse(&dependency.requirement).with_context(|| {
+            format!(
+                "invalid version requirement for {}: {}",
+                dependency.name, dependency.requirement
+            )
+        })?;
+        let satisfied = installed.iter().any(|package| {
+            package.name == dependency.name
+                && Version::parse(&package.version)
+                    .map(|version| requirement.matches(&version))
+                    .unwrap_or(false)
+        });
+        if !satisfied {
+            bail!(
+                "missing dependency {} {} (install it before {})",
+                dependency.name,
+                dependency.requirement,
+                manifest.name
+            );
+        }
+    }
+    Ok(())
 }
 
 fn installed_packages(store: Option<&Path>) -> Result<Vec<InstalledPackage>> {
@@ -366,6 +442,37 @@ mod tests {
         assert_eq!(event.sig.to_string().len(), 128);
         assert!(event.verify().is_ok());
         assert!(serde_json::to_string(&event.tags)?.contains("libfoo"));
+        verify_release_event(&event, &manifest)?;
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_install_without_dependencies() -> Result<()> {
+        let dir = tempdir()?;
+        let artifact = dir.path().join("app.bin");
+        fs::write(&artifact, b"app")?;
+        let manifest_path = dir.path().join("app.npack.json");
+        let manifest = Manifest {
+            publisher: "npub1test".into(),
+            name: "app".into(),
+            version: "1.0.0".into(),
+            artifact: "app.bin".into(),
+            sha256: hash_file(&artifact)?,
+            dependencies: vec![Dependency {
+                name: "libfoo".into(),
+                requirement: ">=2.0.0".into(),
+            }],
+            artifact_event: None,
+            repo: None,
+            commit: None,
+            os: default_os(),
+            arch: default_arch(),
+            format: default_format(),
+        };
+        fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+        let error =
+            install(&manifest, &manifest_path, Some(&dir.path().join("store"))).unwrap_err();
+        assert!(error.to_string().contains("missing dependency libfoo"));
         Ok(())
     }
 }

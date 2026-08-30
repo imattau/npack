@@ -6,13 +6,14 @@ npack is intended to manage the complete package lifecycle: discover signed rele
 
 ## First vertical slice
 
-The current prototype works entirely locally. It defines a package manifest, calculates SHA-256 hashes, verifies an artifact, installs it into a versioned store, and records installed packages.
+The current prototype works entirely locally. It defines a package manifest, calculates SHA-256 hashes, verifies an artifact, checks declared dependencies, installs it into a versioned store, and records installed packages.
 
     cargo run -- hash ./hello.tar.gz
     cargo run -- verify ./hello.npack.json
     cargo run -- install ./hello.npack.json --store /tmp/npack-store
     cargo run -- list --store /tmp/npack-store
     cargo run -- release-event ./hello.npack.json --secret-key <32-byte-hex-key>
+    cargo run -- verify-event ./release.json ./hello.npack.json
 
 Example manifest:
 
@@ -27,4 +28,4 @@ Example manifest:
 
 The manifest is deliberately format-neutral. The release-event command uses the official Rust Nostr library for event IDs, tags, key handling, and Schnorr signatures while preserving this local package lifecycle.
 
-The release-event command emits a signed, provisional kind:9900 Nostr package-release event. It is currently an offline event generator; relay publishing, Blossom upload, and release-event signature verification are the next integration steps.
+The release-event command emits a signed, provisional kind:9900 Nostr package-release event. The verify-event command validates the event signature and checks it against the package manifest. Relay publishing and Blossom upload are the next integration steps.
