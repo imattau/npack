@@ -249,6 +249,14 @@ enum Command {
         #[arg(long, help = "Nostr pubkey whose NIP-65 write relays should be used")]
         pubkey: Option<String>,
     },
+    /// Generate a new publisher key and register it in the OS credential store
+    GenerateKey {
+        #[arg(
+            long,
+            help = "Print the generated nsec; keep it private and back it up securely"
+        )]
+        show_secret: bool,
+    },
     Register {
         #[arg(
             help = "Nostr secret key in nsec or 32-byte hexadecimal form",
@@ -637,6 +645,7 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::GenerateKey { show_secret } => generate_and_register_key(show_secret)?,
         Command::Register { secret_key, stdin } => {
             let secret_key = if stdin {
                 let mut secret_key = String::new();
@@ -878,6 +887,18 @@ fn register_secret_key(secret_key: &str) -> Result<()> {
         "registered publisher {}",
         display_publisher(&keys.public_key().to_hex())
     );
+    Ok(())
+}
+
+fn generate_and_register_key(show_secret: bool) -> Result<()> {
+    let keys = Keys::generate();
+    let secret_key = keys.secret_key().to_bech32()?;
+    register_secret_key(&secret_key)?;
+    if show_secret {
+        println!("nsec: {secret_key}");
+    } else {
+        eprintln!("secret key stored in the OS credential store; use --show-secret to display it");
+    }
     Ok(())
 }
 

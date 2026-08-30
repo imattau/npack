@@ -361,6 +361,21 @@ Review package metadata and publisher identity before granting capabilities.
 
 ### Registering a publisher key
 
+Generate a new publisher key and store its `nsec` automatically in the
+operating system credential store:
+
+```bash
+npack generate-key
+```
+
+The public `npub` is displayed; the private key is not printed by default.
+Use `--show-secret` only when you are prepared to copy and back up the `nsec`
+securely:
+
+```bash
+npack generate-key --show-secret
+```
+
 Register a dedicated publisher key once in the operating system credential
 store. With no argument, npack prompts without echoing the key:
 
