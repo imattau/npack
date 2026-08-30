@@ -660,7 +660,7 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
                 },
             })
         })
-        .collect();
+        .collect::<Vec<_>>();
     let conflicts = event
         .tags
         .iter()
@@ -681,7 +681,7 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
                 },
             })
         })
-        .collect();
+        .collect::<Vec<_>>();
     let runtime_requires = event
         .tags
         .iter()
@@ -708,6 +708,8 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
             })
         })
         .collect();
+    validate_dependency_declarations(&dependencies)?;
+    validate_dependency_declarations(&conflicts)?;
     Ok(Manifest {
         publisher: event.pubkey.to_hex(),
         name: tag_value(event, "name")
@@ -936,7 +938,39 @@ fn load_manifest(path: &Path) -> Result<Manifest> {
     if manifest.sha256.len() != 64 || !manifest.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
         bail!("manifest sha256 must be 64 hexadecimal characters");
     }
+    validate_dependency_declarations(&manifest.dependencies)?;
+    validate_dependency_declarations(&manifest.conflicts)?;
     Ok(manifest)
+}
+
+fn validate_dependency_declarations(dependencies: &[Dependency]) -> Result<()> {
+    for dependency in dependencies {
+        if dependency.name.is_empty()
+            || dependency.name.contains('/')
+            || dependency.name.contains('\\')
+            || dependency.name == "."
+            || dependency.name == ".."
+        {
+            bail!("dependency name must be a single safe path component");
+        }
+        if let Some(publisher) = &dependency.publisher {
+            if publisher.is_empty()
+                || publisher.contains('/')
+                || publisher.contains('\\')
+                || publisher == "."
+                || publisher == ".."
+            {
+                bail!("dependency publisher must be a single safe path component");
+            }
+        }
+        VersionReq::parse(&dependency.requirement).with_context(|| {
+            format!(
+                "invalid dependency version requirement for {}: {}",
+                dependency.name, dependency.requirement
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn artifact_path(manifest: &Manifest, manifest_path: &Path) -> PathBuf {
