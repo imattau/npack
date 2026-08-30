@@ -10,6 +10,19 @@ The current prototype works entirely locally. It defines a package manifest, cal
 
 System installation is the default and uses `/` as the payload prefix with package state in `/var/lib/npack`, so it normally requires privilege. Use `--user` to install payloads into `$HOME/.local`; user state remains in the user's local data directory. `--store` is available as an explicit development/test state and prefix override.
 
+Persistent defaults can be configured in `$XDG_CONFIG_HOME/npack/config.toml` (or the platform config directory):
+
+    [network]
+    relays = ["wss://relay.example"]
+
+    [trust]
+    publishers = ["<publisher-hex>"]
+
+    [install]
+    user = true
+
+Command-line values take precedence over configuration values.
+
     cargo run -- hash ./hello.tar.gz
     cargo run -- verify ./hello.npack.json
     cargo run -- install ./hello.npack.json --store /tmp/npack-store

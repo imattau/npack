@@ -24,6 +24,34 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct Config {
+    #[serde(default)]
+    network: NetworkConfig,
+    #[serde(default)]
+    trust: TrustConfig,
+    #[serde(default)]
+    install: InstallConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct NetworkConfig {
+    #[serde(default)]
+    relays: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TrustConfig {
+    #[serde(default)]
+    publishers: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct InstallConfig {
+    #[serde(default)]
+    user: bool,
+}
+
 #[derive(Subcommand)]
 enum Command {
     Hash {
@@ -75,7 +103,7 @@ enum Command {
     },
     Search {
         query: String,
-        #[arg(long = "relay", required = true)]
+        #[arg(long = "relay")]
         relays: Vec<String>,
         #[arg(long = "trusted-publisher")]
         trusted_publishers: Vec<String>,
@@ -90,7 +118,7 @@ enum Command {
     #[command(alias = "update")]
     InstallRef {
         package: String,
-        #[arg(long = "relay", required = true)]
+        #[arg(long = "relay")]
         relays: Vec<String>,
         #[arg(long)]
         store: Option<PathBuf>,
@@ -192,6 +220,7 @@ struct InstalledPackage {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let config = load_config()?;
     match Cli::parse().command {
         Command::Hash { artifact } => println!("{}", hash_file(&artifact)?),
         Command::Verify { manifest } => {
@@ -214,7 +243,7 @@ async fn main() -> Result<()> {
                 &package,
                 &manifest,
                 store.as_deref(),
-                user,
+                user || config.install.user,
                 &allowed_capabilities,
             )?;
             println!(
@@ -223,12 +252,13 @@ async fn main() -> Result<()> {
             );
         }
         Command::List { store, user } => {
+            let user = user || config.install.user;
             for package in installed_packages(Some(&install_paths(store.as_deref(), user).0))? {
                 println!("{}/{} {}", package.publisher, package.name, package.version);
             }
         }
         Command::VerifyInstalled { store, user } => {
-            verify_installed(store.as_deref(), user)?;
+            verify_installed(store.as_deref(), user || config.install.user)?;
         }
         Command::ReleaseEvent {
             manifest,
@@ -290,7 +320,11 @@ async fn main() -> Result<()> {
             query,
             relays,
             trusted_publishers,
-        } => search_releases(&query, &relays, &trusted_publishers).await?,
+        } => {
+            let relays = configured_relays(relays, &config)?;
+            let trusted_publishers = configured_publishers(trusted_publishers, &config);
+            search_releases(&query, &relays, &trusted_publishers).await?
+        }
         Command::Fetch {
             sha256,
             server,
@@ -304,6 +338,8 @@ async fn main() -> Result<()> {
             trusted_publishers,
             allowed_capabilities,
         } => {
+            let relays = configured_relays(relays, &config)?;
+            let trusted_publishers = configured_publishers(trusted_publishers, &config);
             let (publisher, name) = package
                 .split_once('/')
                 .map_or((None, package.as_str()), |(p, n)| (Some(p.to_owned()), n));
@@ -312,7 +348,7 @@ async fn main() -> Result<()> {
                 publisher,
                 &relays,
                 store.as_deref(),
-                user,
+                user || config.install.user,
                 &trusted_publishers,
                 &allowed_capabilities,
             )
@@ -323,7 +359,7 @@ async fn main() -> Result<()> {
             package,
             store,
             user,
-        } => remove_package_at(&package, store.as_deref(), user)?,
+        } => remove_package_at(&package, store.as_deref(), user || config.install.user)?,
         Command::Inspect { artifact } => inspect_artifact(&artifact)?,
     }
     Ok(())
@@ -1071,6 +1107,39 @@ fn default_store() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("npack")
+}
+
+fn load_config() -> Result<Config> {
+    let Some(config_dir) = dirs::config_dir() else {
+        return Ok(Config::default());
+    };
+    let path = config_dir.join("npack/config.toml");
+    if !path.exists() {
+        return Ok(Config::default());
+    }
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("reading npack config {}", path.display()))?;
+    toml::from_str(&contents).with_context(|| format!("parsing npack config {}", path.display()))
+}
+
+fn configured_relays(cli_relays: Vec<String>, config: &Config) -> Result<Vec<String>> {
+    let relays = if cli_relays.is_empty() {
+        config.network.relays.clone()
+    } else {
+        cli_relays
+    };
+    if relays.is_empty() {
+        bail!("no relays configured; pass --relay or configure [network].relays");
+    }
+    Ok(relays)
+}
+
+fn configured_publishers(cli_publishers: Vec<String>, config: &Config) -> Vec<String> {
+    if cli_publishers.is_empty() {
+        config.trust.publishers.clone()
+    } else {
+        cli_publishers
+    }
 }
 
 fn default_system_store() -> PathBuf {

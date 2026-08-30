@@ -20,6 +20,7 @@ nostr-blossom = "0.45.0"
 nostr-sdk = "0.45.2"
 semver = "1"
 tar = "0.4"
+toml = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 zstd = "0.13"
 
