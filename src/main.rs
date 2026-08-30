@@ -60,7 +60,7 @@ enum Command {
         output: PathBuf,
     },
     InstallRef {
-        name: String,
+        package: String,
         #[arg(long = "relay", required = true)]
         relays: Vec<String>,
         #[arg(long)]
@@ -103,6 +103,8 @@ fn default_format() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Dependency {
+    #[serde(default)]
+    publisher: Option<String>,
     name: String,
     requirement: String,
 }
@@ -184,10 +186,15 @@ async fn main() -> Result<()> {
             output,
         } => fetch_blob(&sha256, &server, &output).await?,
         Command::InstallRef {
-            name,
+            package,
             relays,
             store,
-        } => install_ref(&name, &relays, store.as_deref()).await?,
+        } => {
+            let (publisher, name) = package
+                .split_once('/')
+                .map_or((None, package.as_str()), |(p, n)| (Some(p.to_owned()), n));
+            install_ref(&name, publisher, &relays, store.as_deref()).await?
+        }
     }
     Ok(())
 }
@@ -210,7 +217,12 @@ async fn fetch_blob(sha256: &str, server: &str, output: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn install_ref(name: &str, relays: &[String], store: Option<&Path>) -> Result<()> {
+async fn install_ref(
+    name: &str,
+    publisher: Option<String>,
+    relays: &[String],
+    store: Option<&Path>,
+) -> Result<()> {
     let client = Client::default();
     for relay in relays {
         client.add_relay(relay).await?;
@@ -219,7 +231,16 @@ async fn install_ref(name: &str, relays: &[String], store: Option<&Path>) -> Res
     let root = store.map(Path::to_path_buf).unwrap_or_else(default_store);
     let mut visiting = Vec::new();
     let mut installed = Vec::new();
-    install_remote_package(&client, name, None, &root, &mut visiting, &mut installed).await?;
+    install_remote_package(
+        &client,
+        name,
+        publisher,
+        None,
+        &root,
+        &mut visiting,
+        &mut installed,
+    )
+    .await?;
     client.disconnect().await;
     println!("install order: {}", installed.join(" -> "));
     Ok(())
@@ -231,15 +252,20 @@ use std::pin::Pin;
 fn install_remote_package<'a>(
     client: &'a Client,
     name: &'a str,
+    publisher: Option<String>,
     requirement: Option<String>,
     root: &'a Path,
     visiting: &'a mut Vec<String>,
     installed: &'a mut Vec<String>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
+        let install_key = publisher.as_deref().map_or_else(
+            || name.to_owned(),
+            |publisher| format!("{publisher}/{name}"),
+        );
         if installed
             .iter()
-            .any(|installed_name| installed_name == name)
+            .any(|installed_name| installed_name == &install_key)
         {
             return Ok(());
         }
@@ -259,6 +285,11 @@ fn install_remote_package<'a>(
             .into_iter()
             .filter(|event| event.verify().is_ok())
             .filter(|event| tag_value(event, "name") == Some(name))
+            .filter(|event| {
+                publisher
+                    .as_deref()
+                    .map_or(true, |publisher| event.pubkey.to_hex() == publisher)
+            })
             .filter(|event| {
                 requirement.as_deref().map_or(true, |req| {
                     VersionReq::parse(req)
@@ -314,6 +345,7 @@ fn install_remote_package<'a>(
             install_remote_package(
                 client,
                 &dependency.name,
+                dependency.publisher,
                 Some(dependency.requirement),
                 root,
                 visiting,
@@ -323,7 +355,7 @@ fn install_remote_package<'a>(
         }
         install(&manifest, &staging.join("manifest.json"), Some(&root))?;
         visiting.pop();
-        installed.push(manifest.name.clone());
+        installed.push(install_key);
         Ok(())
     })
 }
@@ -342,8 +374,17 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
         .filter_map(|tag| {
             let values = tag.clone().to_vec();
             (values.len() >= 3).then(|| Dependency {
-                name: values[1].clone(),
-                requirement: values[2].clone(),
+                publisher: (values.len() >= 4).then(|| values[1].clone()),
+                name: if values.len() >= 4 {
+                    values[2].clone()
+                } else {
+                    values[1].clone()
+                },
+                requirement: if values.len() >= 4 {
+                    values[3].clone()
+                } else {
+                    values[2].clone()
+                },
             })
         })
         .collect();
@@ -454,11 +495,13 @@ fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) ->
         tags.push(vec!["commit".into(), commit.clone()]);
     }
     for dependency in &manifest.dependencies {
-        tags.push(vec![
-            "depends".into(),
-            dependency.name.clone(),
-            dependency.requirement.clone(),
-        ]);
+        let mut tag = vec!["depends".into()];
+        if let Some(publisher) = &dependency.publisher {
+            tag.push(publisher.clone());
+        }
+        tag.push(dependency.name.clone());
+        tag.push(dependency.requirement.clone());
+        tags.push(tag);
     }
     let content = format!(
         "npack release {}/{} {}",
@@ -575,6 +618,10 @@ fn ensure_dependencies_available(manifest: &Manifest, store: &Path) -> Result<()
         })?;
         let satisfied = installed.iter().any(|package| {
             package.name == dependency.name
+                && dependency
+                    .publisher
+                    .as_deref()
+                    .map_or(true, |publisher| package.publisher == publisher)
                 && Version::parse(&package.version)
                     .map(|version| requirement.matches(&version))
                     .unwrap_or(false)
@@ -667,6 +714,7 @@ mod tests {
             artifact: "hello.tar.gz".into(),
             sha256: "00".repeat(32),
             dependencies: vec![Dependency {
+                publisher: None,
                 name: "libfoo".into(),
                 requirement: ">=2".into(),
             }],
@@ -702,6 +750,7 @@ mod tests {
             artifact: "app.bin".into(),
             sha256: hash_file(&artifact)?,
             dependencies: vec![Dependency {
+                publisher: None,
                 name: "libfoo".into(),
                 requirement: ">=2.0.0".into(),
             }],

@@ -20,7 +20,7 @@ npack is an independent package manager whose registry metadata will be publishe
     npack verify-event <event> <manifest>
     npack search <query> --relay <relay-url>
     npack fetch <sha256> --server <blossom-url> --output <path>
-    npack install-ref <name> --relay <relay-url> [--store <path>]
+    npack install-ref [<publisher-hex>/]<name> --relay <relay-url> [--store <path>]
 
 ## Conventions
 
