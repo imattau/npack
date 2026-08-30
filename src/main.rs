@@ -231,6 +231,19 @@ enum Command {
         #[arg(long, help = "Nostr pubkey whose NIP-65 write relays should be used")]
         pubkey: Option<String>,
     },
+    /// Publish a signed Nostr text note
+    Announce {
+        content: String,
+        #[arg(
+            long,
+            help = "Nostr secret key in nsec or 32-byte hexadecimal form; defaults to the registered key"
+        )]
+        secret_key: Option<String>,
+        #[arg(long = "relay")]
+        relays: Vec<String>,
+        #[arg(long, help = "Nostr pubkey whose NIP-65 write relays should be used")]
+        pubkey: Option<String>,
+    },
     Register {
         #[arg(
             help = "Nostr secret key in nsec or 32-byte hexadecimal form",
@@ -597,6 +610,22 @@ async fn main() -> Result<()> {
                 &secret_key,
                 &relays,
                 &servers,
+                pubkey.or_else(|| config.identity.pubkey.clone()).as_deref(),
+            )
+            .await?
+        }
+        Command::Announce {
+            content,
+            secret_key,
+            relays,
+            pubkey,
+        } => {
+            let secret_key = resolve_secret_key(secret_key.as_deref())?;
+            let relays = configured_relays(relays, &config)?;
+            publish_announcement(
+                &content,
+                &secret_key,
+                &relays,
                 pubkey.or_else(|| config.identity.pubkey.clone()).as_deref(),
             )
             .await?
@@ -2435,6 +2464,33 @@ async fn publish_release(
     client.disconnect().await;
     println!("artifact event: {}", artifact_event.id);
     println!("release event: {}", release_event.id);
+    Ok(())
+}
+
+async fn publish_announcement(
+    content: &str,
+    secret_hex: &str,
+    relays: &[String],
+    user_pubkey: Option<&str>,
+) -> Result<()> {
+    let keys = Keys::parse(secret_hex).context("secret key must be hex or nsec")?;
+    let event = EventBuilder::new(Kind::TextNote, content).finalize(&keys)?;
+    let client = Client::default();
+    for relay in relays {
+        client.add_relay(relay).await?;
+    }
+    connect_with_timeout(&client).await?;
+    add_user_write_relays(&client, user_pubkey).await?;
+    client
+        .send_event(&event)
+        .await
+        .context("publishing Nostr announcement")?;
+    client.disconnect().await;
+    println!("announcement event: {}", event.id);
+    println!(
+        "publisher: {}",
+        display_publisher(&keys.public_key().to_hex())
+    );
     Ok(())
 }
 

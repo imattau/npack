@@ -491,6 +491,16 @@ OS and architecture.
 
 ## Command summary
 
+Publish a signed Nostr text note using the registered key and configured
+write relays:
+
+```bash
+npack announce "npack is now available!"
+```
+
+Use `--secret-key` for a one-off key override, or `--relay` to select relays
+explicitly.
+
 Generate the installed command reference:
 
 ```bash

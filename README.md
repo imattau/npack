@@ -110,6 +110,9 @@ npack publish ./myapp.manifest.json \
   --secret-key <secret-key> \
   --relay wss://relay.example \
   --server https://blossom.example
+
+# Publish a signed Nostr announcement using the registered key
+npack announce "npack is now available!"
 ```
 
 Publisher keys can be supplied as user-facing `npub` values where a public
