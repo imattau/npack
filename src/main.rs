@@ -12,6 +12,7 @@ use std::{
     env::consts::{ARCH, OS},
     fs, io,
     os::unix::fs::PermissionsExt,
+    os::unix::fs::symlink,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -917,7 +918,12 @@ fn install_with_capabilities_at(
         )?;
     }
     let files = if manifest.format == "npk" {
-        extract_npk(&destination, &prefix)?
+        let staging = package_dir.join("payload");
+        if staging.exists() {
+            fs::remove_dir_all(&staging)?;
+        }
+        extract_npk(&destination, &staging)?;
+        install_staged_npk(&staging, &prefix, &npk_entry_paths(&destination)?)?
     } else {
         vec![destination.clone()]
     };
@@ -1044,6 +1050,35 @@ fn npk_entry_paths(archive_path: &Path) -> Result<Vec<PathBuf>> {
         paths.push(relative);
     }
     Ok(paths)
+}
+
+fn install_staged_npk(staging: &Path, prefix: &Path, entries: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut installed = Vec::new();
+    for relative in entries {
+        let source = staging.join(relative);
+        let destination = prefix.join(relative);
+        let metadata = fs::symlink_metadata(&source)?;
+        if metadata.file_type().is_dir() {
+            fs::create_dir_all(&destination)?;
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if destination.exists() || fs::symlink_metadata(&destination).is_ok() {
+            fs::remove_file(&destination)?;
+        }
+        if metadata.file_type().is_symlink() {
+            symlink(fs::read_link(&source)?, &destination)?;
+        } else if metadata.file_type().is_file() {
+            fs::copy(&source, &destination)?;
+            fs::set_permissions(&destination, metadata.permissions())?;
+        } else {
+            bail!("unsupported staged package entry: {}", relative.display());
+        }
+        installed.push(destination);
+    }
+    Ok(installed)
 }
 
 fn ensure_install_paths_available(
