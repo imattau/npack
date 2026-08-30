@@ -47,6 +47,12 @@ enum Command {
         #[arg(long, help = "List packages installed in the user's prefix")]
         user: bool,
     },
+    VerifyInstalled {
+        #[arg(long)]
+        store: Option<PathBuf>,
+        #[arg(long, help = "Verify packages installed in the user's prefix")]
+        user: bool,
+    },
     ReleaseEvent {
         manifest: PathBuf,
         #[arg(long, help = "32-byte hex-encoded Nostr secret key")]
@@ -213,6 +219,9 @@ async fn main() -> Result<()> {
             for package in installed_packages(Some(&install_paths(store.as_deref(), user).0))? {
                 println!("{}/{} {}", package.publisher, package.name, package.version);
             }
+        }
+        Command::VerifyInstalled { store, user } => {
+            verify_installed(store.as_deref(), user)?;
         }
         Command::ReleaseEvent {
             manifest,
@@ -1448,6 +1457,43 @@ fn installed_packages(store: Option<&Path>) -> Result<Vec<InstalledPackage>> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
+fn verify_installed(store: Option<&Path>, user: bool) -> Result<()> {
+    let root = install_paths(store, user).0;
+    let packages = installed_packages(Some(&root))?;
+    for package in &packages {
+        let actual = hash_file(&package.artifact).with_context(|| {
+            format!(
+                "reading artifact for {}/{} {}",
+                package.publisher, package.name, package.version
+            )
+        })?;
+        if actual != package.sha256.to_ascii_lowercase() {
+            bail!(
+                "installed artifact hash mismatch for {}/{} {}",
+                package.publisher,
+                package.name,
+                package.version
+            );
+        }
+        for file in &package.files {
+            if fs::symlink_metadata(file).is_err() {
+                bail!(
+                    "installed file is missing for {}/{} {}: {}",
+                    package.publisher,
+                    package.name,
+                    package.version,
+                    file.display()
+                );
+            }
+        }
+        println!(
+            "verified {}/{} {}",
+            package.publisher, package.name, package.version
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn remove_package(package: &str, store: Option<&Path>) -> Result<()> {
     remove_package_at(package, store, false)
@@ -1559,6 +1605,41 @@ mod tests {
         remove_package("npub1test/hello", Some(&store))?;
         assert!(installed_packages(Some(&store))?.is_empty());
         assert!(!installed.artifact.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn verifies_installed_artifacts_and_files() -> Result<()> {
+        let dir = tempdir()?;
+        let artifact = dir.path().join("hello.bin");
+        fs::write(&artifact, b"hello npack")?;
+        let manifest_path = dir.path().join("hello.json");
+        let manifest = Manifest {
+            publisher: "pub".into(),
+            name: "hello".into(),
+            version: "1.0.0".into(),
+            artifact: "hello.bin".into(),
+            sha256: hash_file(&artifact)?,
+            dependencies: vec![],
+            artifact_event: None,
+            repo: None,
+            commit: None,
+            os: default_os(),
+            arch: default_arch(),
+            format: "opaque".into(),
+            runtime_requires: vec![],
+            provides: vec![],
+            post_install: vec![],
+        };
+        fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+        let store = dir.path().join("store");
+        install(&manifest, &manifest_path, Some(&store))?;
+        verify_installed(Some(&store), false)?;
+        fs::write(
+            store.join("packages/pub/hello/1.0.0/hello.bin"),
+            b"tampered",
+        )?;
+        assert!(verify_installed(Some(&store), false).is_err());
         Ok(())
     }
 
