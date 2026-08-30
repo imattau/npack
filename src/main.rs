@@ -60,6 +60,20 @@ struct IdentityConfig {
     pubkey: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Lockfile {
+    version: u32,
+    packages: Vec<LockedPackage>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct LockedPackage {
+    publisher: String,
+    name: String,
+    version: String,
+    sha256: String,
+}
+
 #[derive(Subcommand)]
 enum Command {
     Hash {
@@ -138,6 +152,8 @@ enum Command {
         trusted_publishers: Vec<String>,
         #[arg(long, help = "Nostr pubkey whose NIP-65 relay list should be used")]
         pubkey: Option<String>,
+        #[arg(long, help = "Write the resolved dependency graph to a lockfile")]
+        lockfile: Option<PathBuf>,
         #[arg(long = "allow-capability")]
         allowed_capabilities: Vec<String>,
     },
@@ -351,6 +367,7 @@ async fn main() -> Result<()> {
             user,
             trusted_publishers,
             pubkey,
+            lockfile,
             allowed_capabilities,
         } => {
             let relays = configured_relays(relays, &config)?;
@@ -369,6 +386,7 @@ async fn main() -> Result<()> {
                 user || config.install.user,
                 &trusted_publishers,
                 pubkey.as_deref(),
+                lockfile.as_deref(),
                 &allowed_capabilities,
             )
             .await?
@@ -501,6 +519,7 @@ async fn install_ref(
     user: bool,
     trusted_publishers: &[String],
     user_pubkey: Option<&str>,
+    lockfile: Option<&Path>,
     allowed_capabilities: &[String],
 ) -> Result<()> {
     let client = Client::default();
@@ -528,7 +547,42 @@ async fn install_ref(
     )
     .await?;
     client.disconnect().await;
+    if let Some(lockfile) = lockfile {
+        write_lockfile(lockfile, &root, &installed)?;
+    }
     println!("install order: {}", installed.join(" -> "));
+    Ok(())
+}
+
+fn write_lockfile(path: &Path, root: &Path, install_order: &[String]) -> Result<()> {
+    let installed = installed_packages(Some(root))?;
+    let mut packages = Vec::new();
+    for key in install_order {
+        let package = installed
+            .iter()
+            .find(|package| {
+                let package_key = format!("{}/{}", package.publisher, package.name);
+                package_key == *key || package.name == *key
+            })
+            .with_context(|| format!("installed package missing from lockfile: {key}"))?;
+        packages.push(LockedPackage {
+            publisher: package.publisher.clone(),
+            name: package.name.clone(),
+            version: package.version.clone(),
+            sha256: package.sha256.clone(),
+        });
+    }
+    let lockfile = Lockfile {
+        version: 1,
+        packages,
+    };
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(&lockfile)?)?;
     Ok(())
 }
 
@@ -1954,6 +2008,11 @@ mod tests {
         let store = dir.path().join("store");
         install(&manifest, &manifest_path, Some(&store))?;
         verify_installed(Some(&store), false)?;
+        let lock_path = dir.path().join("npack.lock.json");
+        write_lockfile(&lock_path, &store, &["pub/hello".into()])?;
+        let lockfile: Lockfile = serde_json::from_slice(&fs::read(lock_path)?)?;
+        assert_eq!(lockfile.version, 1);
+        assert_eq!(lockfile.packages[0].sha256, manifest.sha256);
         fs::write(
             store.join("packages/pub/hello/1.0.0/hello.bin"),
             b"tampered",
