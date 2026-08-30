@@ -358,7 +358,9 @@ async fn main() -> Result<()> {
             let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
             let (publisher, name) = package
                 .split_once('/')
-                .map_or((None, package.as_str()), |(p, n)| (Some(p.to_owned()), n));
+                .map_or((None, package.as_str()), |(p, n)| {
+                    (Some(normalize_publisher_reference(p)), n)
+                });
             install_ref(
                 &name,
                 publisher,
@@ -1209,6 +1211,12 @@ fn configured_publishers(cli_publishers: Vec<String>, config: &Config) -> Result
         .collect()
 }
 
+fn normalize_publisher_reference(publisher: &str) -> String {
+    PublicKey::parse(publisher)
+        .map(|key| key.to_hex())
+        .unwrap_or_else(|_| publisher.to_owned())
+}
+
 fn default_system_store() -> PathBuf {
     PathBuf::from("/var/lib/npack")
 }
@@ -1811,6 +1819,7 @@ fn remove_package_at(package: &str, store: Option<&Path>, user: bool) -> Result<
     let (publisher, name) = package
         .split_once('/')
         .context("package reference must be publisher/name")?;
+    let publisher = normalize_publisher_reference(publisher);
     if publisher.is_empty() || name.is_empty() || publisher.contains('/') || name.contains('/') {
         bail!("package reference must be publisher/name");
     }
@@ -2206,8 +2215,12 @@ mod tests {
             PublicKey::parse(&keys.public_key().to_hex())?,
             keys.public_key()
         );
-        let publishers = configured_publishers(vec![npub], &Config::default())?;
+        let publishers = configured_publishers(vec![npub.clone()], &Config::default())?;
         assert_eq!(publishers, vec![keys.public_key().to_hex()]);
+        assert_eq!(
+            normalize_publisher_reference(&npub),
+            keys.public_key().to_hex()
+        );
         Ok(())
     }
 
