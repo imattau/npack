@@ -238,6 +238,8 @@ Search configured relays:
 
 ```bash
 npack search myapp --relay wss://relay.example
+npack search myapp --refresh   # ignore the five-minute cache
+npack search myapp --no-cache  # do not read or write the cache
 ```
 
 Install a publisher-qualified package:
@@ -262,6 +264,13 @@ older command name. The remote installation process is:
 
 Relays and storage servers are transport. They do not become package
 authorities merely because they served an event or file.
+
+Search displays progress on stderr while querying relays. Successful search
+results are cached locally for five minutes. The cache key includes the query,
+relay set, trusted-publisher filter, and NIP-65 identity, keeping results from
+different trust configurations separate. Results are then reduced to the
+newest valid SemVer release for each publisher/package pair, while retaining
+all platform artifacts belonging to that release.
 
 ## Configuration
 

@@ -11,11 +11,11 @@ use std::{
     collections::{HashMap, HashSet},
     env::consts::{ARCH, OS},
     fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     os::unix::fs::PermissionsExt,
     os::unix::fs::symlink,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 const RELEASE_KIND: u16 = 9900;
@@ -204,6 +204,10 @@ enum Command {
         trusted_publishers: Vec<String>,
         #[arg(long, help = "Nostr pubkey whose NIP-65 relay list should be used")]
         pubkey: Option<String>,
+        #[arg(long, help = "Ignore cached results and query relays now")]
+        refresh: bool,
+        #[arg(long, help = "Do not read or write the local search cache")]
+        no_cache: bool,
     },
     Fetch {
         sha256: String,
@@ -547,11 +551,21 @@ async fn main() -> Result<()> {
             relays,
             trusted_publishers,
             pubkey,
+            refresh,
+            no_cache,
         } => {
             let relays = configured_relays(relays, &config)?;
             let trusted_publishers = configured_publishers(trusted_publishers, &config)?;
             let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
-            search_releases(&query, &relays, &trusted_publishers, pubkey.as_deref()).await?
+            search_releases(
+                &query,
+                &relays,
+                &trusted_publishers,
+                pubkey.as_deref(),
+                refresh,
+                no_cache,
+            )
+            .await?
         }
         Command::Fetch {
             sha256,
@@ -1872,39 +1886,124 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
     })
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct SearchCache {
+    created_at: u64,
+    releases: Vec<Event>,
+    revocations: Vec<Event>,
+}
+
+fn revocation_pairs(events: &[Event]) -> Vec<(String, String)> {
+    events
+        .iter()
+        .filter_map(|event| {
+            tag_value(event, "e").map(|release| (event.pubkey.to_hex(), release.to_owned()))
+        })
+        .collect()
+}
+
+fn search_cache_path(
+    query: &str,
+    relays: &[String],
+    trusted_publishers: &[String],
+    user_pubkey: Option<&str>,
+) -> PathBuf {
+    let key =
+        serde_json::to_vec(&(query, relays, trusted_publishers, user_pubkey)).unwrap_or_default();
+    let digest = Sha256::digest(key);
+    default_store()
+        .join("search-cache")
+        .join(format!("{}.json", hex::encode(digest)))
+}
+
+fn load_search_cache(path: &Path, max_age: u64) -> Result<Option<SearchCache>> {
+    let cache: SearchCache = match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing search cache {}", path.display()))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    if now.saturating_sub(cache.created_at) > max_age {
+        return Ok(None);
+    }
+    Ok(Some(cache))
+}
+
+fn save_search_cache(path: &Path, cache: &SearchCache) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec(cache)?)?;
+    Ok(())
+}
+
 async fn search_releases(
     query: &str,
     relays: &[String],
     trusted_publishers: &[String],
     user_pubkey: Option<&str>,
+    refresh: bool,
+    no_cache: bool,
 ) -> Result<()> {
-    let client = Client::default();
-    for relay in relays {
-        client
-            .add_relay(relay)
+    const SEARCH_CACHE_MAX_AGE_SECS: u64 = 300;
+    let cache_path = search_cache_path(query, relays, trusted_publishers, user_pubkey);
+    let cached = if !refresh && !no_cache {
+        load_search_cache(&cache_path, SEARCH_CACHE_MAX_AGE_SECS).unwrap_or(None)
+    } else {
+        None
+    };
+    let (events, revoked) = if let Some(cache) = cached {
+        let age = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|now| now.as_secs().saturating_sub(cache.created_at))
+            .unwrap_or_default();
+        eprintln!("Using cached search results ({age}s old)");
+        let revoked = revocation_pairs(&cache.revocations);
+        (cache.releases, revoked)
+    } else {
+        eprint!("Searching {} Nostr relay(s)...", relays.len());
+        io::stderr().flush()?;
+        let started = Instant::now();
+        let client = Client::default();
+        for relay in relays {
+            client
+                .add_relay(relay)
+                .await
+                .with_context(|| format!("adding relay {relay}"))?;
+        }
+        connect_with_timeout(&client).await?;
+        add_user_relays(&client, user_pubkey).await?;
+        let filter = Filter::new().kind(Kind::Custom(RELEASE_KIND)).limit(500);
+        let events = client
+            .fetch_events(filter)
+            .timeout(std::time::Duration::from_secs(10))
             .await
-            .with_context(|| format!("adding relay {relay}"))?;
-    }
-    connect_with_timeout(&client).await?;
-    add_user_relays(&client, user_pubkey).await?;
-    let filter = Filter::new().kind(Kind::Custom(RELEASE_KIND)).limit(500);
-    let events = client
-        .fetch_events(filter)
-        .timeout(std::time::Duration::from_secs(10))
-        .await
-        .context("querying Nostr relays")?;
-    let revoked = client
-        .fetch_events(Filter::new().kind(Kind::Custom(REVOCATION_KIND)).limit(500))
-        .timeout(std::time::Duration::from_secs(10))
-        .await?
-        .into_iter()
-        .filter(|event| event.verify().is_ok())
-        .filter(revocation_event_is_v1)
-        .filter_map(|event| {
-            tag_value(&event, "e").map(|release| (event.pubkey.to_hex(), release.to_owned()))
-        })
-        .collect::<Vec<_>>();
+            .context("querying Nostr relays")?;
+        let revocation_events = client
+            .fetch_events(Filter::new().kind(Kind::Custom(REVOCATION_KIND)).limit(500))
+            .timeout(std::time::Duration::from_secs(10))
+            .await?
+            .into_iter()
+            .filter(|event| event.verify().is_ok())
+            .filter(revocation_event_is_v1)
+            .collect::<Vec<_>>();
+        let revoked = revocation_pairs(&revocation_events);
+        if !no_cache {
+            let cache = SearchCache {
+                created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+                releases: events.iter().cloned().collect(),
+                revocations: revocation_events,
+            };
+            let _ = save_search_cache(&cache_path, &cache);
+        }
+        eprintln!(" done in {:.1}s", started.elapsed().as_secs_f32());
+        client.disconnect().await;
+        (events.into_iter().collect(), revoked)
+    };
     let query = query.to_ascii_lowercase();
+    let mut latest_versions = HashMap::<(String, String), Version>::new();
+    let mut matches = Vec::new();
     for event in events {
         if !trusted_publishers.is_empty()
             && !trusted_publishers
@@ -1918,14 +2017,42 @@ async fn search_releases(
         }) {
             continue;
         }
-        let matches = event.tags.iter().any(|tag| {
+        let name_matches = event.tags.iter().any(|tag| {
             tag.kind() == "name"
                 && tag
                     .content()
                     .map(|name| name.to_ascii_lowercase().contains(&query))
                     .unwrap_or(false)
         });
-        if matches && event.verify().is_ok() && release_event_is_v1(&event) {
+        if !name_matches || event.verify().is_err() || !release_event_is_v1(&event) {
+            continue;
+        }
+        let Some(name) = tag_value(&event, "name") else {
+            continue;
+        };
+        let Some(version_text) = tag_value(&event, "version") else {
+            continue;
+        };
+        let Ok(version) = Version::parse(version_text) else {
+            continue;
+        };
+        let key = (event.pubkey.to_hex(), name.to_owned());
+        if latest_versions
+            .get(&key)
+            .is_none_or(|latest| &version >= latest)
+        {
+            latest_versions.insert(key, version);
+        }
+        matches.push(event);
+    }
+    for event in matches {
+        let name = tag_value(&event, "name").unwrap_or_default();
+        let version = tag_value(&event, "version").unwrap_or_default();
+        let key = (event.pubkey.to_hex(), name.to_owned());
+        if latest_versions
+            .get(&key)
+            .is_some_and(|latest| latest == &Version::parse(version).unwrap())
+        {
             println!(
                 "{} {} {}",
                 event.id,
@@ -1934,7 +2061,6 @@ async fn search_releases(
             );
         }
     }
-    client.disconnect().await;
     Ok(())
 }
 

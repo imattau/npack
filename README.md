@@ -91,6 +91,7 @@ npack revoke-event ./release.json --secret-key <secret-key> \
 
 # Discover and install from Nostr
 npack search myapp --relay wss://relay.example
+npack search myapp --refresh   # bypass the local search cache
 npack install <publisher>/myapp --relay wss://relay.example --user
 npack update <publisher>/myapp --relay wss://relay.example --user
 
@@ -130,6 +131,12 @@ When an identity is configured, `npack` reads the user's NIP-65 relay list
 and adds read-capable relays to discovery. For artifact retrieval it also
 checks the publisher's Blossom `kind:10063` server list before configured
 fallback servers.
+
+Search results are cached locally for five minutes. Use `--refresh` to query
+relays immediately, or `--no-cache` to disable both reading and writing the
+cache. Search returns only the newest valid SemVer release for each publisher
+and package; platform-specific artifacts at that version are retained.
+Progress is written to stderr so search results remain clean on stdout.
 
 ## Security model
 
