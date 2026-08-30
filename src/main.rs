@@ -842,7 +842,12 @@ fn install_with_capabilities(
     } else {
         vec![destination.clone()]
     };
-    run_post_install(&manifest.post_install, &package_dir, allowed_capabilities)?;
+    let mut files = files;
+    files.extend(run_post_install(
+        &manifest.post_install,
+        &package_dir,
+        allowed_capabilities,
+    )?);
     let installed = InstalledPackage {
         publisher: manifest.publisher.clone(),
         name: manifest.name.clone(),
@@ -873,7 +878,8 @@ fn run_post_install(
     actions: &[PostInstallAction],
     package_dir: &Path,
     allowed_capabilities: &[String],
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
+    let mut created = Vec::new();
     for action in actions {
         let capability = if action.action == "create-directory" {
             "filesystem:package-store"
@@ -910,11 +916,12 @@ fn run_post_install(
                     .join(source.file_name().context("service path has no filename")?);
                 fs::create_dir_all(destination.parent().unwrap())?;
                 fs::copy(source, &destination)?;
+                created.push(destination);
             }
             _ => bail!("unsupported post-install action: {}", action.action),
         }
     }
-    Ok(())
+    Ok(created)
 }
 
 fn extract_npk(archive_path: &Path, destination: &Path) -> Result<Vec<PathBuf>> {
@@ -1074,6 +1081,16 @@ fn remove_package(package: &str, store: Option<&Path>) -> Result<()> {
     let mut removed = 0;
     for installed in packages {
         if installed.publisher == publisher && installed.name == name {
+            for file in &installed.files {
+                if file.is_file()
+                    || fs::symlink_metadata(file)
+                        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    if file.exists() || fs::symlink_metadata(file).is_ok() {
+                        fs::remove_file(file)?;
+                    }
+                }
+            }
             let package_dir = root
                 .join("packages")
                 .join(&installed.publisher)
@@ -1135,6 +1152,38 @@ mod tests {
         remove_package("npub1test/hello", Some(&store))?;
         assert!(installed_packages(Some(&store))?.is_empty());
         assert!(!installed.artifact.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn removes_files_created_outside_the_package_directory() -> Result<()> {
+        let dir = tempdir()?;
+        let store = dir.path().join("store");
+        let package_dir = store.join("packages/pub/service/1.0.0");
+        fs::create_dir_all(&package_dir)?;
+        let service = dir.path().join("hello.service");
+        fs::write(&service, b"[Unit]\nDescription=hello\n")?;
+        let installed = InstalledPackage {
+            publisher: "pub".into(),
+            name: "service".into(),
+            version: "1.0.0".into(),
+            sha256: "00".repeat(32),
+            artifact: package_dir.join("service.npk"),
+            dependencies: vec![],
+            files: vec![service.clone()],
+            runtime_requires: vec![],
+            provides: vec![],
+        };
+        fs::create_dir_all(&store)?;
+        fs::write(
+            store.join("installed.json"),
+            serde_json::to_vec(&[installed])?,
+        )?;
+
+        remove_package("pub/service", Some(&store))?;
+
+        assert!(!service.exists());
+        assert!(!package_dir.exists());
         Ok(())
     }
 
