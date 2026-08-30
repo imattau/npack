@@ -68,13 +68,13 @@ struct IdentityConfig {
     pubkey: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Lockfile {
     version: u32,
     packages: Vec<LockedPackage>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct LockedPackage {
     publisher: String,
     name: String,
@@ -662,6 +662,7 @@ async fn install_ref(
     .await?;
     client.disconnect().await;
     if let Some(lockfile) = locked_packages {
+        verify_locked_order(lockfile, &installed)?;
         verify_locked_install(lockfile, &root)?;
     }
     if let Some(lockfile) = lockfile {
@@ -733,12 +734,118 @@ fn load_lockfile(path: &Path) -> Result<Lockfile> {
                 package.name
             );
         }
+        for dependency in package
+            .dependencies
+            .iter_mut()
+            .chain(package.conflicts.iter_mut())
+        {
+            if let Some(publisher) = &mut dependency.publisher {
+                *publisher = normalize_publisher_reference(publisher);
+                PublicKey::parse(publisher).with_context(|| {
+                    format!("invalid lockfile dependency publisher: {publisher}")
+                })?;
+            }
+            VersionReq::parse(&dependency.requirement)
+                .with_context(|| format!("invalid lockfile requirement for {}", dependency.name))?;
+        }
     }
+    validate_lockfile_graph(&lockfile)?;
     Ok(lockfile)
+}
+
+fn validate_lockfile_graph(lockfile: &Lockfile) -> Result<()> {
+    for package in &lockfile.packages {
+        for dependency in &package.dependencies {
+            let matches = lockfile.packages.iter().filter(|candidate| {
+                candidate.name == dependency.name
+                    && dependency
+                        .publisher
+                        .as_deref()
+                        .map_or(true, |publisher| candidate.publisher == publisher)
+            });
+            let candidates = matches.collect::<Vec<_>>();
+            let candidate = match candidates.as_slice() {
+                [candidate] => candidate,
+                [] => bail!(
+                    "lockfile dependency is missing: {}/{} depends on {}",
+                    package.publisher,
+                    package.name,
+                    dependency.name
+                ),
+                _ => bail!(
+                    "lockfile dependency is ambiguous: {}/{} depends on {}",
+                    package.publisher,
+                    package.name,
+                    dependency.name
+                ),
+            };
+            let requirement = VersionReq::parse(&dependency.requirement)?;
+            let version = Version::parse(&candidate.version)?;
+            if !requirement.matches(&version) {
+                bail!(
+                    "lockfile dependency does not satisfy requirement: {}/{} requires {} {}, locked {}",
+                    package.publisher,
+                    package.name,
+                    dependency.name,
+                    dependency.requirement,
+                    candidate.version
+                );
+            }
+        }
+        for conflict in &package.conflicts {
+            let matches = lockfile.packages.iter().any(|candidate| {
+                candidate.name == conflict.name
+                    && conflict
+                        .publisher
+                        .as_deref()
+                        .map_or(true, |publisher| candidate.publisher == publisher)
+                    && VersionReq::parse(&conflict.requirement)
+                        .ok()
+                        .and_then(|requirement| {
+                            Version::parse(&candidate.version)
+                                .ok()
+                                .map(|version| requirement.matches(&version))
+                        })
+                        .unwrap_or(false)
+            });
+            if matches {
+                bail!(
+                    "lockfile conflict is present: {}/{} conflicts with {}",
+                    package.publisher,
+                    package.name,
+                    conflict.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_locked_order(lockfile: &Lockfile, installed: &[String]) -> Result<()> {
+    let expected = lockfile
+        .packages
+        .iter()
+        .map(|package| format!("{}/{}", package.publisher, package.name))
+        .collect::<Vec<_>>();
+    if expected != installed {
+        bail!(
+            "locked install order differs: expected {}, got {}",
+            expected.join(" -> "),
+            installed.join(" -> ")
+        );
+    }
+    Ok(())
 }
 
 fn verify_locked_install(lockfile: &Lockfile, root: &Path) -> Result<()> {
     let installed = installed_packages(Some(root))?;
+    if installed.len() != lockfile.packages.len() {
+        bail!(
+            "locked install contains {} packages, expected {}",
+            installed.len(),
+            lockfile.packages.len()
+        );
+    }
     for locked in &lockfile.packages {
         let found = installed.iter().any(|package| {
             package.publisher == locked.publisher
@@ -799,14 +906,25 @@ fn install_remote_package<'a>(
         {
             bail!("publisher is not in the trusted publisher list");
         }
-        let locked_package = locked_packages.and_then(|lockfile| {
-            lockfile.packages.iter().find(|package| {
-                package.name == name
-                    && publisher
-                        .as_deref()
-                        .map_or(true, |publisher| package.publisher == publisher)
-            })
-        });
+        let locked_package = if let Some(lockfile) = locked_packages {
+            let matches = lockfile
+                .packages
+                .iter()
+                .filter(|package| {
+                    package.name == name
+                        && publisher
+                            .as_deref()
+                            .map_or(true, |publisher| package.publisher == publisher)
+                })
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [package] => Some(*package),
+                [] => None,
+                _ => bail!("package {install_key} is ambiguous in the lockfile"),
+            }
+        } else {
+            None
+        };
         if locked_packages.is_some() && locked_package.is_none() {
             bail!("package {install_key} is not present in the lockfile");
         }
@@ -2733,6 +2851,42 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("service-manager"));
+        Ok(())
+    }
+
+    #[test]
+    fn lockfile_validates_dependency_graph_and_conflicts() -> Result<()> {
+        let publisher = "11".repeat(32);
+        let lockfile = Lockfile {
+            version: 1,
+            packages: vec![
+                LockedPackage {
+                    publisher: publisher.clone(),
+                    name: "libfoo".into(),
+                    version: "2.1.0".into(),
+                    sha256: "aa".repeat(32),
+                    dependencies: vec![],
+                    conflicts: vec![],
+                },
+                LockedPackage {
+                    publisher: "22".repeat(32),
+                    name: "app".into(),
+                    version: "1.0.0".into(),
+                    sha256: "bb".repeat(32),
+                    dependencies: vec![Dependency {
+                        publisher: Some(publisher.clone()),
+                        name: "libfoo".into(),
+                        requirement: ">=2.0.0".into(),
+                    }],
+                    conflicts: vec![],
+                },
+            ],
+        };
+        validate_lockfile_graph(&lockfile)?;
+
+        let mut invalid = lockfile.clone();
+        invalid.packages[1].dependencies[0].requirement = ">=3.0.0".into();
+        assert!(validate_lockfile_graph(&invalid).is_err());
         Ok(())
     }
 }
