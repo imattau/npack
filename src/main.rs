@@ -72,6 +72,7 @@ struct LockedPackage {
     name: String,
     version: String,
     sha256: String,
+    dependencies: Vec<Dependency>,
 }
 
 #[derive(Subcommand)]
@@ -588,6 +589,7 @@ fn write_lockfile(path: &Path, root: &Path, install_order: &[String]) -> Result<
             name: package.name.clone(),
             version: package.version.clone(),
             sha256: package.sha256.clone(),
+            dependencies: package.dependencies.clone(),
         });
     }
     let lockfile = Lockfile {
@@ -644,6 +646,7 @@ fn verify_locked_install(lockfile: &Lockfile, root: &Path) -> Result<()> {
                 && package.name == locked.name
                 && package.version == locked.version
                 && package.sha256 == locked.sha256
+                && package.dependencies == locked.dependencies
         });
         if !found {
             bail!(
