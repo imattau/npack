@@ -29,9 +29,11 @@ Example manifest:
       "version": "0.1.0",
       "artifact": "hello.tar.gz",
       "sha256": "<64 lowercase hexadecimal characters>",
-      "dependencies": []
+      "dependencies": [],
+      "runtime_requires": ["libc.so.6"],
+      "provides": []
     }
 
-The canonical transport artifact is .npk: a tar archive compressed with zstd. The manifest is deliberately format-neutral. The release-event command uses the official Rust Nostr library for event IDs, tags, key handling, and Schnorr signatures while preserving this local package lifecycle.
+The canonical transport artifact is .npk: a tar archive compressed with zstd. The manifest is deliberately format-neutral. runtime_requires records discovered runtime capabilities such as ELF DT_NEEDED libraries, while provides records capabilities supplied by a package. The release-event command uses the official Rust Nostr library for event IDs, tags, key handling, and Schnorr signatures while preserving this local package lifecycle.
 
 The release-event command emits a signed, provisional kind:9900 Nostr package-release event. The verify-event command validates the event signature and checks it against the package manifest. The search command queries configured relays and displays only cryptographically valid release events. The fetch command retrieves a hash-addressed blob through nostr-blossom and verifies its SHA-256 before writing it. The pack command creates .npk archives, and installation safely extracts them into the npack-managed store. The inspect command reads ELF dependency metadata without executing the artifact. The install-ref command connects these pieces for a verified remote release, recursively installing dependencies before dependents and printing the resulting install order. The remove command deletes all installed versions for a publisher-qualified package reference. Publisher-qualified references constrain selection to a specific event author.

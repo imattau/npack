@@ -34,3 +34,4 @@ npack is an independent package manager whose registry metadata will be publishe
 - Provisional release events use kind 9900 and Nostr Schnorr signatures over the canonical event array.
 - The canonical artifact format is .npk, a tar archive compressed with zstd; Nostr event metadata remains authoritative.
 - ELF inspection is metadata-only; never execute an untrusted artifact to discover dependencies.
+- ELF DT_NEEDED entries must be declared in runtime_requires when verifying an ELF artifact; symbol-version and capability resolution are future work.

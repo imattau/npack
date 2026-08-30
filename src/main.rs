@@ -105,6 +105,10 @@ struct Manifest {
     arch: String,
     #[serde(default = "default_format")]
     format: String,
+    #[serde(default)]
+    runtime_requires: Vec<String>,
+    #[serde(default)]
+    provides: Vec<String>,
 }
 
 fn default_os() -> String {
@@ -500,6 +504,20 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
             })
         })
         .collect();
+    let runtime_requires = event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind() == "requires")
+        .filter_map(Tag::content)
+        .map(str::to_owned)
+        .collect();
+    let provides = event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind() == "provides")
+        .filter_map(Tag::content)
+        .map(str::to_owned)
+        .collect();
     Ok(Manifest {
         publisher: event.pubkey.to_hex(),
         name: tag_value(event, "name")
@@ -520,6 +538,8 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
         os: tag_value(event, "os").unwrap_or("any").into(),
         arch: tag_value(event, "arch").unwrap_or("any").into(),
         format: tag_value(event, "format").unwrap_or("opaque").into(),
+        runtime_requires,
+        provides,
     })
 }
 
@@ -615,6 +635,12 @@ fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) ->
         tag.push(dependency.requirement.clone());
         tags.push(tag);
     }
+    for requirement in &manifest.runtime_requires {
+        tags.push(vec!["requires".into(), requirement.clone()]);
+    }
+    for provided in &manifest.provides {
+        tags.push(vec!["provides".into(), provided.clone()]);
+    }
     let content = format!(
         "npack release {}/{} {}",
         manifest.publisher, manifest.name, manifest.version
@@ -674,7 +700,34 @@ fn verify_manifest(manifest: &Manifest, manifest_path: &Path) -> Result<()> {
             actual
         );
     }
+    if let Some(required) = elf_libraries(&artifact)? {
+        for library in required {
+            if !manifest
+                .runtime_requires
+                .iter()
+                .any(|declared| declared == &library)
+            {
+                bail!("ELF dependency {library} is not declared in runtime_requires");
+            }
+        }
+    }
     Ok(())
+}
+
+fn elf_libraries(path: &Path) -> Result<Option<Vec<String>>> {
+    let bytes = fs::read(path)?;
+    if !bytes.starts_with(b"\x7fELF") {
+        return Ok(None);
+    }
+    match Object::parse(&bytes).context("parsing executable")? {
+        Object::Elf(elf) => Ok(Some(
+            elf.libraries
+                .iter()
+                .map(|library| (*library).into())
+                .collect(),
+        )),
+        _ => Ok(None),
+    }
 }
 
 fn default_store() -> PathBuf {
@@ -888,6 +941,8 @@ mod tests {
             os: default_os(),
             arch: default_arch(),
             format: "opaque".into(),
+            runtime_requires: vec![],
+            provides: vec![],
         };
         fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
         verify_manifest(&manifest, &manifest_path)?;
@@ -919,6 +974,8 @@ mod tests {
             os: default_os(),
             arch: default_arch(),
             format: "opaque".into(),
+            runtime_requires: vec![],
+            provides: vec![],
         };
         fs::write(&artifact, b"tampered")?;
         assert!(verify_manifest(&manifest, &dir.path().join("manifest.json")).is_err());
@@ -944,6 +1001,8 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             format: "tar.zst".into(),
+            runtime_requires: vec![],
+            provides: vec![],
         };
         let event = sign_release_event(&manifest, &"11".repeat(32), 1_700_000_000)?;
         assert_eq!(event.kind.as_u16(), 9900);
@@ -980,6 +1039,8 @@ mod tests {
             os: default_os(),
             arch: default_arch(),
             format: default_format(),
+            runtime_requires: vec![],
+            provides: vec![],
         };
         fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
         let error =
