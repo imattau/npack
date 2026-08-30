@@ -2693,6 +2693,7 @@ fn ensure_install_paths_available(
 }
 
 fn extract_npk(archive_path: &Path, destination: &Path) -> Result<Vec<PathBuf>> {
+    fs::create_dir_all(destination)?;
     let file = fs::File::open(archive_path)?;
     let decoder = zstd::Decoder::new(file)?;
     let mut archive = tar::Archive::new(decoder);
@@ -2846,7 +2847,7 @@ fn system_capabilities() -> HashSet<String> {
         if let Ok(entries) = fs::read_dir(directory) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with("lib") && name.contains(".so") {
+                if (name.starts_with("lib") || name.starts_with("ld-")) && name.contains(".so") {
                     capabilities.insert(name);
                 }
             }
@@ -3613,7 +3614,6 @@ mod tests {
         pack_npk(&source, &archive_again)?;
         assert_eq!(hash_file(&archive)?, hash_file(&archive_again)?);
         let destination = dir.path().join("extracted");
-        fs::create_dir_all(&destination)?;
         let files = extract_npk(&archive, &destination)?;
         assert_eq!(files.len(), 2);
         assert_eq!(fs::read(destination.join("bin/hello"))?, b"hello");
