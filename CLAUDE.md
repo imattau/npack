@@ -22,6 +22,7 @@ npack is an independent package manager whose registry metadata will be publishe
     npack fetch <sha256> --server <blossom-url> --output <path>
     npack install-ref [<publisher-hex>/]<name> --relay <relay-url> [--store <path>]
     npack pack <source-directory> --output <package.npk>
+    npack remove <publisher-hex>/<name> [--store <path>]
 
 ## Conventions
 

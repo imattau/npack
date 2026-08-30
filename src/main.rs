@@ -72,6 +72,11 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    Remove {
+        package: String,
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -204,6 +209,7 @@ async fn main() -> Result<()> {
             install_ref(&name, publisher, &relays, store.as_deref()).await?
         }
         Command::Pack { source, output } => pack_npk(&source, &output)?,
+        Command::Remove { package, store } => remove_package(&package, store.as_deref())?,
     }
     Ok(())
 }
@@ -599,6 +605,15 @@ fn load_manifest(path: &Path) -> Result<Manifest> {
     if manifest.publisher.is_empty() || manifest.name.is_empty() || manifest.version.is_empty() {
         bail!("manifest publisher, name, and version must not be empty");
     }
+    for (label, value) in [
+        ("publisher", &manifest.publisher),
+        ("name", &manifest.name),
+        ("version", &manifest.version),
+    ] {
+        if value.contains('/') || value.contains('\\') || value == "." || value == ".." {
+            bail!("manifest {label} must be a single safe path component");
+        }
+    }
     if manifest.sha256.len() != 64 || !manifest.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
         bail!("manifest sha256 must be 64 hexadecimal characters");
     }
@@ -764,6 +779,43 @@ fn installed_packages(store: Option<&Path>) -> Result<Vec<InstalledPackage>> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
+fn remove_package(package: &str, store: Option<&Path>) -> Result<()> {
+    let (publisher, name) = package
+        .split_once('/')
+        .context("package reference must be publisher/name")?;
+    if publisher.is_empty() || name.is_empty() || publisher.contains('/') || name.contains('/') {
+        bail!("package reference must be publisher/name");
+    }
+    let root = store.map(Path::to_path_buf).unwrap_or_else(default_store);
+    let packages = installed_packages(Some(&root))?;
+    let mut remaining = Vec::new();
+    let mut removed = 0;
+    for installed in packages {
+        if installed.publisher == publisher && installed.name == name {
+            let package_dir = root
+                .join("packages")
+                .join(&installed.publisher)
+                .join(&installed.name)
+                .join(&installed.version);
+            if package_dir.exists() {
+                fs::remove_dir_all(&package_dir)?;
+            }
+            removed += 1;
+        } else {
+            remaining.push(installed);
+        }
+    }
+    if removed == 0 {
+        bail!("package {package} is not installed");
+    }
+    fs::write(
+        root.join("installed.json"),
+        serde_json::to_vec_pretty(&remaining)?,
+    )?;
+    println!("removed {package} ({removed} version(s))");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,6 +847,9 @@ mod tests {
         let installed = install(&manifest, &manifest_path, Some(&store))?;
         assert_eq!(installed_packages(Some(&store))?.len(), 1);
         assert!(installed.artifact.exists());
+        remove_package("npub1test/hello", Some(&store))?;
+        assert!(installed_packages(Some(&store))?.is_empty());
+        assert!(!installed.artifact.exists());
         Ok(())
     }
 
