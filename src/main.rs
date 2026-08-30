@@ -7,6 +7,7 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs, io,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -708,6 +709,7 @@ fn extract_npk(archive_path: &Path, destination: &Path) -> Result<Vec<PathBuf>> 
     let decoder = zstd::Decoder::new(file)?;
     let mut archive = tar::Archive::new(decoder);
     let mut files = Vec::new();
+    let mut seen = HashSet::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
         let relative = entry.path()?.into_owned();
@@ -717,6 +719,9 @@ fn extract_npk(archive_path: &Path, destination: &Path) -> Result<Vec<PathBuf>> 
                 .any(|component| matches!(component, std::path::Component::ParentDir))
         {
             bail!("unsafe path in .npk archive: {}", relative.display());
+        }
+        if !seen.insert(relative.clone()) {
+            bail!("duplicate path in .npk archive: {}", relative.display());
         }
         if entry.header().entry_type().is_symlink() {
             let target = entry.link_name()?.context("symlink entry has no target")?;
@@ -788,6 +793,19 @@ fn remove_package(package: &str, store: Option<&Path>) -> Result<()> {
     }
     let root = store.map(Path::to_path_buf).unwrap_or_else(default_store);
     let packages = installed_packages(Some(&root))?;
+    if packages.iter().any(|installed| {
+        installed.dependencies.iter().any(|dependency| {
+            dependency.name == name
+                && dependency
+                    .publisher
+                    .as_deref()
+                    .map_or(true, |dependency_publisher| {
+                        dependency_publisher == publisher
+                    })
+        })
+    }) {
+        bail!("cannot remove {package}: it is required by an installed package");
+    }
     let mut remaining = Vec::new();
     let mut removed = 0;
     for installed in packages {
@@ -956,6 +974,48 @@ mod tests {
         let files = extract_npk(&archive, &destination)?;
         assert_eq!(files.len(), 2);
         assert_eq!(fs::read(destination.join("bin/hello"))?, b"hello");
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_removing_required_dependency() -> Result<()> {
+        let dir = tempdir()?;
+        let store = dir.path().join("store");
+        fs::create_dir_all(&store)?;
+        let installed = vec![
+            InstalledPackage {
+                publisher: "pub".into(),
+                name: "libfoo".into(),
+                version: "2.0.0".into(),
+                sha256: "00".repeat(32),
+                artifact: store.join("libfoo"),
+                dependencies: vec![],
+                files: vec![],
+            },
+            InstalledPackage {
+                publisher: "app-pub".into(),
+                name: "app".into(),
+                version: "1.0.0".into(),
+                sha256: "11".repeat(32),
+                artifact: store.join("app"),
+                dependencies: vec![Dependency {
+                    publisher: Some("pub".into()),
+                    name: "libfoo".into(),
+                    requirement: ">=2.0.0".into(),
+                }],
+                files: vec![],
+            },
+        ];
+        fs::write(
+            store.join("installed.json"),
+            serde_json::to_vec(&installed)?,
+        )?;
+        let error = remove_package("pub/libfoo", Some(&store)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("required by an installed package")
+        );
         Ok(())
     }
 }
