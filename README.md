@@ -36,6 +36,7 @@ are transport; clients verify the event signatures and artifact hash locally.
 
 See:
 
+- [Using npack](docs/using-npack.md)
 - [Package protocol v1](docs/package-protocol-v1.md)
 - [Event fixtures](docs/package-event-fixtures.md)
 - [Release-key notes](docs/release-key-model.md)
