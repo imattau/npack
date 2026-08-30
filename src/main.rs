@@ -546,18 +546,38 @@ fn install_remote_package<'a>(
         if tag_value(&artifact_event, "x") != Some(sha256) {
             bail!("release and artifact event hashes do not match");
         }
-        let url = tag_value(&artifact_event, "url").context("artifact event has no URL")?;
-        let mut server_url = Url::parse(url)?;
-        server_url.set_path("/");
-        server_url.set_query(None);
-        server_url.set_fragment(None);
         let expected: Sha256Hash = sha256.parse()?;
-        let bytes = BlossomClient::new(server_url)
-            .get_blob::<Keys>(expected, None, None, None)
-            .await?;
-        if Sha256Hash::hash(&bytes) != expected {
-            bail!("downloaded artifact hash does not match release");
+        let urls = artifact_event
+            .tags
+            .iter()
+            .filter(|tag| tag.kind() == "url")
+            .filter_map(Tag::content)
+            .collect::<Vec<_>>();
+        if urls.is_empty() {
+            bail!("artifact event has no URL");
         }
+        let mut bytes = None;
+        for url in urls {
+            let mut server_url = match Url::parse(url) {
+                Ok(url) => url,
+                Err(_) => continue,
+            };
+            server_url.set_path("/");
+            server_url.set_query(None);
+            server_url.set_fragment(None);
+            let candidate = match BlossomClient::new(server_url)
+                .get_blob::<Keys>(expected, None, None, None)
+                .await
+            {
+                Ok(candidate) => candidate,
+                Err(_) => continue,
+            };
+            if Sha256Hash::hash(&candidate) == expected {
+                bytes = Some(candidate);
+                break;
+            }
+        }
+        let bytes = bytes.context("no artifact mirror returned the expected SHA-256")?;
         let staging = root.join("downloads").join(sha256);
         fs::create_dir_all(&staging)?;
         let artifact_path = staging.join("artifact");
