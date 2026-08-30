@@ -20,6 +20,7 @@ System installation is the default and uses `/` as the payload prefix with packa
     cargo run -- verify-event ./release.json ./hello.npack.json
     cargo run -- revoke-event ./release.json --secret-key <32-byte-hex-key> --reason "security issue"
     cargo run -- search hello --relay wss://relay.example
+    cargo run -- search hello --relay wss://relay.example --trusted-publisher <publisher-hex>
     cargo run -- fetch <sha256> --server https://blossom.example --output ./artifact
     cargo run -- install-ref <publisher-hex>/hello --relay wss://relay.example --user
     cargo run -- update <publisher-hex>/hello --relay wss://relay.example --user

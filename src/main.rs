@@ -77,6 +77,8 @@ enum Command {
         query: String,
         #[arg(long = "relay", required = true)]
         relays: Vec<String>,
+        #[arg(long = "trusted-publisher")]
+        trusted_publishers: Vec<String>,
     },
     Fetch {
         sha256: String,
@@ -284,7 +286,11 @@ async fn main() -> Result<()> {
                 )?)?
             );
         }
-        Command::Search { query, relays } => search_releases(&query, &relays).await?,
+        Command::Search {
+            query,
+            relays,
+            trusted_publishers,
+        } => search_releases(&query, &relays, &trusted_publishers).await?,
         Command::Fetch {
             sha256,
             server,
@@ -761,7 +767,11 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
     })
 }
 
-async fn search_releases(query: &str, relays: &[String]) -> Result<()> {
+async fn search_releases(
+    query: &str,
+    relays: &[String],
+    trusted_publishers: &[String],
+) -> Result<()> {
     let client = Client::default();
     for relay in relays {
         client
@@ -788,6 +798,13 @@ async fn search_releases(query: &str, relays: &[String]) -> Result<()> {
         .collect::<Vec<_>>();
     let query = query.to_ascii_lowercase();
     for event in events {
+        if !trusted_publishers.is_empty()
+            && !trusted_publishers
+                .iter()
+                .any(|trusted| trusted == &event.pubkey.to_hex())
+        {
+            continue;
+        }
         if revoked.iter().any(|(publisher, release_id)| {
             publisher == &event.pubkey.to_hex() && release_id == &event.id.to_hex()
         }) {
