@@ -7,7 +7,8 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs,
+    fs, io,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -235,27 +236,55 @@ fn pack_npk(source: &Path, output: &Path) -> Result<()> {
     let file = fs::File::create(output)?;
     let encoder = zstd::Encoder::new(file, 3)?;
     let mut archive = tar::Builder::new(encoder);
-    let mut files = Vec::new();
-    collect_package_files(source, &mut files)?;
-    files.sort();
-    let file_count = files.len();
-    for path in files {
+    let mut entries = Vec::new();
+    collect_package_entries(source, &mut entries)?;
+    entries.sort();
+    let entry_count = entries.len();
+    for path in entries {
         let relative = path.strip_prefix(source)?;
-        archive.append_path_with_name(&path, relative)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        let mut header = tar::Header::new_gnu();
+        header.set_path(relative)?;
+        header.set_mtime(0);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mode(if metadata.file_type().is_dir() {
+            0o755
+        } else {
+            metadata.permissions().mode() & 0o7777
+        });
+        if metadata.file_type().is_symlink() {
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_link_name(fs::read_link(&path)?)?;
+            header.set_size(0);
+            header.set_cksum();
+            archive.append_data(&mut header, relative, io::empty())?;
+        } else if metadata.file_type().is_dir() {
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_cksum();
+            archive.append_data(&mut header, relative, io::empty())?;
+        } else {
+            header.set_size(metadata.len());
+            header.set_cksum();
+            archive.append_data(&mut header, relative, fs::File::open(&path)?)?;
+        }
     }
     let encoder = archive.into_inner()?;
     encoder.finish()?;
-    println!("packed {} files into {}", file_count, output.display());
+    println!("packed {} entries into {}", entry_count, output.display());
     Ok(())
 }
 
-fn collect_package_files(current: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_package_entries(current: &Path, entries: &mut Vec<PathBuf>) -> Result<()> {
     for entry in fs::read_dir(current)? {
         let path = entry?.path();
-        if path.is_dir() {
-            collect_package_files(&path, files)?;
-        } else if path.is_file() {
-            files.push(path);
+        let file_type = fs::symlink_metadata(&path)?.file_type();
+        if file_type.is_dir() {
+            entries.push(path.clone());
+            collect_package_entries(&path, entries)?;
+        } else if file_type.is_file() || file_type.is_symlink() {
+            entries.push(path);
         } else {
             bail!("unsupported package entry: {}", path.display());
         }
@@ -674,6 +703,19 @@ fn extract_npk(archive_path: &Path, destination: &Path) -> Result<Vec<PathBuf>> 
         {
             bail!("unsafe path in .npk archive: {}", relative.display());
         }
+        if entry.header().entry_type().is_symlink() {
+            let target = entry.link_name()?.context("symlink entry has no target")?;
+            if target.is_absolute()
+                || target
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                bail!(
+                    "unsafe symlink target in .npk archive: {}",
+                    target.display()
+                );
+            }
+        }
         let unpacked = entry.unpack_in(destination)?;
         if unpacked {
             files.push(destination.join(relative));
@@ -851,10 +893,13 @@ mod tests {
         fs::write(source.join("bin/hello"), b"hello")?;
         let archive = dir.path().join("hello.npk");
         pack_npk(&source, &archive)?;
+        let archive_again = dir.path().join("hello-again.npk");
+        pack_npk(&source, &archive_again)?;
+        assert_eq!(hash_file(&archive)?, hash_file(&archive_again)?);
         let destination = dir.path().join("extracted");
         fs::create_dir_all(&destination)?;
         let files = extract_npk(&archive, &destination)?;
-        assert_eq!(files.len(), 1);
+        assert_eq!(files.len(), 2);
         assert_eq!(fs::read(destination.join("bin/hello"))?, b"hello");
         Ok(())
     }
