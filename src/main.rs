@@ -123,6 +123,8 @@ struct Manifest {
     #[serde(default)]
     dependencies: Vec<Dependency>,
     #[serde(default)]
+    conflicts: Vec<Dependency>,
+    #[serde(default)]
     artifact_event: Option<String>,
     #[serde(default)]
     repo: Option<String>,
@@ -659,6 +661,27 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
             })
         })
         .collect();
+    let conflicts = event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind() == "conflicts")
+        .filter_map(|tag| {
+            let values = tag.clone().to_vec();
+            (values.len() >= 3).then(|| Dependency {
+                publisher: (values.len() >= 4).then(|| values[1].clone()),
+                name: if values.len() >= 4 {
+                    values[2].clone()
+                } else {
+                    values[1].clone()
+                },
+                requirement: if values.len() >= 4 {
+                    values[3].clone()
+                } else {
+                    values[2].clone()
+                },
+            })
+        })
+        .collect();
     let runtime_requires = event
         .tags
         .iter()
@@ -699,6 +722,7 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
             .into(),
         sha256: sha256.into(),
         dependencies,
+        conflicts,
         artifact_event: tag_value(event, "artifact").map(str::to_owned),
         repo: tag_value(event, "repo").map(str::to_owned),
         commit: tag_value(event, "commit").map(str::to_owned),
@@ -816,6 +840,15 @@ fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) ->
         }
         tag.push(dependency.name.clone());
         tag.push(dependency.requirement.clone());
+        tags.push(tag);
+    }
+    for conflict in &manifest.conflicts {
+        let mut tag = vec!["conflicts".into()];
+        if let Some(publisher) = &conflict.publisher {
+            tag.push(publisher.clone());
+        }
+        tag.push(conflict.name.clone());
+        tag.push(conflict.requirement.clone());
         tags.push(tag);
     }
     for requirement in &manifest.runtime_requires {
@@ -1370,6 +1403,31 @@ fn extract_npk(archive_path: &Path, destination: &Path) -> Result<Vec<PathBuf>> 
 fn ensure_dependencies_available(manifest: &Manifest, store: &Path) -> Result<()> {
     let installed = installed_packages(Some(store))?;
     let system = system_capabilities();
+    for conflict in &manifest.conflicts {
+        let requirement = VersionReq::parse(&conflict.requirement).with_context(|| {
+            format!(
+                "invalid conflict version requirement for {}: {}",
+                conflict.name, conflict.requirement
+            )
+        })?;
+        if installed.iter().any(|package| {
+            package.name == conflict.name
+                && conflict
+                    .publisher
+                    .as_deref()
+                    .map_or(true, |publisher| package.publisher == publisher)
+                && Version::parse(&package.version)
+                    .map(|version| requirement.matches(&version))
+                    .unwrap_or(false)
+        }) {
+            bail!(
+                "package {} conflicts with installed {} {}",
+                manifest.name,
+                conflict.name,
+                conflict.requirement
+            );
+        }
+    }
     for dependency in &manifest.dependencies {
         let requirement = VersionReq::parse(&dependency.requirement).with_context(|| {
             format!(
@@ -1589,6 +1647,7 @@ mod tests {
             artifact: "hello.tar.gz".into(),
             sha256: hash_file(&artifact)?,
             dependencies: vec![],
+            conflicts: vec![],
             artifact_event: None,
             repo: None,
             commit: None,
@@ -1624,6 +1683,7 @@ mod tests {
             artifact: "hello.bin".into(),
             sha256: hash_file(&artifact)?,
             dependencies: vec![],
+            conflicts: vec![],
             artifact_event: None,
             repo: None,
             commit: None,
@@ -1779,6 +1839,7 @@ mod tests {
             artifact: "app.bin".into(),
             sha256: hash_file(&artifact)?,
             dependencies: vec![],
+            conflicts: vec![],
             artifact_event: None,
             repo: None,
             commit: None,
@@ -1807,6 +1868,7 @@ mod tests {
                 name: "libfoo".into(),
                 requirement: ">=2".into(),
             }],
+            conflicts: vec![],
             artifact_event: Some("artifact-event-id".into()),
             repo: Some("30617:publisher:hello".into()),
             commit: Some("commit-sha".into()),
@@ -1838,6 +1900,7 @@ mod tests {
             artifact: "hello.npk".into(),
             sha256: "00".repeat(32),
             dependencies: vec![],
+            conflicts: vec![],
             artifact_event: None,
             repo: None,
             commit: None,
@@ -1875,6 +1938,7 @@ mod tests {
                 name: "libfoo".into(),
                 requirement: ">=2.0.0".into(),
             }],
+            conflicts: vec![],
             artifact_event: None,
             repo: None,
             commit: None,
@@ -1889,6 +1953,56 @@ mod tests {
         let error =
             install(&manifest, &manifest_path, Some(&dir.path().join("store"))).unwrap_err();
         assert!(error.to_string().contains("missing dependency libfoo"));
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_install_with_conflicting_package() -> Result<()> {
+        let dir = tempdir()?;
+        let store = dir.path().join("store");
+        let artifact = dir.path().join("app.bin");
+        fs::write(&artifact, b"app")?;
+        fs::create_dir_all(&store)?;
+        fs::write(
+            store.join("installed.json"),
+            serde_json::to_vec(&[InstalledPackage {
+                publisher: "pub".into(),
+                name: "old".into(),
+                version: "1.2.0".into(),
+                sha256: "00".repeat(32),
+                artifact: store.join("old"),
+                dependencies: vec![],
+                files: vec![],
+                runtime_requires: vec![],
+                provides: vec![],
+            }])?,
+        )?;
+        let manifest = Manifest {
+            publisher: "pub".into(),
+            name: "new".into(),
+            version: "1.0.0".into(),
+            artifact: "app.bin".into(),
+            sha256: hash_file(&artifact)?,
+            dependencies: vec![],
+            conflicts: vec![Dependency {
+                publisher: Some("pub".into()),
+                name: "old".into(),
+                requirement: ">=1.0.0".into(),
+            }],
+            artifact_event: None,
+            repo: None,
+            commit: None,
+            os: default_os(),
+            arch: default_arch(),
+            format: "opaque".into(),
+            runtime_requires: vec![],
+            provides: vec![],
+            post_install: vec![],
+        };
+        let manifest_path = dir.path().join("manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+        let error = install(&manifest, &manifest_path, Some(&store)).unwrap_err();
+        assert!(error.to_string().contains("conflicts with installed"));
         Ok(())
     }
 
