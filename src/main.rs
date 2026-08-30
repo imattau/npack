@@ -406,6 +406,7 @@ fn install_remote_package<'a>(
             .into_iter()
             .filter(|event| event.verify().is_ok())
             .filter(|event| tag_value(event, "name") == Some(name))
+            .filter(release_matches_host)
             .filter(|event| {
                 publisher
                     .as_deref()
@@ -487,6 +488,12 @@ fn tag_value<'a>(event: &'a Event, kind: &str) -> Option<&'a str> {
         .iter()
         .find(|tag| tag.kind() == kind)
         .and_then(Tag::content)
+}
+
+fn release_matches_host(event: &Event) -> bool {
+    let os = tag_value(event, "os").unwrap_or("any");
+    let arch = tag_value(event, "arch").unwrap_or("any");
+    (os == "any" || os == OS) && (arch == "any" || arch == ARCH)
 }
 
 fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result<Manifest> {
