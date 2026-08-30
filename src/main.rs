@@ -2679,11 +2679,7 @@ fn install_with_capabilities_at(
     };
     remove_stale_files(&existing_packages, &installed)?;
     let mut packages = existing_packages;
-    packages.retain(|p| {
-        !(p.publisher == installed.publisher
-            && p.name == installed.name
-            && p.version == installed.version)
-    });
+    packages.retain(|p| !(p.publisher == installed.publisher && p.name == installed.name));
     packages.push(installed.clone());
     fs::create_dir_all(&root)?;
     fs::write(
@@ -2694,35 +2690,36 @@ fn install_with_capabilities_at(
 }
 
 fn remove_stale_files(existing: &[InstalledPackage], replacement: &InstalledPackage) -> Result<()> {
-    let previous = existing.iter().find(|package| {
-        package.publisher == replacement.publisher
-            && package.name == replacement.name
-            && package.version == replacement.version
-    });
-    let Some(previous) = previous else {
+    let previous_files = existing
+        .iter()
+        .filter(|package| {
+            package.publisher == replacement.publisher && package.name == replacement.name
+        })
+        .flat_map(|package| package.files.iter())
+        .cloned()
+        .collect::<HashSet<_>>();
+    if previous_files.is_empty() {
         return Ok(());
-    };
-    for file in &previous.files {
+    }
+    for file in previous_files {
         if replacement
             .files
             .iter()
-            .any(|replacement_file| replacement_file == file)
+            .any(|replacement_file| replacement_file == &file)
         {
             continue;
         }
         let owned_by_other_package = existing.iter().any(|package| {
-            !(package.publisher == previous.publisher
-                && package.name == previous.name
-                && package.version == previous.version)
-                && package.files.iter().any(|other_file| other_file == file)
+            !(package.publisher == replacement.publisher && package.name == replacement.name)
+                && package.files.iter().any(|other_file| other_file == &file)
         });
         if owned_by_other_package {
             continue;
         }
         if file.is_file()
-            || fs::symlink_metadata(file).is_ok_and(|metadata| metadata.file_type().is_symlink())
+            || fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.file_type().is_symlink())
         {
-            fs::remove_file(file)?;
+            fs::remove_file(&file)?;
         }
     }
     Ok(())
@@ -3028,7 +3025,7 @@ fn ensure_install_paths_available(
     installed: &[InstalledPackage],
     publisher: &str,
     name: &str,
-    version: &str,
+    _version: &str,
 ) -> Result<()> {
     for path in paths {
         let metadata = match fs::symlink_metadata(path) {
@@ -3042,7 +3039,6 @@ fn ensure_install_paths_available(
         let owned_by_this_package = installed.iter().any(|package| {
             package.publisher == publisher
                 && package.name == name
-                && package.version == version
                 && package.files.iter().any(|file| file == path)
         });
         if !owned_by_this_package {
@@ -3640,6 +3636,49 @@ mod tests {
         remove_stale_files(&[previous], &replacement)?;
         assert!(!stale.exists());
         assert!(current.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn upgrade_replaces_previous_version_and_files() -> Result<()> {
+        let dir = tempdir()?;
+        let old_file = dir.path().join("bin/old");
+        let shared_file = dir.path().join("bin/app");
+        let new_file = dir.path().join("bin/new");
+        fs::create_dir_all(old_file.parent().unwrap())?;
+        fs::write(&old_file, b"old")?;
+        fs::write(&shared_file, b"v1")?;
+        fs::write(&new_file, b"new")?;
+
+        let previous = InstalledPackage {
+            publisher: "pub".into(),
+            name: "app".into(),
+            version: "1.0.0".into(),
+            sha256: "00".repeat(32),
+            artifact: dir.path().join("old.npk"),
+            dependencies: vec![],
+            conflicts: vec![],
+            files: vec![old_file.clone(), shared_file.clone()],
+            runtime_requires: vec![],
+            provides: vec![],
+        };
+        let replacement = InstalledPackage {
+            publisher: "pub".into(),
+            name: "app".into(),
+            version: "2.0.0".into(),
+            sha256: "11".repeat(32),
+            artifact: dir.path().join("new.npk"),
+            dependencies: vec![],
+            conflicts: vec![],
+            files: vec![shared_file.clone(), new_file.clone()],
+            runtime_requires: vec![],
+            provides: vec![],
+        };
+
+        remove_stale_files(&[previous], &replacement)?;
+        assert!(!old_file.exists());
+        assert!(shared_file.exists());
+        assert!(new_file.exists());
         Ok(())
     }
 
