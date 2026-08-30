@@ -58,6 +58,15 @@ enum Command {
         event: PathBuf,
         manifest: PathBuf,
     },
+    RevokeEvent {
+        event: PathBuf,
+        #[arg(long, help = "32-byte hex-encoded Nostr secret key")]
+        secret_key: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value_t = 0)]
+        created_at: u64,
+    },
     Search {
         query: String,
         #[arg(long = "relay", required = true)]
@@ -236,6 +245,29 @@ async fn main() -> Result<()> {
             println!(
                 "verified release event {} for {}/{} {}",
                 nostr_event.id, package.publisher, package.name, package.version
+            );
+        }
+        Command::RevokeEvent {
+            event,
+            secret_key,
+            reason,
+            created_at,
+        } => {
+            let event_json = fs::read(&event)?;
+            let release: Event = serde_json::from_slice(&event_json)?;
+            let timestamp = if created_at == 0 {
+                SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
+            } else {
+                created_at
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&sign_revocation_event(
+                    &release,
+                    &secret_key,
+                    &reason,
+                    timestamp,
+                )?)?
             );
         }
         Command::Search { query, relays } => search_releases(&query, &relays).await?,
@@ -456,9 +488,24 @@ fn install_remote_package<'a>(
             .fetch_events(Filter::new().kind(Kind::Custom(9900)).limit(500))
             .timeout(std::time::Duration::from_secs(10))
             .await?;
+        let revoked = client
+            .fetch_events(Filter::new().kind(Kind::Custom(9901)).limit(500))
+            .timeout(std::time::Duration::from_secs(10))
+            .await?
+            .into_iter()
+            .filter(|event| event.verify().is_ok())
+            .filter_map(|event| {
+                tag_value(&event, "e").map(|release| (event.pubkey.to_hex(), release.to_owned()))
+            })
+            .collect::<Vec<_>>();
         let release = releases
             .into_iter()
             .filter(|event| event.verify().is_ok())
+            .filter(|event| {
+                !revoked.iter().any(|(publisher, release_id)| {
+                    publisher == &event.pubkey.to_hex() && release_id == &event.id.to_hex()
+                })
+            })
             .filter(|event| tag_value(event, "name") == Some(name))
             .filter(release_matches_host)
             .filter(|event| {
@@ -746,6 +793,45 @@ fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) ->
         .map(Tag::parse)
         .collect::<Result<Vec<_>, _>>()?;
     EventBuilder::new(Kind::Custom(9900), content)
+        .tags(tags)
+        .custom_created_at(Timestamp::from(created_at))
+        .finalize(&keys)
+        .map_err(Into::into)
+}
+
+fn sign_revocation_event(
+    release: &Event,
+    secret_hex: &str,
+    reason: &str,
+    created_at: u64,
+) -> Result<Event> {
+    if release.kind.as_u16() != 9900 {
+        bail!("can only revoke a kind:9900 release event");
+    }
+    release
+        .verify()
+        .context("release event has invalid signature")?;
+    let keys = Keys::parse(secret_hex).context("secret key must be hex or nsec")?;
+    if keys.public_key() != release.pubkey {
+        bail!("revocation signer must match the release publisher");
+    }
+    let tags = vec![
+        Tag::parse(vec!["e".into(), release.id.to_hex()])?,
+        Tag::parse(vec![
+            String::from("name"),
+            tag_value(release, "name").unwrap_or_default().to_owned(),
+        ])?,
+        Tag::parse(vec![
+            String::from("version"),
+            tag_value(release, "version").unwrap_or_default().to_owned(),
+        ])?,
+        Tag::parse(vec![
+            String::from("x"),
+            tag_value(release, "x").unwrap_or_default().to_owned(),
+        ])?,
+        Tag::parse(vec![String::from("reason"), reason.to_owned()])?,
+    ];
+    EventBuilder::new(Kind::Custom(9901), reason)
         .tags(tags)
         .custom_created_at(Timestamp::from(created_at))
         .finalize(&keys)
@@ -1621,6 +1707,35 @@ mod tests {
         assert!(event.verify().is_ok());
         assert!(serde_json::to_string(&event.tags)?.contains("libfoo"));
         verify_release_event(&event, &manifest)?;
+        Ok(())
+    }
+
+    #[test]
+    fn creates_publisher_signed_revocation_event() -> Result<()> {
+        let manifest = Manifest {
+            publisher: "npub1test".into(),
+            name: "hello".into(),
+            version: "1.0.0".into(),
+            artifact: "hello.npk".into(),
+            sha256: "00".repeat(32),
+            dependencies: vec![],
+            artifact_event: None,
+            repo: None,
+            commit: None,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            format: "npk".into(),
+            runtime_requires: vec![],
+            provides: vec![],
+            post_install: vec![],
+        };
+        let secret = "11".repeat(32);
+        let release = sign_release_event(&manifest, &secret, 1_700_000_000)?;
+        let revocation = sign_revocation_event(&release, &secret, "security issue", 1_700_000_001)?;
+        assert_eq!(revocation.kind.as_u16(), 9901);
+        let release_id = release.id.to_hex();
+        assert_eq!(tag_value(&revocation, "e"), Some(release_id.as_str()));
+        assert!(revocation.verify().is_ok());
         Ok(())
     }
 
