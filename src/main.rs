@@ -125,6 +125,8 @@ enum Command {
         allowed_capabilities: Vec<String>,
         #[arg(long = "relay")]
         relays: Vec<String>,
+        #[arg(long = "server")]
+        servers: Vec<String>,
         #[arg(long = "trusted-publisher")]
         trusted_publishers: Vec<String>,
         #[arg(long, help = "Nostr pubkey whose NIP-65 relay list should be used")]
@@ -229,6 +231,8 @@ enum Command {
         package: String,
         #[arg(long = "relay")]
         relays: Vec<String>,
+        #[arg(long = "server")]
+        servers: Vec<String>,
         #[arg(long)]
         store: Option<PathBuf>,
         #[arg(
@@ -382,6 +386,7 @@ async fn main() -> Result<()> {
             lockfile,
             locked,
             offline,
+            servers,
         } => {
             let path = Path::new(&target);
             if path.exists() {
@@ -408,6 +413,7 @@ async fn main() -> Result<()> {
                 install_remote_command(
                     &target,
                     relays,
+                    servers,
                     store,
                     user,
                     system,
@@ -552,6 +558,7 @@ async fn main() -> Result<()> {
         Command::InstallRef {
             package,
             relays,
+            servers,
             store,
             user,
             system,
@@ -565,6 +572,7 @@ async fn main() -> Result<()> {
             install_remote_command(
                 &package,
                 relays,
+                servers,
                 store,
                 user,
                 system,
@@ -598,6 +606,7 @@ async fn main() -> Result<()> {
 async fn install_remote_command(
     package: &str,
     relays: Vec<String>,
+    servers: Vec<String>,
     store: Option<PathBuf>,
     user: bool,
     system: bool,
@@ -615,6 +624,7 @@ async fn install_remote_command(
         configured_relays(relays, config)?
     };
     let trusted_publishers = configured_publishers(trusted_publishers, config)?;
+    let servers = configured_servers(servers, config)?;
     let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
     let locked_packages = if locked || offline {
         Some(load_lockfile(
@@ -641,7 +651,7 @@ async fn install_remote_command(
             user_pubkey: pubkey.as_deref(),
             lockfile: lockfile.as_deref(),
             locked_packages: locked_packages.as_ref(),
-            blossom_servers: &config.storage.blossom,
+            blossom_servers: &servers,
             allowed_capabilities: &allowed_capabilities,
             offline,
         },
