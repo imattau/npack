@@ -23,6 +23,7 @@ System installation is the default and uses `/` as the payload prefix with packa
     cargo run -- fetch <sha256> --server https://blossom.example --output ./artifact
     cargo run -- install-ref <publisher-hex>/hello --relay wss://relay.example --user
     cargo run -- update <publisher-hex>/hello --relay wss://relay.example --user
+    cargo run -- update hello --relay wss://relay.example --trusted-publisher <publisher-hex>
     cargo run -- pack ./package-root --output ./hello-1.0.0.npk
     cargo run -- remove <publisher-hex>/hello --store /tmp/npack-store
     cargo run -- inspect ./package-root/bin/hello

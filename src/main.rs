@@ -94,6 +94,8 @@ enum Command {
         store: Option<PathBuf>,
         #[arg(long, help = "Install into the current user's ~/.local prefix")]
         user: bool,
+        #[arg(long = "trusted-publisher")]
+        trusted_publishers: Vec<String>,
         #[arg(long = "allow-capability")]
         allowed_capabilities: Vec<String>,
     },
@@ -293,6 +295,7 @@ async fn main() -> Result<()> {
             relays,
             store,
             user,
+            trusted_publishers,
             allowed_capabilities,
         } => {
             let (publisher, name) = package
@@ -304,6 +307,7 @@ async fn main() -> Result<()> {
                 &relays,
                 store.as_deref(),
                 user,
+                &trusted_publishers,
                 &allowed_capabilities,
             )
             .await?
@@ -434,6 +438,7 @@ async fn install_ref(
     relays: &[String],
     store: Option<&Path>,
     user: bool,
+    trusted_publishers: &[String],
     allowed_capabilities: &[String],
 ) -> Result<()> {
     let client = Client::default();
@@ -451,6 +456,7 @@ async fn install_ref(
         None,
         allowed_capabilities,
         user,
+        trusted_publishers,
         &root,
         &prefix,
         &mut visiting,
@@ -472,6 +478,7 @@ fn install_remote_package<'a>(
     requirement: Option<String>,
     allowed_capabilities: &'a [String],
     user: bool,
+    trusted_publishers: &'a [String],
     root: &'a Path,
     prefix: &'a Path,
     visiting: &'a mut Vec<String>,
@@ -487,6 +494,15 @@ fn install_remote_package<'a>(
             .any(|installed_name| installed_name == &install_key)
         {
             return Ok(());
+        }
+        if !trusted_publishers.is_empty()
+            && publisher.as_deref().map_or(false, |publisher| {
+                !trusted_publishers
+                    .iter()
+                    .any(|trusted| trusted == publisher)
+            })
+        {
+            bail!("publisher is not in the trusted publisher list");
         }
         if visiting
             .iter()
@@ -516,6 +532,12 @@ fn install_remote_package<'a>(
         let release = releases
             .into_iter()
             .filter(|event| event.verify().is_ok())
+            .filter(|event| {
+                trusted_publishers.is_empty()
+                    || trusted_publishers
+                        .iter()
+                        .any(|trusted| trusted == &event.pubkey.to_hex())
+            })
             .filter(|event| {
                 !revoked.iter().any(|(publisher, release_id)| {
                     publisher == &event.pubkey.to_hex() && release_id == &event.id.to_hex()
@@ -607,6 +629,7 @@ fn install_remote_package<'a>(
                 Some(dependency.requirement),
                 allowed_capabilities,
                 user,
+                trusted_publishers,
                 root,
                 prefix,
                 visiting,
