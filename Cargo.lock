@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "npack"
-version = "0.2.3"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "bitcoin_hashes 1.2.0",
