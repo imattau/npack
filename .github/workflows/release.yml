@@ -50,10 +50,14 @@ jobs:
           VERSION: ${{ steps.release.outputs.version }}
           PUBLISHER: ${{ vars.NOSTR_PUBLISHER }}
         run: |
-          test -n "$PUBLISHER" || {
-            echo "Repository variable NOSTR_PUBLISHER must contain the release publisher key" >&2
-            exit 1
-          }
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            test -n "$PUBLISHER" || {
+              echo "Repository variable NOSTR_PUBLISHER must contain the release publisher key" >&2
+              exit 1
+            }
+          else
+            PUBLISHER="manual-test-publisher"
+          fi
           artifact="npack-${VERSION}-linux-x86_64.npk"
           sha256=$(sha256sum "package-output/$artifact" | cut -d ' ' -f 1)
           runtime_requires=$(cargo run --quiet -- inspect target/release/npack \
