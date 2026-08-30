@@ -2275,13 +2275,15 @@ fn verify_installed(store: Option<&Path>, user: bool) -> Result<()> {
         let actual = hash_file(&package.artifact).with_context(|| {
             format!(
                 "reading artifact for {}/{} {}",
-                package.publisher, package.name, package.version
+                display_publisher(&package.publisher),
+                package.name,
+                package.version
             )
         })?;
         if actual != package.sha256.to_ascii_lowercase() {
             bail!(
                 "installed artifact hash mismatch for {}/{} {}",
-                package.publisher,
+                display_publisher(&package.publisher),
                 package.name,
                 package.version
             );
@@ -2290,7 +2292,7 @@ fn verify_installed(store: Option<&Path>, user: bool) -> Result<()> {
             if fs::symlink_metadata(file).is_err() {
                 bail!(
                     "installed file is missing for {}/{} {}: {}",
-                    package.publisher,
+                    display_publisher(&package.publisher),
                     package.name,
                     package.version,
                     file.display()
@@ -2299,7 +2301,9 @@ fn verify_installed(store: Option<&Path>, user: bool) -> Result<()> {
         }
         println!(
             "verified {}/{} {}",
-            package.publisher, package.name, package.version
+            display_publisher(&package.publisher),
+            package.name,
+            package.version
         );
     }
     Ok(())
