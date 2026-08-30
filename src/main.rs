@@ -659,33 +659,29 @@ async fn install_ref(
     client.connect().await;
     add_user_relays(&client, user_pubkey).await?;
     let (root, prefix) = install_paths(store, user);
-    let mut visiting = Vec::new();
-    let mut installed = Vec::new();
-    install_remote_package(
-        &client,
-        name,
-        publisher,
-        None,
+    let mut state = ResolverState {
+        client: &client,
         allowed_capabilities,
         user,
         trusted_publishers,
         blossom_servers,
-        &root,
-        &prefix,
+        root: &root,
+        prefix: &prefix,
         locked_packages,
-        &mut visiting,
-        &mut installed,
-    )
-    .await?;
+        visiting: Vec::new(),
+        installed: Vec::new(),
+    };
+    install_remote_package(&mut state, name.to_owned(), publisher, None).await?;
     client.disconnect().await;
     if let Some(lockfile) = locked_packages {
-        verify_locked_order(lockfile, &installed)?;
+        verify_locked_order(lockfile, &state.installed)?;
         verify_locked_install(lockfile, &root)?;
     }
     if let Some(lockfile) = lockfile {
-        write_lockfile(lockfile, &root, &installed)?;
+        write_lockfile(lockfile, &root, &state.installed)?;
     }
-    let display_order = installed
+    let display_order = state
+        .installed
         .iter()
         .map(|package| display_package_reference(package))
         .collect::<Vec<_>>();
@@ -900,11 +896,8 @@ fn verify_locked_install(lockfile: &Lockfile, root: &Path) -> Result<()> {
 use std::future::Future;
 use std::pin::Pin;
 
-fn install_remote_package<'a>(
+struct ResolverState<'a> {
     client: &'a Client,
-    name: &'a str,
-    publisher: Option<String>,
-    requirement: Option<String>,
     allowed_capabilities: &'a [String],
     user: bool,
     trusted_publishers: &'a [String],
@@ -912,30 +905,39 @@ fn install_remote_package<'a>(
     root: &'a Path,
     prefix: &'a Path,
     locked_packages: Option<&'a Lockfile>,
-    visiting: &'a mut Vec<String>,
-    installed: &'a mut Vec<String>,
+    visiting: Vec<String>,
+    installed: Vec<String>,
+}
+
+fn install_remote_package<'a, 'b>(
+    state: &'a mut ResolverState<'b>,
+    name: String,
+    publisher: Option<String>,
+    requirement: Option<String>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
         let install_key = publisher.as_deref().map_or_else(
             || name.to_owned(),
             |publisher| format!("{publisher}/{name}"),
         );
-        if installed
+        if state
+            .installed
             .iter()
             .any(|installed_name| installed_name == &install_key)
         {
             return Ok(());
         }
-        if !trusted_publishers.is_empty()
+        if !state.trusted_publishers.is_empty()
             && publisher.as_deref().is_some_and(|publisher| {
-                !trusted_publishers
+                !state
+                    .trusted_publishers
                     .iter()
                     .any(|trusted| trusted == publisher)
             })
         {
             bail!("publisher is not in the trusted publisher list");
         }
-        let locked_package = if let Some(lockfile) = locked_packages {
+        let locked_package = if let Some(lockfile) = state.locked_packages {
             let matches = lockfile
                 .packages
                 .iter()
@@ -954,25 +956,28 @@ fn install_remote_package<'a>(
         } else {
             None
         };
-        if locked_packages.is_some() && locked_package.is_none() {
+        if state.locked_packages.is_some() && locked_package.is_none() {
             bail!("package {install_key} is not present in the lockfile");
         }
-        if visiting
+        if state
+            .visiting
             .iter()
             .any(|visiting_name| visiting_name == &install_key)
         {
             bail!(
                 "dependency cycle detected: {} -> {}",
-                visiting.join(" -> "),
+                state.visiting.join(" -> "),
                 name
             );
         }
-        visiting.push(install_key.clone());
-        let releases = client
+        state.visiting.push(install_key.clone());
+        let releases = state
+            .client
             .fetch_events(Filter::new().kind(Kind::Custom(RELEASE_KIND)).limit(500))
             .timeout(std::time::Duration::from_secs(10))
             .await?;
-        let revoked = client
+        let revoked = state
+            .client
             .fetch_events(Filter::new().kind(Kind::Custom(REVOCATION_KIND)).limit(500))
             .timeout(std::time::Duration::from_secs(10))
             .await?
@@ -988,8 +993,9 @@ fn install_remote_package<'a>(
             .filter(|event| event.verify().is_ok())
             .filter(release_event_is_v1)
             .filter(|event| {
-                trusted_publishers.is_empty()
-                    || trusted_publishers
+                state.trusted_publishers.is_empty()
+                    || state
+                        .trusted_publishers
                         .iter()
                         .any(|trusted| trusted == &event.pubkey.to_hex())
             })
@@ -998,7 +1004,7 @@ fn install_remote_package<'a>(
                     publisher == &event.pubkey.to_hex() && release_id == &event.id.to_hex()
                 })
             })
-            .filter(|event| tag_value(event, "name") == Some(name))
+            .filter(|event| tag_value(event, "name") == Some(name.as_str()))
             .filter(release_matches_host)
             .filter(|event| {
                 publisher
@@ -1034,7 +1040,8 @@ fn install_remote_package<'a>(
         let artifact_event_id = tag_value(&release, "artifact")
             .context("release has no artifact event")?
             .parse::<EventId>()?;
-        let artifact_events = client
+        let artifact_events = state
+            .client
             .fetch_events(Filter::new().kind(Kind::Custom(1063)).id(artifact_event_id))
             .timeout(std::time::Duration::from_secs(10))
             .await?;
@@ -1050,7 +1057,7 @@ fn install_remote_package<'a>(
             bail!("release and artifact event hashes do not match");
         }
         let expected: Sha256Hash = sha256.parse()?;
-        let staging = root.join("downloads").join(sha256);
+        let staging = state.root.join("downloads").join(sha256);
         fs::create_dir_all(&staging)?;
         let artifact_path = staging.join("artifact");
         if !artifact_path.exists() {
@@ -1060,8 +1067,8 @@ fn install_remote_package<'a>(
                 .filter(|tag| tag.kind() == "url")
                 .filter_map(Tag::content)
                 .map(str::to_owned)
-                .collect::<Vec<_>>();
-            urls.extend(blossom_servers.iter().cloned());
+                .collect::<Vec<String>>();
+            urls.extend(state.blossom_servers.iter().cloned());
             urls.sort();
             urls.dedup();
             if urls.is_empty() {
@@ -1100,32 +1107,23 @@ fn install_remote_package<'a>(
         let dependencies = manifest.dependencies.clone();
         for dependency in dependencies {
             install_remote_package(
-                client,
-                &dependency.name,
+                state,
+                dependency.name.clone(),
                 dependency.publisher,
                 Some(dependency.requirement),
-                allowed_capabilities,
-                user,
-                trusted_publishers,
-                blossom_servers,
-                root,
-                prefix,
-                locked_packages,
-                visiting,
-                installed,
             )
             .await?;
         }
         install_with_capabilities_at(
             &manifest,
             &staging.join("manifest.json"),
-            Some(root),
-            Some(prefix),
-            user,
-            allowed_capabilities,
+            Some(state.root),
+            Some(state.prefix),
+            state.user,
+            state.allowed_capabilities,
         )?;
-        visiting.pop();
-        installed.push(install_key);
+        state.visiting.pop();
+        state.installed.push(install_key);
         Ok(())
     })
 }
