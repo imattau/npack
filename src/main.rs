@@ -66,6 +66,11 @@ enum Command {
         #[arg(long)]
         store: Option<PathBuf>,
     },
+    Pack {
+        source: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,7 +103,7 @@ fn default_arch() -> String {
     "any".into()
 }
 fn default_format() -> String {
-    "opaque".into()
+    "npk".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -118,6 +123,8 @@ struct InstalledPackage {
     artifact: PathBuf,
     #[serde(default)]
     dependencies: Vec<Dependency>,
+    #[serde(default)]
+    files: Vec<PathBuf>,
 }
 
 #[tokio::main]
@@ -195,6 +202,7 @@ async fn main() -> Result<()> {
                 .map_or((None, package.as_str()), |(p, n)| (Some(p.to_owned()), n));
             install_ref(&name, publisher, &relays, store.as_deref()).await?
         }
+        Command::Pack { source, output } => pack_npk(&source, &output)?,
     }
     Ok(())
 }
@@ -214,6 +222,44 @@ async fn fetch_blob(sha256: &str, server: &str, output: &Path) -> Result<()> {
     }
     fs::write(output, &bytes).with_context(|| format!("writing {}", output.display()))?;
     println!("fetched {} bytes to {}", bytes.len(), output.display());
+    Ok(())
+}
+
+fn pack_npk(source: &Path, output: &Path) -> Result<()> {
+    if !source.is_dir() {
+        bail!("package source must be a directory");
+    }
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = fs::File::create(output)?;
+    let encoder = zstd::Encoder::new(file, 3)?;
+    let mut archive = tar::Builder::new(encoder);
+    let mut files = Vec::new();
+    collect_package_files(source, &mut files)?;
+    files.sort();
+    let file_count = files.len();
+    for path in files {
+        let relative = path.strip_prefix(source)?;
+        archive.append_path_with_name(&path, relative)?;
+    }
+    let encoder = archive.into_inner()?;
+    encoder.finish()?;
+    println!("packed {} files into {}", file_count, output.display());
+    Ok(())
+}
+
+fn collect_package_files(current: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(current)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_package_files(&path, files)?;
+        } else if path.is_file() {
+            files.push(path);
+        } else {
+            bail!("unsupported package entry: {}", path.display());
+        }
+    }
     Ok(())
 }
 
@@ -584,6 +630,11 @@ fn install(
     );
     fs::copy(artifact_path(manifest, manifest_path), &destination)
         .context("copying verified artifact")?;
+    let files = if manifest.format == "npk" {
+        extract_npk(&destination, &package_dir)?
+    } else {
+        vec![destination.clone()]
+    };
     let installed = InstalledPackage {
         publisher: manifest.publisher.clone(),
         name: manifest.name.clone(),
@@ -591,6 +642,7 @@ fn install(
         sha256: manifest.sha256.to_ascii_lowercase(),
         artifact: destination,
         dependencies: manifest.dependencies.clone(),
+        files,
     };
     let mut packages = installed_packages(Some(&root))?;
     packages.retain(|p| {
@@ -605,6 +657,29 @@ fn install(
         serde_json::to_vec_pretty(&packages)?,
     )?;
     Ok(installed)
+}
+
+fn extract_npk(archive_path: &Path, destination: &Path) -> Result<Vec<PathBuf>> {
+    let file = fs::File::open(archive_path)?;
+    let decoder = zstd::Decoder::new(file)?;
+    let mut archive = tar::Archive::new(decoder);
+    let mut files = Vec::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let relative = entry.path()?.into_owned();
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            bail!("unsafe path in .npk archive: {}", relative.display());
+        }
+        let unpacked = entry.unpack_in(destination)?;
+        if unpacked {
+            files.push(destination.join(relative));
+        }
+    }
+    Ok(files)
 }
 
 fn ensure_dependencies_available(manifest: &Manifest, store: &Path) -> Result<()> {
@@ -670,7 +745,7 @@ mod tests {
             commit: None,
             os: default_os(),
             arch: default_arch(),
-            format: default_format(),
+            format: "opaque".into(),
         };
         fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
         verify_manifest(&manifest, &manifest_path)?;
@@ -698,7 +773,7 @@ mod tests {
             commit: None,
             os: default_os(),
             arch: default_arch(),
-            format: default_format(),
+            format: "opaque".into(),
         };
         fs::write(&artifact, b"tampered")?;
         assert!(verify_manifest(&manifest, &dir.path().join("manifest.json")).is_err());
@@ -765,6 +840,22 @@ mod tests {
         let error =
             install(&manifest, &manifest_path, Some(&dir.path().join("store"))).unwrap_err();
         assert!(error.to_string().contains("missing dependency libfoo"));
+        Ok(())
+    }
+
+    #[test]
+    fn packs_and_extracts_npk_archive() -> Result<()> {
+        let dir = tempdir()?;
+        let source = dir.path().join("source");
+        fs::create_dir_all(source.join("bin"))?;
+        fs::write(source.join("bin/hello"), b"hello")?;
+        let archive = dir.path().join("hello.npk");
+        pack_npk(&source, &archive)?;
+        let destination = dir.path().join("extracted");
+        fs::create_dir_all(&destination)?;
+        let files = extract_npk(&archive, &destination)?;
+        assert_eq!(files.len(), 1);
+        assert_eq!(fs::read(destination.join("bin/hello"))?, b"hello");
         Ok(())
     }
 }

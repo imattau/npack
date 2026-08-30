@@ -18,7 +18,9 @@ nostr = { version = "0.45.3", features = ["os-rng"] }
 nostr-blossom = "0.45.0"
 nostr-sdk = "0.45.2"
 semver = "1"
+tar = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+zstd = "0.13"
 
 [dev-dependencies]
 tempfile = "3"
