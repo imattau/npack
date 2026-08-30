@@ -8,7 +8,7 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env::consts::{ARCH, OS},
     fs, io,
     os::unix::fs::PermissionsExt,
@@ -687,6 +687,7 @@ async fn install_ref(
         locked_packages,
         visiting: Vec::new(),
         installed: Vec::new(),
+        selected: HashMap::new(),
     };
     install_remote_package(&mut state, name.to_owned(), publisher, None).await?;
     client.disconnect().await;
@@ -924,6 +925,7 @@ struct ResolverState<'a> {
     locked_packages: Option<&'a Lockfile>,
     visiting: Vec<String>,
     installed: Vec<String>,
+    selected: HashMap<String, Manifest>,
 }
 
 fn install_remote_package<'a, 'b>(
@@ -938,10 +940,34 @@ fn install_remote_package<'a, 'b>(
             |publisher| format!("{publisher}/{name}"),
         );
         if state
+            .visiting
+            .iter()
+            .any(|visiting_name| visiting_name == &install_key)
+        {
+            bail!(
+                "dependency cycle detected: {} -> {}",
+                state.visiting.join(" -> "),
+                name
+            );
+        }
+        if state
             .installed
             .iter()
             .any(|installed_name| installed_name == &install_key)
         {
+            return Ok(());
+        }
+        let selected = state.selected.iter().find(|(key, manifest)| {
+            key.as_str() == install_key || (publisher.is_none() && manifest.name == name)
+        });
+        if let Some((key, manifest)) = selected {
+            if let Some(requirement) = &requirement {
+                let requirement = VersionReq::parse(requirement)?;
+                let version = Version::parse(&manifest.version)?;
+                if !requirement.matches(&version) {
+                    bail!("selected package {key} does not satisfy requirement {requirement}");
+                }
+            }
             return Ok(());
         }
         if !state.trusted_publishers.is_empty()
@@ -975,17 +1001,6 @@ fn install_remote_package<'a, 'b>(
         };
         if state.locked_packages.is_some() && locked_package.is_none() {
             bail!("package {install_key} is not present in the lockfile");
-        }
-        if state
-            .visiting
-            .iter()
-            .any(|visiting_name| visiting_name == &install_key)
-        {
-            bail!(
-                "dependency cycle detected: {} -> {}",
-                state.visiting.join(" -> "),
-                name
-            );
         }
         state.visiting.push(install_key.clone());
         let releases = state
@@ -1121,6 +1136,21 @@ fn install_remote_package<'a, 'b>(
             bail!("cached artifact hash does not match release");
         }
         let manifest = manifest_from_release(&release, &artifact_path, sha256)?;
+        let canonical_key = format!("{}/{}", manifest.publisher, manifest.name);
+        for (selected_key, selected_manifest) in &state.selected {
+            if manifest
+                .conflicts
+                .iter()
+                .any(|conflict| manifest_satisfies_dependency(selected_manifest, conflict))
+                || selected_manifest
+                    .conflicts
+                    .iter()
+                    .any(|conflict| manifest_satisfies_dependency(&manifest, conflict))
+            {
+                bail!("resolved package conflict between {canonical_key} and {selected_key}");
+            }
+        }
+        state.selected.insert(canonical_key, manifest.clone());
         let dependencies = manifest.dependencies.clone();
         for dependency in dependencies {
             install_remote_package(
@@ -2219,6 +2249,22 @@ fn extract_npk(archive_path: &Path, destination: &Path) -> Result<Vec<PathBuf>> 
     Ok(files)
 }
 
+fn manifest_satisfies_dependency(manifest: &Manifest, dependency: &Dependency) -> bool {
+    dependency
+        .publisher
+        .as_deref()
+        .is_none_or(|publisher| publisher == manifest.publisher)
+        && dependency.name == manifest.name
+        && VersionReq::parse(&dependency.requirement)
+            .ok()
+            .and_then(|requirement| {
+                Version::parse(&manifest.version)
+                    .ok()
+                    .map(|version| requirement.matches(&version))
+            })
+            .unwrap_or(false)
+}
+
 fn ensure_dependencies_available(manifest: &Manifest, store: &Path) -> Result<()> {
     let installed = installed_packages(Some(store))?;
     let system = system_capabilities();
@@ -3107,6 +3153,44 @@ mod tests {
             "libfoo-api@2.4.1"
         ));
         assert!(capability_satisfies("libfoo.so.2", "libfoo.so.2"));
+    }
+
+    #[test]
+    fn matches_publisher_qualified_package_requirements() {
+        let manifest = Manifest {
+            publisher: "pub".into(),
+            name: "libfoo".into(),
+            version: "2.4.1".into(),
+            artifact: "libfoo.npk".into(),
+            sha256: "00".repeat(32),
+            dependencies: vec![],
+            conflicts: vec![],
+            artifact_event: None,
+            repo: None,
+            commit: None,
+            os: default_os(),
+            arch: default_arch(),
+            format: default_format(),
+            runtime_requires: vec![],
+            provides: vec![],
+            post_install: vec![],
+        };
+        assert!(manifest_satisfies_dependency(
+            &manifest,
+            &Dependency {
+                publisher: Some("pub".into()),
+                name: "libfoo".into(),
+                requirement: ">=2.0.0".into(),
+            }
+        ));
+        assert!(!manifest_satisfies_dependency(
+            &manifest,
+            &Dependency {
+                publisher: Some("other".into()),
+                name: "libfoo".into(),
+                requirement: ">=2.0.0".into(),
+            }
+        ));
     }
 
     #[test]
