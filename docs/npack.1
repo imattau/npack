@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH npack 1  "npack 0.2.9"
+.TH npack 1  "npack 0.2.9" 
 .SH NAME
 npack \- A Nostr\-native package manager
 .SH SYNOPSIS
@@ -66,6 +66,9 @@ Render the complete command reference as a man page
 .TP
 npack\-install\-ref(1)
 Install a package\*(Aqs latest available version, or update all packages
+.TP
+npack\-resolve(1)
+Resolve and verify a package\*(Aqs release metadata without installing it
 .TP
 npack\-pack(1)
 Build a deterministic .npk archive from a package directory

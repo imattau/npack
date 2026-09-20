@@ -106,6 +106,11 @@ npack install <publisher>/myapp --relay wss://relay.example --user
 npack update <publisher>/myapp --relay wss://relay.example --user
 npack update --user                 # check all installed packages
 
+# Resolve and verify release metadata without installing it -- useful for
+# declarative package managers (e.g. Nix) that want to fetch and manage the
+# artifact themselves
+npack resolve <publisher>/myapp --relay wss://relay.example
+
 # Publish an artifact and its Nostr events
 npack publish ./myapp.manifest.json \
   --secret-key <secret-key> \

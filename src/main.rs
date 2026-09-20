@@ -322,6 +322,31 @@ enum Command {
         #[arg(long = "allow-capability")]
         allowed_capabilities: Vec<String>,
     },
+    /// Resolve and verify a package's release metadata without installing it.
+    ///
+    /// Prints the publisher, version, SHA-256, candidate artifact URLs,
+    /// declared dependencies and verification outcome as JSON, so that a
+    /// declarative package manager (e.g. Nix) can fetch and manage the
+    /// artifact itself.
+    Resolve {
+        package: String,
+        #[arg(long, help = "Version requirement to resolve, e.g. '>=1.2.0'")]
+        requirement: Option<String>,
+        #[arg(long = "relay")]
+        relays: Vec<String>,
+        #[arg(long, help = "Target operating system; defaults to the host OS")]
+        os: Option<String>,
+        #[arg(long, help = "Target architecture; defaults to the host architecture")]
+        arch: Option<String>,
+        #[arg(long = "trusted-publisher")]
+        trusted_publishers: Vec<String>,
+        #[arg(long, help = "Nostr pubkey whose NIP-65 relay list should be used")]
+        pubkey: Option<String>,
+        #[arg(long, help = "Resolve against a pinned entry in this lockfile")]
+        lockfile: Option<PathBuf>,
+        #[arg(long, requires = "lockfile")]
+        locked: bool,
+    },
     /// Build a deterministic .npk archive from a package directory.
     Pack {
         source: PathBuf,
@@ -385,6 +410,34 @@ struct Manifest {
     provides: Vec<String>,
     #[serde(default)]
     post_install: Vec<PostInstallAction>,
+}
+
+#[derive(Debug, Serialize)]
+struct VerificationResult {
+    release_signature_valid: bool,
+    artifact_event_signature_valid: bool,
+    release_event_is_v1: bool,
+    publisher_trusted: bool,
+    revoked: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolvedRelease {
+    publisher: String,
+    name: String,
+    version: String,
+    sha256: String,
+    os: String,
+    arch: String,
+    format: String,
+    artifact_urls: Vec<String>,
+    dependencies: Vec<Dependency>,
+    conflicts: Vec<Dependency>,
+    runtime_requires: Vec<String>,
+    provides: Vec<String>,
+    release_event_id: String,
+    artifact_event_id: String,
+    verification: VerificationResult,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -733,6 +786,31 @@ async fn main() -> Result<()> {
                 )
                 .await?
             }
+        }
+        Command::Resolve {
+            package,
+            requirement,
+            relays,
+            os,
+            arch,
+            trusted_publishers,
+            pubkey,
+            lockfile,
+            locked,
+        } => {
+            resolve_command(
+                &package,
+                requirement,
+                relays,
+                os,
+                arch,
+                trusted_publishers,
+                pubkey,
+                lockfile,
+                locked,
+                &config,
+            )
+            .await?
         }
         Command::Pack { source, output } => pack_npk(&source, &output)?,
         Command::Remove {
@@ -1521,6 +1599,259 @@ fn load_cached_artifact(root: &Path, event_id: EventId) -> Result<Event> {
     Ok(event)
 }
 
+async fn fetch_revoked_release_ids(client: &Client) -> Result<Vec<(String, String)>> {
+    Ok(client
+        .fetch_events(Filter::new().kind(Kind::Custom(REVOCATION_KIND)).limit(500))
+        .timeout(std::time::Duration::from_secs(10))
+        .await?
+        .into_iter()
+        .filter(|event| event.verify().is_ok())
+        .filter(revocation_event_is_v1)
+        .filter_map(|event| {
+            tag_value(&event, "e").map(|release| (event.pubkey.to_hex(), release.to_owned()))
+        })
+        .collect())
+}
+
+/// Queries relays for the highest-version, verified, non-revoked release
+/// event matching `name` and the supplied trust/lockfile/semver constraints.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_verified_release(
+    client: &Client,
+    name: &str,
+    publisher: Option<&str>,
+    requirement: Option<&str>,
+    trusted_publishers: &[String],
+    locked_package: Option<&LockedPackage>,
+    target_os: &str,
+    target_arch: &str,
+) -> Result<Event> {
+    let releases = client
+        .fetch_events(Filter::new().kind(Kind::Custom(RELEASE_KIND)).limit(500))
+        .timeout(std::time::Duration::from_secs(10))
+        .await?;
+    let revoked = fetch_revoked_release_ids(client).await?;
+    releases
+        .into_iter()
+        .filter(|event| event.verify().is_ok())
+        .filter(release_event_is_v1)
+        .filter(|event| {
+            trusted_publishers.is_empty()
+                || trusted_publishers
+                    .iter()
+                    .any(|trusted| trusted == &event.pubkey.to_hex())
+        })
+        .filter(|event| {
+            !revoked.iter().any(|(publisher, release_id)| {
+                publisher == &event.pubkey.to_hex() && release_id == &event.id.to_hex()
+            })
+        })
+        .filter(|event| tag_value(event, "name") == Some(name))
+        .filter(|event| release_matches_target(event, target_os, target_arch))
+        .filter(|event| publisher.is_none_or(|publisher| event.pubkey.to_hex() == publisher))
+        .filter(|event| {
+            locked_package.is_none_or(|package| {
+                event.pubkey.to_hex() == package.publisher
+                    && tag_value(event, "version") == Some(package.version.as_str())
+                    && tag_value(event, "x") == Some(package.sha256.as_str())
+            })
+        })
+        .filter(|event| {
+            requirement.is_none_or(|req| {
+                VersionReq::parse(req)
+                    .ok()
+                    .zip(tag_value(event, "version").and_then(|v| Version::parse(v).ok()))
+                    .map(|(req, version)| req.matches(&version))
+                    .unwrap_or(false)
+            })
+        })
+        .max_by_key(|event| {
+            (
+                tag_value(event, "version")
+                    .and_then(|v| Version::parse(v).ok())
+                    .unwrap_or_else(|| Version::new(0, 0, 0)),
+                event.created_at.as_secs(),
+                event.id.to_hex(),
+            )
+        })
+        .with_context(|| format!("no verified release found for {name}"))
+}
+
+/// Fetches and verifies the NIP-94 artifact event referenced by `release`.
+async fn fetch_verified_artifact_event(client: &Client, release: &Event) -> Result<Event> {
+    let artifact_event_id = tag_value(release, "artifact")
+        .context("release has no artifact event")?
+        .parse::<EventId>()?;
+    let artifact_events = client
+        .fetch_events(Filter::new().kind(Kind::Custom(1063)).id(artifact_event_id))
+        .timeout(std::time::Duration::from_secs(10))
+        .await?;
+    artifact_events
+        .into_iter()
+        .find(|event| event.verify().is_ok())
+        .context("no verified NIP-94 artifact event found")
+}
+
+/// Cross-checks a release and its artifact event and builds the resulting
+/// `Manifest`. Performs no network access.
+fn resolved_manifest(release: &Event, artifact_event: &Event) -> Result<(String, Manifest)> {
+    if artifact_event.pubkey != release.pubkey {
+        bail!("release and artifact event publishers do not match");
+    }
+    let sha256 = tag_value(release, "x")
+        .context("release has no artifact hash")?
+        .to_owned();
+    validate_artifact_event(artifact_event, &release.pubkey, &sha256)?;
+    let manifest = manifest_from_release(release, Path::new("artifact"), &sha256)?;
+    Ok((sha256, manifest))
+}
+
+/// Collects candidate download URLs for an artifact: NIP-94 `url` tags,
+/// the publisher's declared Blossom servers (NIP-96/BUD-03 kind 10063), and
+/// any caller-supplied mirrors.
+async fn collect_artifact_urls(
+    client: &Client,
+    publisher: &PublicKey,
+    artifact_event: &Event,
+    extra_servers: &[String],
+) -> Vec<String> {
+    let publisher_blossom_servers = discover_blossom_servers(client, publisher)
+        .await
+        .unwrap_or_default();
+    let mut urls = artifact_event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind() == "url")
+        .filter_map(Tag::content)
+        .map(str::to_owned)
+        .collect::<Vec<String>>();
+    urls.extend(publisher_blossom_servers);
+    urls.extend(extra_servers.iter().cloned());
+    urls.sort();
+    urls.dedup();
+    urls
+}
+
+/// Resolves and verifies a package's release metadata (relay discovery,
+/// trust/semver/os-arch filtering, revocation check, NIP-94 artifact-event
+/// verification) without downloading the artifact or installing anything.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_release(
+    client: &Client,
+    root: &Path,
+    name: &str,
+    publisher: Option<&str>,
+    requirement: Option<&str>,
+    trusted_publishers: &[String],
+    locked_package: Option<&LockedPackage>,
+    target_os: &str,
+    target_arch: &str,
+) -> Result<ResolvedRelease> {
+    let release = fetch_verified_release(
+        client,
+        name,
+        publisher,
+        requirement,
+        trusted_publishers,
+        locked_package,
+        target_os,
+        target_arch,
+    )
+    .await?;
+    cache_release(root, &release)?;
+    let artifact_event = fetch_verified_artifact_event(client, &release).await?;
+    cache_artifact(root, &artifact_event)?;
+    let (_, manifest) = resolved_manifest(&release, &artifact_event)?;
+    let artifact_urls = collect_artifact_urls(client, &release.pubkey, &artifact_event, &[]).await;
+    let publisher_trusted = trusted_publishers.is_empty()
+        || trusted_publishers
+            .iter()
+            .any(|trusted| trusted == &release.pubkey.to_hex());
+    Ok(ResolvedRelease {
+        publisher: manifest.publisher,
+        name: manifest.name,
+        version: manifest.version,
+        sha256: manifest.sha256,
+        os: manifest.os,
+        arch: manifest.arch,
+        format: manifest.format,
+        artifact_urls,
+        dependencies: manifest.dependencies,
+        conflicts: manifest.conflicts,
+        runtime_requires: manifest.runtime_requires,
+        provides: manifest.provides,
+        release_event_id: release.id.to_hex(),
+        artifact_event_id: artifact_event.id.to_hex(),
+        verification: VerificationResult {
+            release_signature_valid: true,
+            artifact_event_signature_valid: true,
+            release_event_is_v1: true,
+            publisher_trusted,
+            revoked: false,
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_command(
+    package: &str,
+    requirement: Option<String>,
+    relays: Vec<String>,
+    os: Option<String>,
+    arch: Option<String>,
+    trusted_publishers: Vec<String>,
+    pubkey: Option<String>,
+    lockfile: Option<PathBuf>,
+    locked: bool,
+    config: &Config,
+) -> Result<()> {
+    let target_os = os.unwrap_or_else(|| OS.to_owned());
+    let target_arch = arch.unwrap_or_else(|| ARCH.to_owned());
+    let relays = configured_relays(relays, config)?;
+    let trusted_publishers = configured_publishers(trusted_publishers, config)?;
+    let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
+    let lockfile_data = lockfile.as_deref().map(load_lockfile).transpose()?;
+    if locked && lockfile_data.is_none() {
+        bail!("--locked requires --lockfile");
+    }
+    let (publisher, name) = package
+        .split_once('/')
+        .map_or((None, package), |(publisher, name)| {
+            (Some(normalize_publisher_reference(publisher)), name)
+        });
+    let locked_package = lockfile_data.as_ref().and_then(|lockfile| {
+        lockfile.packages.iter().find(|candidate| {
+            candidate.name == name
+                && publisher
+                    .as_deref()
+                    .is_none_or(|publisher| candidate.publisher == publisher)
+        })
+    });
+    let client = Client::default();
+    for relay in &relays {
+        client.add_relay(relay).await?;
+    }
+    connect_with_timeout(&client).await?;
+    add_user_relays(&client, pubkey.as_deref()).await?;
+    let root = default_store();
+    fs::create_dir_all(&root)?;
+    let result = resolve_release(
+        &client,
+        &root,
+        name,
+        publisher.as_deref(),
+        requirement.as_deref(),
+        &trusted_publishers,
+        locked_package,
+        &target_os,
+        &target_arch,
+    )
+    .await;
+    client.disconnect().await;
+    println!("{}", serde_json::to_string_pretty(&result?)?);
+    Ok(())
+}
+
 fn install_remote_package<'a, 'b>(
     state: &'a mut ResolverState<'b>,
     name: String,
@@ -1610,122 +1941,47 @@ fn install_remote_package<'a, 'b>(
             }
             release
         } else {
-            let releases = state
-                .client
-                .fetch_events(Filter::new().kind(Kind::Custom(RELEASE_KIND)).limit(500))
-                .timeout(std::time::Duration::from_secs(10))
-                .await?;
-            let revoked = state
-                .client
-                .fetch_events(Filter::new().kind(Kind::Custom(REVOCATION_KIND)).limit(500))
-                .timeout(std::time::Duration::from_secs(10))
-                .await?
-                .into_iter()
-                .filter(|event| event.verify().is_ok())
-                .filter(revocation_event_is_v1)
-                .filter_map(|event| {
-                    tag_value(&event, "e")
-                        .map(|release| (event.pubkey.to_hex(), release.to_owned()))
-                })
-                .collect::<Vec<_>>();
-            releases
-                .into_iter()
-                .filter(|event| event.verify().is_ok())
-                .filter(release_event_is_v1)
-                .filter(|event| {
-                    state.trusted_publishers.is_empty()
-                        || state
-                            .trusted_publishers
-                            .iter()
-                            .any(|trusted| trusted == &event.pubkey.to_hex())
-                })
-                .filter(|event| {
-                    !revoked.iter().any(|(publisher, release_id)| {
-                        publisher == &event.pubkey.to_hex() && release_id == &event.id.to_hex()
-                    })
-                })
-                .filter(|event| tag_value(event, "name") == Some(name.as_str()))
-                .filter(release_matches_host)
-                .filter(|event| {
-                    publisher
-                        .as_deref()
-                        .is_none_or(|publisher| event.pubkey.to_hex() == publisher)
-                })
-                .filter(|event| {
-                    locked_package.is_none_or(|package| {
-                        event.pubkey.to_hex() == package.publisher
-                            && tag_value(event, "version") == Some(package.version.as_str())
-                            && tag_value(event, "x") == Some(package.sha256.as_str())
-                    })
-                })
-                .filter(|event| {
-                    requirement.as_deref().is_none_or(|req| {
-                        VersionReq::parse(req)
-                            .ok()
-                            .zip(tag_value(event, "version").and_then(|v| Version::parse(v).ok()))
-                            .map(|(req, version)| req.matches(&version))
-                            .unwrap_or(false)
-                    })
-                })
-                .max_by_key(|event| {
-                    (
-                        tag_value(event, "version")
-                            .and_then(|v| Version::parse(v).ok())
-                            .unwrap_or_else(|| Version::new(0, 0, 0)),
-                        event.created_at.as_secs(),
-                        event.id.to_hex(),
-                    )
-                })
-                .with_context(|| format!("no verified release found for {name}"))?
+            fetch_verified_release(
+                state.client,
+                &name,
+                publisher.as_deref(),
+                requirement.as_deref(),
+                state.trusted_publishers,
+                locked_package,
+                OS,
+                ARCH,
+            )
+            .await?
         };
         if !state.offline {
             cache_release(state.root, &release)?;
         }
-        let artifact_event_id = tag_value(&release, "artifact")
-            .context("release has no artifact event")?
-            .parse::<EventId>()?;
         let artifact_event = if state.offline {
+            let artifact_event_id = tag_value(&release, "artifact")
+                .context("release has no artifact event")?
+                .parse::<EventId>()?;
             load_cached_artifact(state.root, artifact_event_id)?
         } else {
-            let artifact_events = state
-                .client
-                .fetch_events(Filter::new().kind(Kind::Custom(1063)).id(artifact_event_id))
-                .timeout(std::time::Duration::from_secs(10))
-                .await?;
-            let artifact_event = artifact_events
-                .into_iter()
-                .find(|event| event.verify().is_ok())
-                .context("no verified NIP-94 artifact event found")?;
+            let artifact_event = fetch_verified_artifact_event(state.client, &release).await?;
             cache_artifact(state.root, &artifact_event)?;
             artifact_event
         };
-        if artifact_event.pubkey != release.pubkey {
-            bail!("release and artifact event publishers do not match");
-        }
-        let sha256 = tag_value(&release, "x").context("release has no artifact hash")?;
-        validate_artifact_event(&artifact_event, &release.pubkey, sha256)?;
+        let (sha256, manifest) = resolved_manifest(&release, &artifact_event)?;
         let expected: Sha256Hash = sha256.parse()?;
-        let staging = state.root.join("downloads").join(sha256);
+        let staging = state.root.join("downloads").join(&sha256);
         fs::create_dir_all(&staging)?;
         let artifact_path = staging.join("artifact");
         if !artifact_path.exists() {
             if state.offline {
                 bail!("offline artifact cache is missing for SHA-256 {sha256}");
             }
-            let publisher_blossom_servers = discover_blossom_servers(state.client, &release.pubkey)
-                .await
-                .unwrap_or_default();
-            let mut urls = artifact_event
-                .tags
-                .iter()
-                .filter(|tag| tag.kind() == "url")
-                .filter_map(Tag::content)
-                .map(str::to_owned)
-                .collect::<Vec<String>>();
-            urls.extend(publisher_blossom_servers);
-            urls.extend(state.blossom_servers.iter().cloned());
-            urls.sort();
-            urls.dedup();
+            let urls = collect_artifact_urls(
+                state.client,
+                &release.pubkey,
+                &artifact_event,
+                state.blossom_servers,
+            )
+            .await;
             if urls.is_empty() {
                 bail!("artifact event has no URL");
             }
@@ -1758,7 +2014,6 @@ fn install_remote_package<'a, 'b>(
         if Sha256Hash::hash(&fs::read(&artifact_path)?) != expected {
             bail!("cached artifact hash does not match release");
         }
-        let manifest = manifest_from_release(&release, &artifact_path, sha256)?;
         let canonical_key = format!("{}/{}", manifest.publisher, manifest.name);
         for (selected_key, selected_manifest) in &state.selected {
             if manifest
@@ -1806,10 +2061,10 @@ fn tag_value<'a>(event: &'a Event, kind: &str) -> Option<&'a str> {
         .and_then(Tag::content)
 }
 
-fn release_matches_host(event: &Event) -> bool {
+fn release_matches_target(event: &Event, target_os: &str, target_arch: &str) -> bool {
     let os = tag_value(event, "os").unwrap_or("any");
     let arch = tag_value(event, "arch").unwrap_or("any");
-    (os == "any" || os == OS) && (arch == "any" || arch == ARCH)
+    (os == "any" || os == target_os) && (arch == "any" || arch == target_arch)
 }
 
 async fn add_user_relays(client: &Client, user_pubkey: Option<&str>) -> Result<()> {
@@ -4168,6 +4423,149 @@ mod tests {
         };
         let event = sign_artifact_event(&manifest, "https://blob.example/00", 1, &keys)?;
         validate_artifact_event(&event, &keys.public_key(), &manifest.sha256)?;
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_manifest_from_verified_release_and_artifact_events() -> Result<()> {
+        let keys = Keys::parse(&"11".repeat(32))?;
+        let manifest = Manifest {
+            publisher: keys.public_key().to_hex(),
+            name: "hello".into(),
+            version: "1.0.0".into(),
+            artifact: "hello.npk".into(),
+            sha256: "ab".repeat(32),
+            dependencies: vec![Dependency {
+                publisher: None,
+                name: "libfoo".into(),
+                requirement: ">=2.0.0".into(),
+            }],
+            conflicts: vec![],
+            artifact_event: None,
+            repo: None,
+            commit: None,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            format: "npk".into(),
+            runtime_requires: vec![],
+            provides: vec![],
+            post_install: vec![],
+        };
+        let artifact_event =
+            sign_artifact_event(&manifest, "https://blossom.example/artifact", 42, &keys)?;
+        let mut release_manifest = manifest.clone();
+        release_manifest.artifact_event = Some(artifact_event.id.to_hex());
+        let release = sign_release_event(&release_manifest, &"11".repeat(32), 1_700_000_000)?;
+
+        let (sha256, resolved) = resolved_manifest(&release, &artifact_event)?;
+        assert_eq!(sha256, manifest.sha256);
+        assert_eq!(resolved.publisher, keys.public_key().to_hex());
+        assert_eq!(resolved.name, "hello");
+        assert_eq!(resolved.version, "1.0.0");
+        assert_eq!(resolved.dependencies, manifest.dependencies);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_resolved_manifest_with_mismatched_artifact_publisher() -> Result<()> {
+        let keys = Keys::parse(&"11".repeat(32))?;
+        let other_keys = Keys::parse(&"22".repeat(32))?;
+        let manifest = Manifest {
+            publisher: keys.public_key().to_hex(),
+            name: "hello".into(),
+            version: "1.0.0".into(),
+            artifact: "hello.npk".into(),
+            sha256: "ab".repeat(32),
+            dependencies: vec![],
+            conflicts: vec![],
+            artifact_event: None,
+            repo: None,
+            commit: None,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            format: "npk".into(),
+            runtime_requires: vec![],
+            provides: vec![],
+            post_install: vec![],
+        };
+        let artifact_event = sign_artifact_event(
+            &manifest,
+            "https://blossom.example/artifact",
+            42,
+            &other_keys,
+        )?;
+        let mut release_manifest = manifest.clone();
+        release_manifest.artifact_event = Some(artifact_event.id.to_hex());
+        let release = sign_release_event(&release_manifest, &"11".repeat(32), 1_700_000_000)?;
+
+        let error = resolved_manifest(&release, &artifact_event).unwrap_err();
+        assert!(error.to_string().contains("publishers do not match"));
+        Ok(())
+    }
+
+    #[test]
+    fn release_matches_target_treats_any_as_wildcard() -> Result<()> {
+        let manifest = Manifest {
+            publisher: "npub1test".into(),
+            name: "hello".into(),
+            version: "1.0.0".into(),
+            artifact: "hello.npk".into(),
+            sha256: "00".repeat(32),
+            dependencies: vec![],
+            conflicts: vec![],
+            artifact_event: Some("artifact-event-id".into()),
+            repo: None,
+            commit: None,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            format: "npk".into(),
+            runtime_requires: vec![],
+            provides: vec![],
+            post_install: vec![],
+        };
+        let release = sign_release_event(&manifest, &"11".repeat(32), 1)?;
+        assert!(release_matches_target(&release, "linux", "x86_64"));
+        assert!(!release_matches_target(&release, "macos", "x86_64"));
+        assert!(!release_matches_target(&release, "linux", "aarch64"));
+
+        let mut any_manifest = manifest;
+        any_manifest.os = "any".into();
+        any_manifest.arch = "any".into();
+        let release = sign_release_event(&any_manifest, &"11".repeat(32), 1)?;
+        assert!(release_matches_target(&release, "macos", "aarch64"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolved_release_serializes_expected_fields() -> Result<()> {
+        let resolved = ResolvedRelease {
+            publisher: "pub".into(),
+            name: "hello".into(),
+            version: "1.0.0".into(),
+            sha256: "00".repeat(32),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            format: "npk".into(),
+            artifact_urls: vec!["https://example.com/a".into()],
+            dependencies: vec![],
+            conflicts: vec![],
+            runtime_requires: vec![],
+            provides: vec![],
+            release_event_id: "release-id".into(),
+            artifact_event_id: "artifact-id".into(),
+            verification: VerificationResult {
+                release_signature_valid: true,
+                artifact_event_signature_valid: true,
+                release_event_is_v1: true,
+                publisher_trusted: true,
+                revoked: false,
+            },
+        };
+        let value = serde_json::to_value(&resolved)?;
+        assert_eq!(value["publisher"], "pub");
+        assert_eq!(value["artifact_urls"][0], "https://example.com/a");
+        assert_eq!(value["verification"]["revoked"], false);
+        assert_eq!(value["verification"]["publisher_trusted"], true);
         Ok(())
     }
 
