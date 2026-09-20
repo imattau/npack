@@ -21,6 +21,7 @@ npack is an independent package manager whose registry metadata will be publishe
     npack search <query> --relay <relay-url>
     npack fetch <sha256> --server <blossom-url> --output <path>
     npack install-ref [<publisher>/]<name> --relay <relay-url> [--user|--system] [--store <path>] [--lockfile <path>] [--locked] [--allow-capability <capability>]
+    npack resolve [<publisher>/]<name> --relay <relay-url> [--requirement <semver>] [--lockfile <path>] [--locked]
     npack pack <source-directory> --output <package.npk>
     npack remove <publisher>/<name> [--user|--system] [--store <path>]
     npack inspect <artifact>
@@ -40,3 +41,4 @@ npack is an independent package manager whose registry metadata will be publishe
 - Runtime capabilities may be exact names or semver constraints matched against name@version provisions.
 - Post-install hooks are declarative and signed; create-directory is package-local, while register-service is explicitly capability-gated.
 - register-service is approved by the service-manager capability and installs a system or user systemd unit without enabling or starting it.
+- `npack resolve` performs the same relay discovery, trust/semver/os-arch filtering, revocation check, and NIP-94 verification as `npack install-ref`, but stops before downloading the artifact or installing anything, printing the resolved metadata as JSON for declarative package managers (e.g. Nix) to consume.

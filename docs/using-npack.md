@@ -284,6 +284,53 @@ different trust configurations separate. Results are then reduced to the
 newest valid SemVer release for each publisher/package pair, while retaining
 all platform artifacts belonging to that release.
 
+## Resolving release metadata for other package managers
+
+`npack resolve` performs the same relay discovery, trust and revocation
+checks, and signature verification as remote installation (steps 1-3 and 5
+above), but stops before downloading the artifact or installing anything:
+
+```bash
+npack resolve npub1.../myapp --relay wss://relay.example
+```
+
+The command prints the resolved publisher, name, version, SHA-256, candidate
+artifact URLs (NIP-94 `url` tags plus the publisher's declared Blossom
+servers), declared dependencies, and a verification summary as JSON on
+stdout, for example:
+
+```json
+{
+  "publisher": "...",
+  "name": "myapp",
+  "version": "1.0.0",
+  "sha256": "...",
+  "os": "linux",
+  "arch": "x86_64",
+  "format": "npk",
+  "artifact_urls": ["https://blossom.example/..."],
+  "dependencies": [],
+  "conflicts": [],
+  "runtime_requires": [],
+  "provides": [],
+  "release_event_id": "...",
+  "artifact_event_id": "...",
+  "verification": {
+    "release_signature_valid": true,
+    "artifact_event_signature_valid": true,
+    "release_event_is_v1": true,
+    "publisher_trusted": true,
+    "revoked": false
+  }
+}
+```
+
+This is intended for declarative package managers (such as Nix) that want to
+own fetching, unpacking, and rollback of the artifact themselves while
+leaving Nostr/Blossom discovery and trust verification to npack. `--relay`,
+`--requirement`, `--trusted-publisher`, `--pubkey`, `--lockfile`, and
+`--locked` behave the same as their `install-ref` counterparts.
+
 ## Configuration
 
 Configuration is stored at the platform's user config path, normally:
@@ -540,6 +587,7 @@ npack verify <file.npk-or-manifest.json>
 npack search <query> [--relay <url>]
 npack install <publisher>/<name> [options]
 npack install-ref <publisher>/<name> [options]  # compatibility alias
+npack resolve <publisher>/<name> --relay <url> [options]
 npack update <publisher>/<name> [options]
 npack list [--user|--system]
 npack verify-installed [--user|--system]
