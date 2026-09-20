@@ -265,6 +265,18 @@ older command name. The remote installation process is:
 Relays and storage servers are transport. They do not become package
 authorities merely because they served an event or file.
 
+Each step prints progress to stderr (connecting, resolving, downloading) so
+the process doesn't look hung during slow relay or Blossom lookups, and each
+installed package prints a confirmation to stdout on success:
+
+```text
+Connecting to 1 relay(s)... done in 0.4s
+Resolving npub1.../myapp...
+Downloading npub1.../myapp 1.0.0 (2 mirror(s))... done in 1.1s (48213 bytes)
+installed npub1.../myapp 1.0.0
+install order: npub1.../myapp
+```
+
 To check every package in the selected install store for a newer release:
 
 ```bash
