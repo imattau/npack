@@ -277,6 +277,24 @@ strictly newer version, then reuses normal dependency resolution, artifact
 hash verification, and install ordering. A targeted update remains available
 with `npack update <publisher>/package`.
 
+Pass `--check` to report available updates without installing anything, the
+`apt update` equivalent to `update`'s `apt upgrade`:
+
+```bash
+npack update --user --check
+npack update <publisher>/myapp --relay wss://relay.example --check
+```
+
+For each installed package this resolves and verifies the newest release
+matching a strictly newer version, the same way `update` does, but stops
+before downloading the artifact or installing it. Output looks like:
+
+```text
+npub1.../myapp 1.0.0 -> 1.1.0 available
+npub1.../otherapp 2.3.0 up to date
+1 update(s) available.
+```
+
 Search displays progress on stderr while querying relays. Successful search
 results are cached locally for five minutes. The cache key includes the query,
 relay set, trusted-publisher filter, and NIP-65 identity, keeping results from
