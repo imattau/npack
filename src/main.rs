@@ -1436,11 +1436,15 @@ async fn install_ref(
     } = options;
     let client = Client::default();
     if !offline {
+        eprint!("Connecting to {} relay(s)...", relays.len());
+        io::stderr().flush()?;
+        let started = Instant::now();
         for relay in relays {
             client.add_relay(relay).await?;
         }
         connect_with_timeout(&client).await?;
         add_user_relays(&client, user_pubkey).await?;
+        eprintln!(" done in {:.1}s", started.elapsed().as_secs_f32());
     }
     let (root, prefix) = install_paths(store, user);
     let mut state = ResolverState {
@@ -2231,6 +2235,9 @@ fn install_remote_package<'a, 'b>(
             bail!("package {install_key} is not present in the lockfile");
         }
         state.visiting.push(install_key.clone());
+        if !state.offline {
+            eprintln!("Resolving {}...", display_package_reference(&install_key));
+        }
         let release = if state.offline {
             let package = locked_package.context("offline installs require a lockfile")?;
             let release = load_cached_release(state.root, package)?;
@@ -2289,6 +2296,15 @@ fn install_remote_package<'a, 'b>(
             if urls.is_empty() {
                 bail!("artifact event has no URL");
             }
+            eprint!(
+                "Downloading {}/{} {} ({} mirror(s))...",
+                display_publisher(&manifest.publisher),
+                manifest.name,
+                manifest.version,
+                urls.len()
+            );
+            io::stderr().flush()?;
+            let started = Instant::now();
             let mut bytes = None;
             for url in urls {
                 let mut server_url = match Url::parse(&url) {
@@ -2310,10 +2326,16 @@ fn install_remote_package<'a, 'b>(
                     break;
                 }
             }
-            fs::write(
-                &artifact_path,
-                bytes.context("no artifact mirror returned the expected SHA-256")?,
-            )?;
+            let Some(bytes) = bytes else {
+                eprintln!(" failed");
+                bail!("no artifact mirror returned the expected SHA-256");
+            };
+            eprintln!(
+                " done in {:.1}s ({} bytes)",
+                started.elapsed().as_secs_f32(),
+                bytes.len()
+            );
+            fs::write(&artifact_path, bytes)?;
         }
         if Sha256Hash::hash(&fs::read(&artifact_path)?) != expected {
             bail!("cached artifact hash does not match release");
@@ -2351,6 +2373,12 @@ fn install_remote_package<'a, 'b>(
             state.user,
             state.allowed_capabilities,
         )?;
+        println!(
+            "installed {}/{} {}",
+            display_publisher(&manifest.publisher),
+            manifest.name,
+            manifest.version
+        );
         state.visiting.pop();
         state.installed.push(install_key);
         Ok(())
