@@ -196,23 +196,24 @@ Runs independently of the desktop-store phases above, for consumers that want
 to manage the resulting installation themselves (Nix, Guix, immutable/atomic
 distros) rather than have npack write to the filesystem.
 
-Shipped in v0.2.10 (originally requested for NixOS integration, see
+Shipped (originally requested for NixOS integration, see
 [issue #1](https://github.com/imattau/npack/issues/1)):
 
-- `npack resolve [<publisher>/]<name> --relay <relay-url>` performs the same
-  relay discovery, trust/semver/os-arch filtering, revocation check, and
-  NIP-94 artifact-event verification as `install-ref`, but stops before
+- `npack resolve [<publisher>/]<name> --relay <relay-url>` (v0.2.10) performs
+  the same relay discovery, trust/semver/os-arch filtering, revocation check,
+  and NIP-94 artifact-event verification as `install-ref`, but stops before
   downloading the artifact or installing anything.
 - Prints the resolved publisher key, name, version, SHA-256, candidate
   artifact URLs, declared dependencies, and a verification summary as JSON,
   so a derivation generator can fetch and unpack the artifact itself while
   npack continues to own Nostr/Blossom discovery and trust.
+- `npack resolve --recursive` walks the full declared dependency closure in
+  one call (cycle and version-conflict checks included) and prints a JSON
+  array of resolved entries, so a derivation generator does not need a
+  separate invocation per dependency.
 
 Remaining work:
 
-- A `--recursive` mode to walk and resolve the full dependency closure in one
-  call, for generating a complete set of derivations rather than requiring
-  one `npack resolve` invocation per dependency.
 - Real-world validation of the output shape against an actual NixOS
   flake/derivation, ideally with help from the issue's reporter.
 
