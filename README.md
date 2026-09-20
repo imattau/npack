@@ -105,6 +105,7 @@ npack search myapp --refresh   # bypass the local search cache
 npack install <publisher>/myapp --relay wss://relay.example --user
 npack update <publisher>/myapp --relay wss://relay.example --user
 npack update --user                 # check all installed packages
+npack update --user --check         # report available updates without installing
 
 # Resolve and verify release metadata without installing it -- useful for
 # declarative package managers (e.g. Nix) that want to fetch and manage the

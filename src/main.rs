@@ -321,6 +321,8 @@ enum Command {
         offline: bool,
         #[arg(long = "allow-capability")]
         allowed_capabilities: Vec<String>,
+        #[arg(long, help = "Report available updates without installing them")]
+        check: bool,
     },
     /// Resolve and verify a package's release metadata without installing it.
     ///
@@ -758,8 +760,21 @@ async fn main() -> Result<()> {
             locked,
             offline,
             allowed_capabilities,
+            check,
         } => {
-            if let Some(package) = package {
+            if check {
+                check_updates_command(
+                    package,
+                    relays,
+                    store,
+                    user,
+                    system,
+                    trusted_publishers,
+                    pubkey,
+                    &config,
+                )
+                .await?
+            } else if let Some(package) = package {
                 install_remote_command(
                     &package,
                     None,
@@ -952,6 +967,158 @@ async fn update_all_command(
     }
     println!("Updated {updated} package(s).");
     Ok(())
+}
+
+/// Reports available updates without downloading or installing anything.
+/// Mirrors `update_all_command`'s per-package release selection, but resolves
+/// metadata only (via `resolve_release`) instead of installing.
+#[allow(clippy::too_many_arguments)]
+async fn check_updates_command(
+    package: Option<String>,
+    relays: Vec<String>,
+    store: Option<PathBuf>,
+    user: bool,
+    system: bool,
+    trusted_publishers: Vec<String>,
+    pubkey: Option<String>,
+    config: &Config,
+) -> Result<()> {
+    let relays = configured_relays(relays, config)?;
+    let trusted_publishers = configured_publishers(trusted_publishers, config)?;
+    let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
+    let use_user = user || (!system && config.install.user);
+    let root = install_paths(store.as_deref(), use_user).0;
+    let client = Client::default();
+    for relay in &relays {
+        client.add_relay(relay).await?;
+    }
+    connect_with_timeout(&client).await?;
+    add_user_relays(&client, pubkey.as_deref()).await?;
+
+    let result = if let Some(package) = package {
+        let (publisher, name) = package
+            .split_once('/')
+            .map_or((None, package.as_str()), |(publisher, name)| {
+                (Some(normalize_publisher_reference(publisher)), name)
+            });
+        let installed = installed_packages(Some(&root))?;
+        let installed_match = installed.iter().find(|candidate| {
+            candidate.name == name
+                && publisher
+                    .as_deref()
+                    .is_none_or(|publisher| candidate.publisher == publisher)
+        });
+        let requirement = installed_match.map(|package| format!(">{}", package.version));
+        check_single_update(
+            &client,
+            &root,
+            name,
+            publisher.as_deref(),
+            requirement.as_deref(),
+            &trusted_publishers,
+            installed_match,
+        )
+        .await
+        .map(usize::from)
+    } else {
+        let mut installed = installed_packages(Some(&root))?;
+        installed.sort_by(|left, right| {
+            installed_package_reference(left).cmp(&installed_package_reference(right))
+        });
+        if installed.is_empty() {
+            println!("No installed packages.");
+            Ok(0)
+        } else {
+            let mut available = 0;
+            let mut outcome = Ok(());
+            for package in &installed {
+                let requirement = format!(">{}", package.version);
+                match check_single_update(
+                    &client,
+                    &root,
+                    &package.name,
+                    Some(package.publisher.as_str()),
+                    Some(&requirement),
+                    &trusted_publishers,
+                    Some(package),
+                )
+                .await
+                {
+                    Ok(true) => available += 1,
+                    Ok(false) => {}
+                    Err(error) => {
+                        outcome = Err(error);
+                        break;
+                    }
+                }
+            }
+            outcome.map(|()| available)
+        }
+    };
+    client.disconnect().await;
+    let available = result?;
+    if available > 0 {
+        println!("{available} update(s) available.");
+    } else {
+        println!("Everything is up to date.");
+    }
+    Ok(())
+}
+
+/// Checks a single package for an available update and prints its status.
+/// Returns `true` when a newer verified release exists.
+async fn check_single_update(
+    client: &Client,
+    root: &Path,
+    name: &str,
+    publisher: Option<&str>,
+    requirement: Option<&str>,
+    trusted_publishers: &[String],
+    installed: Option<&InstalledPackage>,
+) -> Result<bool> {
+    let reference = installed.map_or_else(
+        || {
+            publisher.map_or_else(
+                || name.to_owned(),
+                |publisher| format!("{}/{name}", display_publisher(publisher)),
+            )
+        },
+        installed_package_reference,
+    );
+    match resolve_release(
+        client,
+        root,
+        name,
+        publisher,
+        requirement,
+        trusted_publishers,
+        None,
+        OS,
+        ARCH,
+    )
+    .await
+    {
+        Ok(resolved) => {
+            match installed {
+                Some(package) => {
+                    println!(
+                        "{reference} {} -> {} available",
+                        package.version, resolved.version
+                    )
+                }
+                None => println!("{reference} {} available", resolved.version),
+            }
+            Ok(true)
+        }
+        Err(error) if error.to_string() == format!("no verified release found for {name}") => {
+            match installed {
+                Some(package) => println!("{reference} {} up to date", package.version),
+                None => return Err(error),
+            }
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn connect_with_timeout(client: &Client) -> Result<()> {

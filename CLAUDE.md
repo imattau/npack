@@ -20,7 +20,7 @@ npack is an independent package manager whose registry metadata will be publishe
     npack verify-event <event> <manifest>
     npack search <query> --relay <relay-url>
     npack fetch <sha256> --server <blossom-url> --output <path>
-    npack install-ref [<publisher>/]<name> --relay <relay-url> [--user|--system] [--store <path>] [--lockfile <path>] [--locked] [--allow-capability <capability>]
+    npack install-ref [<publisher>/]<name> --relay <relay-url> [--user|--system] [--store <path>] [--lockfile <path>] [--locked] [--allow-capability <capability>] [--check]
     npack resolve [<publisher>/]<name> --relay <relay-url> [--requirement <semver>] [--lockfile <path>] [--locked] [--recursive]
     npack pack <source-directory> --output <package.npk>
     npack remove <publisher>/<name> [--user|--system] [--store <path>]
@@ -42,3 +42,4 @@ npack is an independent package manager whose registry metadata will be publishe
 - Post-install hooks are declarative and signed; create-directory is package-local, while register-service is explicitly capability-gated.
 - register-service is approved by the service-manager capability and installs a system or user systemd unit without enabling or starting it.
 - `npack resolve` performs the same relay discovery, trust/semver/os-arch filtering, revocation check, and NIP-94 verification as `npack install-ref`, but stops before downloading the artifact or installing anything, printing the resolved metadata as JSON for declarative package managers (e.g. Nix) to consume. `--recursive` walks and resolves the full declared dependency closure in one call, printing a JSON array instead of a single object.
+- `npack update --check` (alias of `install-ref --check`) reports available updates for one or all installed packages without downloading or installing anything, the `apt update` counterpart to `update`'s `apt upgrade`.
