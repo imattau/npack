@@ -331,6 +331,23 @@ leaving Nostr/Blossom discovery and trust verification to npack. `--relay`,
 `--requirement`, `--trusted-publisher`, `--pubkey`, `--lockfile`, and
 `--locked` behave the same as their `install-ref` counterparts.
 
+Pass `--recursive` to resolve the full dependency closure in one call instead
+of a single package. The command then walks each declared dependency the same
+way `install-ref` would, but only resolves and verifies metadata rather than
+installing, and prints a JSON array of resolved entries -- one per
+publisher/package in the graph -- instead of a single object:
+
+```bash
+npack resolve npub1.../myapp --relay wss://relay.example --recursive
+```
+
+Dependency cycles are rejected the same way they are during installation, and
+a package required at incompatible versions by two different entries in the
+graph fails resolution rather than silently picking one. This is the shape a
+derivation generator would want to build one `fetchurl`-plus-unpack
+derivation per package in the graph, without needing a separate `npack
+resolve` invocation for every dependency.
+
 ## Configuration
 
 Configuration is stored at the platform's user config path, normally:

@@ -346,6 +346,11 @@ enum Command {
         lockfile: Option<PathBuf>,
         #[arg(long, requires = "lockfile")]
         locked: bool,
+        #[arg(
+            long,
+            help = "Resolve the full dependency closure and print a JSON array"
+        )]
+        recursive: bool,
     },
     /// Build a deterministic .npk archive from a package directory.
     Pack {
@@ -797,6 +802,7 @@ async fn main() -> Result<()> {
             pubkey,
             lockfile,
             locked,
+            recursive,
         } => {
             resolve_command(
                 &package,
@@ -808,6 +814,7 @@ async fn main() -> Result<()> {
                 pubkey,
                 lockfile,
                 locked,
+                recursive,
                 &config,
             )
             .await?
@@ -1792,6 +1799,112 @@ async fn resolve_release(
     })
 }
 
+struct ResolveClosureState<'a> {
+    client: &'a Client,
+    root: &'a Path,
+    trusted_publishers: &'a [String],
+    locked_packages: Option<&'a Lockfile>,
+    target_os: &'a str,
+    target_arch: &'a str,
+    visiting: Vec<String>,
+    resolved: Vec<ResolvedRelease>,
+}
+
+/// Resolves and verifies `name`'s release, then recurses into its declared
+/// dependencies, accumulating the full closure in `state.resolved`.
+/// Performs no downloads or installation.
+fn resolve_dependency_closure<'a, 'b>(
+    state: &'a mut ResolveClosureState<'b>,
+    name: String,
+    publisher: Option<String>,
+    requirement: Option<String>,
+) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        let install_key = publisher
+            .as_deref()
+            .map_or_else(|| name.clone(), |publisher| format!("{publisher}/{name}"));
+        if state
+            .visiting
+            .iter()
+            .any(|visiting_name| visiting_name == &install_key)
+        {
+            bail!(
+                "dependency cycle detected: {} -> {}",
+                state.visiting.join(" -> "),
+                name
+            );
+        }
+        let existing = state.resolved.iter().find(|resolved| {
+            resolved.name == name
+                && publisher
+                    .as_deref()
+                    .is_none_or(|publisher| resolved.publisher == publisher)
+        });
+        if let Some(existing) = existing {
+            if let Some(requirement) = &requirement {
+                let requirement = VersionReq::parse(requirement)?;
+                let version = Version::parse(&existing.version)?;
+                if !requirement.matches(&version) {
+                    bail!(
+                        "resolved package {}/{} does not satisfy requirement {requirement}",
+                        existing.publisher,
+                        existing.name
+                    );
+                }
+            }
+            return Ok(());
+        }
+        let locked_package = if let Some(lockfile) = state.locked_packages {
+            let matches = lockfile
+                .packages
+                .iter()
+                .filter(|package| {
+                    package.name == name
+                        && publisher
+                            .as_deref()
+                            .is_none_or(|publisher| package.publisher == publisher)
+                })
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [package] => Some(*package),
+                [] => None,
+                _ => bail!("package {install_key} is ambiguous in the lockfile"),
+            }
+        } else {
+            None
+        };
+        if state.locked_packages.is_some() && locked_package.is_none() {
+            bail!("package {install_key} is not present in the lockfile");
+        }
+        state.visiting.push(install_key);
+        let resolved = resolve_release(
+            state.client,
+            state.root,
+            &name,
+            publisher.as_deref(),
+            requirement.as_deref(),
+            state.trusted_publishers,
+            locked_package,
+            state.target_os,
+            state.target_arch,
+        )
+        .await?;
+        let dependencies = resolved.dependencies.clone();
+        state.resolved.push(resolved);
+        for dependency in dependencies {
+            resolve_dependency_closure(
+                state,
+                dependency.name,
+                dependency.publisher,
+                Some(dependency.requirement),
+            )
+            .await?;
+        }
+        state.visiting.pop();
+        Ok(())
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn resolve_command(
     package: &str,
@@ -1803,6 +1916,7 @@ async fn resolve_command(
     pubkey: Option<String>,
     lockfile: Option<PathBuf>,
     locked: bool,
+    recursive: bool,
     config: &Config,
 ) -> Result<()> {
     let target_os = os.unwrap_or_else(|| OS.to_owned());
@@ -1819,14 +1933,6 @@ async fn resolve_command(
         .map_or((None, package), |(publisher, name)| {
             (Some(normalize_publisher_reference(publisher)), name)
         });
-    let locked_package = lockfile_data.as_ref().and_then(|lockfile| {
-        lockfile.packages.iter().find(|candidate| {
-            candidate.name == name
-                && publisher
-                    .as_deref()
-                    .is_none_or(|publisher| candidate.publisher == publisher)
-        })
-    });
     let client = Client::default();
     for relay in &relays {
         client.add_relay(relay).await?;
@@ -1835,20 +1941,51 @@ async fn resolve_command(
     add_user_relays(&client, pubkey.as_deref()).await?;
     let root = default_store();
     fs::create_dir_all(&root)?;
-    let result = resolve_release(
-        &client,
-        &root,
-        name,
-        publisher.as_deref(),
-        requirement.as_deref(),
-        &trusted_publishers,
-        locked_package,
-        &target_os,
-        &target_arch,
-    )
-    .await;
-    client.disconnect().await;
-    println!("{}", serde_json::to_string_pretty(&result?)?);
+    if recursive {
+        let mut state = ResolveClosureState {
+            client: &client,
+            root: &root,
+            trusted_publishers: &trusted_publishers,
+            locked_packages: lockfile_data.as_ref(),
+            target_os: &target_os,
+            target_arch: &target_arch,
+            visiting: Vec::new(),
+            resolved: Vec::new(),
+        };
+        let result = resolve_dependency_closure(
+            &mut state,
+            name.to_owned(),
+            publisher.clone(),
+            requirement.clone(),
+        )
+        .await;
+        client.disconnect().await;
+        result?;
+        println!("{}", serde_json::to_string_pretty(&state.resolved)?);
+    } else {
+        let locked_package = lockfile_data.as_ref().and_then(|lockfile| {
+            lockfile.packages.iter().find(|candidate| {
+                candidate.name == name
+                    && publisher
+                        .as_deref()
+                        .is_none_or(|publisher| candidate.publisher == publisher)
+            })
+        });
+        let result = resolve_release(
+            &client,
+            &root,
+            name,
+            publisher.as_deref(),
+            requirement.as_deref(),
+            &trusted_publishers,
+            locked_package,
+            &target_os,
+            &target_arch,
+        )
+        .await;
+        client.disconnect().await;
+        println!("{}", serde_json::to_string_pretty(&result?)?);
+    }
     Ok(())
 }
 
@@ -4566,6 +4703,130 @@ mod tests {
         assert_eq!(value["artifact_urls"][0], "https://example.com/a");
         assert_eq!(value["verification"]["revoked"], false);
         assert_eq!(value["verification"]["publisher_trusted"], true);
+        Ok(())
+    }
+
+    fn sample_resolved_release(publisher: &str, name: &str, version: &str) -> ResolvedRelease {
+        ResolvedRelease {
+            publisher: publisher.into(),
+            name: name.into(),
+            version: version.into(),
+            sha256: "00".repeat(32),
+            os: "any".into(),
+            arch: "any".into(),
+            format: "npk".into(),
+            artifact_urls: vec![],
+            dependencies: vec![],
+            conflicts: vec![],
+            runtime_requires: vec![],
+            provides: vec![],
+            release_event_id: "release-id".into(),
+            artifact_event_id: "artifact-id".into(),
+            verification: VerificationResult {
+                release_signature_valid: true,
+                artifact_event_signature_valid: true,
+                release_event_is_v1: true,
+                publisher_trusted: true,
+                revoked: false,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_dependency_closure_rejects_a_cycle() -> Result<()> {
+        let dir = tempdir()?;
+        let client = Client::default();
+        let mut state = ResolveClosureState {
+            client: &client,
+            root: dir.path(),
+            trusted_publishers: &[],
+            locked_packages: None,
+            target_os: "any",
+            target_arch: "any",
+            visiting: vec!["pub/foo".into()],
+            resolved: vec![],
+        };
+        let error = resolve_dependency_closure(&mut state, "foo".into(), Some("pub".into()), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("dependency cycle detected"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_dependency_closure_skips_an_already_resolved_package() -> Result<()> {
+        let dir = tempdir()?;
+        let client = Client::default();
+        let mut state = ResolveClosureState {
+            client: &client,
+            root: dir.path(),
+            trusted_publishers: &[],
+            locked_packages: None,
+            target_os: "any",
+            target_arch: "any",
+            visiting: vec![],
+            resolved: vec![sample_resolved_release("pub", "foo", "1.5.0")],
+        };
+        resolve_dependency_closure(
+            &mut state,
+            "foo".into(),
+            Some("pub".into()),
+            Some(">=1.0.0".into()),
+        )
+        .await?;
+        assert_eq!(state.resolved.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_dependency_closure_rejects_an_unsatisfied_already_resolved_requirement()
+    -> Result<()> {
+        let dir = tempdir()?;
+        let client = Client::default();
+        let mut state = ResolveClosureState {
+            client: &client,
+            root: dir.path(),
+            trusted_publishers: &[],
+            locked_packages: None,
+            target_os: "any",
+            target_arch: "any",
+            visiting: vec![],
+            resolved: vec![sample_resolved_release("pub", "foo", "1.5.0")],
+        };
+        let error = resolve_dependency_closure(
+            &mut state,
+            "foo".into(),
+            Some("pub".into()),
+            Some(">=2.0.0".into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("does not satisfy requirement"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_dependency_closure_requires_a_lockfile_entry() -> Result<()> {
+        let dir = tempdir()?;
+        let client = Client::default();
+        let lockfile = Lockfile {
+            version: 1,
+            packages: vec![],
+        };
+        let mut state = ResolveClosureState {
+            client: &client,
+            root: dir.path(),
+            trusted_publishers: &[],
+            locked_packages: Some(&lockfile),
+            target_os: "any",
+            target_arch: "any",
+            visiting: vec![],
+            resolved: vec![],
+        };
+        let error = resolve_dependency_closure(&mut state, "foo".into(), None, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("is not present in the lockfile"));
         Ok(())
     }
 
