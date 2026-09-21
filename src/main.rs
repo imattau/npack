@@ -2193,7 +2193,7 @@ fn resolve_dependency_closure<'a, 'b>(
     name: String,
     publisher: Option<String>,
     requirement: Option<String>,
-) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         let install_key = publisher
             .as_deref()
@@ -2369,7 +2369,7 @@ fn install_remote_package<'a, 'b>(
     name: String,
     publisher: Option<String>,
     requirement: Option<String>,
-) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         let install_key = publisher.as_deref().map_or_else(
             || name.to_owned(),
@@ -3111,15 +3111,15 @@ async fn run_daemon(socket: Option<PathBuf>, config: Config) -> Result<()> {
     let listener = tokio::net::UnixListener::bind(&socket_path)
         .with_context(|| format!("binding {}", socket_path.display()))?;
     eprintln!("npackd listening on {}", socket_path.display());
-    // Connections are handled one at a time rather than spawned onto the
-    // runtime: the recursive dependency-install future is not `Send` (it
-    // uses `Pin<Box<dyn Future + 'a>>` without a `Send` bound), which rules
-    // out `tokio::spawn`. Concurrent request handling is future work.
+    let config = std::sync::Arc::new(config);
     loop {
         let (stream, _) = listener.accept().await?;
-        if let Err(error) = handle_daemon_connection(stream, &config).await {
-            eprintln!("npackd connection error: {error:#}");
-        }
+        let config = config.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle_daemon_connection(stream, &config).await {
+                eprintln!("npackd connection error: {error:#}");
+            }
+        });
     }
 }
 
@@ -6626,6 +6626,51 @@ mod tests {
 
         let ((), result) = tokio::join!(server, client_work);
         result?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn daemon_serves_concurrent_connections() -> Result<()> {
+        let dir = tempdir()?;
+        let socket_path = dir.path().join("npackd.sock");
+        let store = dir.path().join("store");
+        fs::create_dir_all(&store)?;
+
+        let daemon = tokio::spawn(run_daemon(Some(socket_path.clone()), Config::default()));
+        // run_daemon loops forever binding the socket at startup; poll until
+        // the socket file exists rather than sleeping a fixed guess.
+        for _ in 0..100 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        async fn list_installed(socket_path: &Path, store: &Path) -> Result<serde_json::Value> {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            let mut client = tokio::net::UnixStream::connect(socket_path).await?;
+            let request = serde_json::json!({
+                "id": 1,
+                "method": "ListInstalled",
+                "params": { "store": store },
+            });
+            client
+                .write_all(format!("{}\n", request).as_bytes())
+                .await?;
+            let (read_half, _write_half) = client.into_split();
+            let mut lines = BufReader::new(read_half).lines();
+            let line = lines.next_line().await?.context("expected a reply")?;
+            Ok(serde_json::from_str(&line)?)
+        }
+
+        let (first, second) = tokio::join!(
+            list_installed(&socket_path, &store),
+            list_installed(&socket_path, &store)
+        );
+        assert_eq!(first?["result"], serde_json::json!([]));
+        assert_eq!(second?["result"], serde_json::json!([]));
+
+        daemon.abort();
         Ok(())
     }
 }
