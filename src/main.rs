@@ -4650,6 +4650,156 @@ fn install_with_capabilities(
     )
 }
 
+fn store_lock_path(root: &Path) -> PathBuf {
+    root.join("npack.lock")
+}
+
+fn transaction_journal_path(root: &Path) -> PathBuf {
+    root.join("transaction.json")
+}
+
+fn installed_json_backup_path(root: &Path) -> PathBuf {
+    root.join("installed.json.bak")
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[derive(Serialize, Deserialize)]
+struct TransactionJournal {
+    pid: u32,
+    operation: String,
+    package: String,
+    package_dir: PathBuf,
+    package_dir_pre_existed: bool,
+}
+
+/// Restores `installed.json` from its pre-transaction backup and, for a
+/// transaction that created a brand-new package directory, removes it.
+/// Removal itself is not undone: rolling that back would require backing up
+/// every file before deleting it, so an interrupted `remove` only recovers
+/// `installed.json` consistency, not deleted files.
+fn rollback_transaction(root: &Path, journal_path: &Path, backup_path: &Path) -> Result<()> {
+    if let Ok(bytes) = fs::read(journal_path)
+        && let Ok(journal) = serde_json::from_slice::<TransactionJournal>(&bytes)
+    {
+        if backup_path.exists() {
+            fs::copy(backup_path, root.join("installed.json"))?;
+        } else {
+            let _ = fs::remove_file(root.join("installed.json"));
+        }
+        if !journal.package_dir_pre_existed && journal.package_dir.exists() {
+            fs::remove_dir_all(&journal.package_dir)?;
+        }
+    }
+    let _ = fs::remove_file(journal_path);
+    let _ = fs::remove_file(backup_path);
+    Ok(())
+}
+
+/// Acquires the exclusive per-store lock, first detecting and recovering a
+/// transaction abandoned by a process that no longer exists (an interrupted
+/// install or remove, e.g. from a crash or `kill -9`).
+fn acquire_store_lock(root: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(root)?;
+    let lock_path = store_lock_path(root);
+    match fs::read_to_string(&lock_path) {
+        Ok(contents) => {
+            let pid: u32 = contents.trim().parse().unwrap_or(0);
+            if pid != 0 && process_is_alive(pid) {
+                bail!("another npack operation is already in progress (pid {pid})");
+            }
+            eprintln!("recovering from an interrupted npack operation (stale lock, pid {pid})");
+            rollback_transaction(
+                root,
+                &transaction_journal_path(root),
+                &installed_json_backup_path(root),
+            )?;
+            match fs::remove_file(&lock_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            bail!("another npack operation is already in progress");
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("acquiring npack store lock at {}", lock_path.display()));
+        }
+    };
+    write!(file, "{}", std::process::id())?;
+    Ok(lock_path)
+}
+
+/// An in-progress mutation of a package store: holds the exclusive store
+/// lock and a journal that can undo `installed.json` (and a freshly created
+/// package directory) if the transaction is dropped without `commit()`,
+/// whether from an early `?` return or the process being killed outright.
+struct StoreTransaction {
+    root: PathBuf,
+    lock_path: PathBuf,
+    journal_path: PathBuf,
+    backup_path: PathBuf,
+    committed: bool,
+}
+
+impl StoreTransaction {
+    fn begin(root: &Path, operation: &str, package: &str, package_dir: &Path) -> Result<Self> {
+        let lock_path = acquire_store_lock(root)?;
+        let journal_path = transaction_journal_path(root);
+        let backup_path = installed_json_backup_path(root);
+        let installed_path = root.join("installed.json");
+        if installed_path.exists() {
+            fs::copy(&installed_path, &backup_path)?;
+        } else {
+            let _ = fs::remove_file(&backup_path);
+        }
+        let journal = TransactionJournal {
+            pid: std::process::id(),
+            operation: operation.to_owned(),
+            package: package.to_owned(),
+            package_dir: package_dir.to_path_buf(),
+            package_dir_pre_existed: package_dir.exists(),
+        };
+        fs::write(&journal_path, serde_json::to_vec_pretty(&journal)?)?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            lock_path,
+            journal_path,
+            backup_path,
+            committed: false,
+        })
+    }
+
+    fn commit(mut self) -> Result<()> {
+        self.committed = true;
+        let _ = fs::remove_file(&self.journal_path);
+        let _ = fs::remove_file(&self.backup_path);
+        Ok(())
+    }
+}
+
+impl Drop for StoreTransaction {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = rollback_transaction(&self.root, &self.journal_path, &self.backup_path);
+        }
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
 fn install_with_capabilities_at(
     manifest: &Manifest,
     manifest_path: &Path,
@@ -4666,7 +4816,35 @@ fn install_with_capabilities_at(
         .join(&manifest.publisher)
         .join(&manifest.name)
         .join(&manifest.version);
-    fs::create_dir_all(&package_dir)
+    let transaction = StoreTransaction::begin(
+        &root,
+        "install",
+        &format!("{}/{}", manifest.publisher, manifest.name),
+        &package_dir,
+    )?;
+    let installed = install_locked(
+        manifest,
+        manifest_path,
+        &root,
+        prefix,
+        &package_dir,
+        user,
+        allowed_capabilities,
+    )?;
+    transaction.commit()?;
+    Ok(installed)
+}
+
+fn install_locked(
+    manifest: &Manifest,
+    manifest_path: &Path,
+    root: &Path,
+    prefix: &Path,
+    package_dir: &Path,
+    user: bool,
+    allowed_capabilities: &[String],
+) -> Result<InstalledPackage> {
+    fs::create_dir_all(package_dir)
         .with_context(|| format!("creating {}", package_dir.display()))?;
     let destination = package_dir.join(
         manifest
@@ -4676,7 +4854,7 @@ fn install_with_capabilities_at(
     );
     fs::copy(artifact_path(manifest, manifest_path), &destination)
         .context("copying verified artifact")?;
-    let existing_packages = installed_packages(Some(&root))?;
+    let existing_packages = installed_packages(Some(root))?;
     if manifest.format == "npk" {
         let payload_paths = npk_entry_paths(&destination)?
             .into_iter()
@@ -4724,7 +4902,7 @@ fn install_with_capabilities_at(
     let mut packages = existing_packages;
     packages.retain(|p| !(p.publisher == installed.publisher && p.name == installed.name));
     packages.push(installed.clone());
-    fs::create_dir_all(&root)?;
+    fs::create_dir_all(root)?;
     fs::write(
         root.join("installed.json"),
         serde_json::to_vec_pretty(&packages)?,
@@ -5347,7 +5525,16 @@ fn remove_package_at(package: &str, store: Option<&Path>, user: bool) -> Result<
         bail!("package reference must be publisher/name");
     }
     let root = install_paths(store, user).0;
-    let packages = installed_packages(Some(&root))?;
+    let transaction =
+        StoreTransaction::begin(&root, "remove", &format!("{publisher}/{name}"), &root)?;
+    let removed = remove_locked(&publisher, name, package, &root)?;
+    transaction.commit()?;
+    println!("removed {package} ({removed} version(s))");
+    Ok(())
+}
+
+fn remove_locked(publisher: &str, name: &str, package: &str, root: &Path) -> Result<usize> {
+    let packages = installed_packages(Some(root))?;
     if packages.iter().any(|installed| {
         installed.dependencies.iter().any(|dependency| {
             dependency.name == name
@@ -5435,8 +5622,7 @@ fn remove_package_at(package: &str, store: Option<&Path>, user: bool) -> Result<
         root.join("installed.json"),
         serde_json::to_vec_pretty(&remaining)?,
     )?;
-    println!("removed {package} ({removed} version(s))");
-    Ok(())
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -5478,6 +5664,88 @@ mod tests {
         remove_package("npub1test/hello", Some(&store))?;
         assert!(installed_packages(Some(&store))?.is_empty());
         assert!(!installed.artifact.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn install_refuses_to_run_while_another_transaction_holds_the_store_lock() -> Result<()> {
+        let dir = tempdir()?;
+        let store = dir.path().join("store");
+        let held = StoreTransaction::begin(
+            &store,
+            "install",
+            "pub/pkg",
+            &store.join("packages/pub/pkg/1.0.0"),
+        )?;
+        let blocked = StoreTransaction::begin(
+            &store,
+            "install",
+            "pub/other",
+            &store.join("packages/pub/other/1.0.0"),
+        );
+        let error = blocked.map(|_| ()).unwrap_err();
+        assert!(error.to_string().contains("already in progress"));
+        held.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn recovers_an_interrupted_transaction_left_by_a_dead_process() -> Result<()> {
+        let dir = tempdir()?;
+        let store = dir.path().join("store");
+        fs::create_dir_all(&store)?;
+        fs::write(
+            store.join("installed.json"),
+            serde_json::to_vec(&Vec::<InstalledPackage>::new())?,
+        )?;
+        fs::copy(
+            store.join("installed.json"),
+            installed_json_backup_path(&store),
+        )?;
+
+        // A pid this unlikely to be alive stands in for a process that was
+        // killed mid-transaction, leaving its lock, journal, and backup
+        // behind alongside a partially written package directory.
+        let dead_pid = 999_999u32;
+        fs::write(store_lock_path(&store), dead_pid.to_string())?;
+        let orphan_dir = store.join("packages/pub/orphan/1.0.0");
+        fs::create_dir_all(&orphan_dir)?;
+        fs::write(orphan_dir.join("marker"), b"junk")?;
+        fs::write(
+            store.join("installed.json"),
+            serde_json::to_vec(&vec![InstalledPackage {
+                publisher: "pub".into(),
+                name: "orphan".into(),
+                version: "1.0.0".into(),
+                sha256: "0".repeat(64),
+                artifact: orphan_dir.join("marker"),
+                dependencies: vec![],
+                conflicts: vec![],
+                files: vec![],
+                runtime_requires: vec![],
+                provides: vec![],
+            }])?,
+        )?;
+        let journal = TransactionJournal {
+            pid: dead_pid,
+            operation: "install".into(),
+            package: "pub/orphan".into(),
+            package_dir: orphan_dir.clone(),
+            package_dir_pre_existed: false,
+        };
+        fs::write(
+            transaction_journal_path(&store),
+            serde_json::to_vec_pretty(&journal)?,
+        )?;
+
+        let lock_path = acquire_store_lock(&store)?;
+
+        assert!(!orphan_dir.exists());
+        assert!(installed_packages(Some(&store))?.is_empty());
+        assert!(!transaction_journal_path(&store).exists());
+        assert!(!installed_json_backup_path(&store).exists());
+
+        fs::remove_file(lock_path)?;
         Ok(())
     }
 

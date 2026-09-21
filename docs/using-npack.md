@@ -701,6 +701,25 @@ npack remove npub1.../myapp --user
 Removal is refused when another installed package depends on the package or
 when removing it would leave a required runtime capability unavailable.
 
+### Transaction locking and interrupted-install recovery
+
+Every `install`/`remove` against a given store (system, `--user`, or a
+`--store <path>` used for isolated/test installs) is serialized by an
+exclusive lock, so running two npack operations against the same store at
+once fails fast rather than racing:
+
+```text
+Error: another npack operation is already in progress (pid 12345)
+```
+
+If an npack process is killed mid-install or mid-remove (a crash, `kill -9`,
+a power loss), the next operation against that store detects that the pid
+holding the lock is no longer running, prints a recovery notice, restores
+`installed.json` to its state before the interrupted transaction, and
+removes any package directory that transaction had newly created -- then
+proceeds normally. No manual cleanup of the store is needed after an
+interrupted operation.
+
 ## Troubleshooting
 
 ### `no verified release found`

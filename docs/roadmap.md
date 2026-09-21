@@ -88,7 +88,7 @@ Remaining work for a future phase: per-byte/per-file download progress
 within a single package's fetch, if a GUI needs a progress bar rather than a
 status line.
 
-## Phase 3: Security and privilege separation
+## Phase 3: Security and privilege separation (in progress)
 
 Do this before connecting a graphical store. Separate user and system
 operations:
@@ -104,6 +104,35 @@ declarations, file ownership/conflicts, rollback, transaction locking, and
 interrupted-install recovery.
 
 Goal: a credible security model for distro-facing integration.
+
+Shipped: transaction locking, rollback, and interrupted-install recovery.
+Every mutating store operation (`install`, `remove`, and the daemon's
+`Install`/`Remove`/`Update`) is wrapped in a `StoreTransaction`: it takes an
+exclusive `npack.lock` on the store root (so two operations against the same
+store can't race on `installed.json` or a package directory -- a concurrent
+attempt fails fast with "another npack operation is already in progress"
+rather than corrupting state), snapshots `installed.json` before mutating
+it, and records a small journal noting which package directory the
+transaction is about to create. If the operation returns an error, the
+transaction's `Drop` restores `installed.json` from the snapshot and removes
+the package directory if the transaction had created it -- the same
+mechanism Rust already used for a single package's file-level rollback
+(`install_staged_npk`'s backup-and-restore), now applied at the whole-store
+level. If the process is killed outright (`kill -9`, a crash, a power loss)
+mid-transaction, the lock, journal, and backup are left on disk; the next
+`install` or `remove` against that store notices the lock's pid is no longer
+alive, treats this as an interrupted transaction, and performs the same
+restore-and-clean-up before proceeding -- so a killed npack process cannot
+leave a store's bookkeeping pointing at a half-written package. This does
+not undo a `remove`'s file deletions themselves (only `installed.json`
+consistency), since that would require backing up every file before
+deleting it; formalising file ownership/conflicts already existed
+(`ensure_install_paths_available`, `remove_stale_files`) and was not part of
+this slice.
+
+Remaining work for this phase: the `npackd-user`/`npackd-system` daemon
+split and PolicyKit-gated privileged installation, plus richer publisher
+trust/revocation and capability-declaration formalisation.
 
 ## Phase 4: App catalogue and index
 
