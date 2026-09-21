@@ -176,6 +176,7 @@ The important fields are:
 | `runtime_requires` | Host capabilities needed by the package, such as ELF libraries. |
 | `provides` | Capabilities supplied to other packages. |
 | `post_install` | Declarative, capability-gated installation actions. |
+| `app` | Optional desktop-store metadata: `summary`, `description`, `homepage`, `license`, `categories`, `icon`, `screenshots`, `desktop_file`, `release_date`. See [AppStream metadata](#appstream-metadata) below. |
 
 An external publishing manifest must contain the final SHA-256:
 
@@ -192,6 +193,58 @@ metadata by hand:
 ```bash
 npack manifest ./myapp-1.0.0.npk \
   --output ./myapp-1.0.0.manifest.json
+```
+
+## AppStream metadata
+
+A manifest's optional `app` object describes the package in the language
+Linux application stores already understand:
+
+```json
+{
+  "publisher": "npub1...",
+  "name": "myapp",
+  "version": "1.0.0",
+  "artifact": "myapp-1.0.0.npk",
+  "sha256": "",
+  "app": {
+    "summary": "A friendly greeting",
+    "description": "Prints a friendly greeting to the terminal.",
+    "homepage": "https://example.com/myapp",
+    "license": "MIT",
+    "categories": ["Utility"],
+    "icon": "share/icons/myapp.png",
+    "screenshots": ["https://example.com/myapp/screenshot.png"],
+    "desktop_file": "myapp.desktop",
+    "release_date": "2026-01-15"
+  }
+}
+```
+
+`icon` and `desktop_file` are package-relative paths to files included in the
+`.npk`; `npack pack` checks both exist in the source directory, and validates
+`desktop_file` as a syntactically correct freedesktop.org
+[Desktop Entry](https://specifications.freedesktop.org/desktop-entry-spec/latest/)
+file (a `[Desktop Entry]` group with `Type` and `Name`, plus `Exec` when
+`Type=Application`).
+
+Generate an [AppStream](https://www.freedesktop.org/software/appstream/docs/)
+component document from a built archive:
+
+```bash
+npack appstream ./myapp-1.0.0.npk --output ./myapp.metainfo.xml
+```
+
+Packages without a `desktop_file` are rendered as a `console-application`
+component advertising `<provides><binary>myapp</binary></provides>`; packages
+with one are rendered as a `desktop-application` component advertising
+`<launchable type="desktop-id">myapp.desktop</launchable>`. Component IDs are
+namespaced `io.npack.<publisher>.<name>`, since npack publishers are Nostr
+public keys rather than domains. Validate the generated document with
+[`appstreamcli`](https://www.freedesktop.org/software/appstream/docs/man/appstreamcli.1.html):
+
+```bash
+appstreamcli validate --no-net ./myapp.metainfo.xml
 ```
 
 ## Dependencies and install order
@@ -642,4 +695,5 @@ npack list [--user|--system]
 npack verify-installed [--user|--system]
 npack remove <publisher>/<name> [--user|--system]
 npack publish <manifest> --secret-key <key> [options]
+npack appstream <file.npk> [--output <metainfo.xml>]
 ```

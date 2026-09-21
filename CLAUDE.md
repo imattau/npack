@@ -25,6 +25,7 @@ npack is an independent package manager whose registry metadata will be publishe
     npack pack <source-directory> --output <package.npk>
     npack remove <publisher>/<name> [--user|--system] [--store <path>]
     npack inspect <artifact>
+    npack appstream <artifact> [--output <metainfo.xml>]
 
 ## Conventions
 
@@ -43,3 +44,5 @@ npack is an independent package manager whose registry metadata will be publishe
 - register-service is approved by the service-manager capability and installs a system or user systemd unit without enabling or starting it.
 - `npack resolve` performs the same relay discovery, trust/semver/os-arch filtering, revocation check, and NIP-94 verification as `npack install-ref`, but stops before downloading the artifact or installing anything, printing the resolved metadata as JSON for declarative package managers (e.g. Nix) to consume. `--recursive` walks and resolves the full declared dependency closure in one call, printing a JSON array instead of a single object.
 - `npack update --check` (alias of `install-ref --check`) reports available updates for one or all installed packages without downloading or installing anything, the `apt update` counterpart to `update`'s `apt upgrade`.
+- A manifest's optional `app` object (`summary`, `description`, `homepage`, `license`, `categories`, `icon`, `screenshots`, `desktop_file`, `release_date`) carries desktop-store metadata; `icon` and `desktop_file` are package-relative paths validated to exist and, for `desktop_file`, to be a syntactically valid freedesktop.org Desktop Entry file with `Exec` required when `Type=Application`.
+- `npack appstream` maps a manifest's `app` metadata to an AppStream `<component>` document per the freedesktop.org AppStream spec: `console-application` when there is no `desktop_file` (advertising `<provides><binary>`), `desktop-application` otherwise (advertising `<launchable type="desktop-id">`). Component IDs are namespaced `io.npack.<publisher>.<name>` since publishers are Nostr pubkeys, not domains.
