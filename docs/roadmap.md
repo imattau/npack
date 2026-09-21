@@ -231,7 +231,7 @@ carry. `npack info` reflects this honestly by not fabricating AppStream
 fields; publishing `app` metadata to Nostr is unstarted future work, likely
 alongside Phase 5's reference GUI once there is a consumer that wants it.
 
-## Phase 5: Reference GUI
+## Phase 5: Reference GUI (done)
 
 Build a small npack GUI to exercise the service API:
 
@@ -244,6 +244,38 @@ Build a small npack GUI to exercise the service API:
 
 This proves that `npackd` is frontend-independent before integrating with an
 existing store.
+
+Shipped: `npack-gui`, a small `egui`/`eframe` desktop app in its own crate
+(the repo is now a Cargo workspace: `npack-cli` for the existing CLI/daemon,
+`npack-gui` for this). It talks to npackd purely over the documented
+newline-delimited-JSON Unix-socket protocol (`npack-gui/src/client.rs`) --
+it has no dependency on and no special access to the `npack` crate's
+internals, so it is exactly as frontend-independent a client as a COSMIC,
+GNOME, or KDE integration would be.
+
+Three tabs cover the roadmap list: **Installed** (`ListInstalled`, with
+per-package Details/Remove), **Search** (`Search`, with a checkbox to
+rebuild the local catalogue from relays first via the existing
+`"refresh": true` param, and per-result Details/Install), and **Updates**
+(`CheckUpdates`). **Details** calls `GetPackage` and renders the raw
+response. **Install** uses `"async": true` and polls `GetTransaction` on a
+background thread, so the status bar shows real progress
+(`connecting`/`resolving`/`downloading`/`installed`) exactly as Phase 2
+designed it to. Every daemon call runs on a background thread and reports
+back over a channel, so a slow relay or Blossom fetch never freezes the
+window.
+
+Verified: the workspace restructure was validated by confirming
+`cargo build --release`, `cargo run -- ...` (via `default-run`), `cargo
+test`, and `cargo fmt`/`clippy` at the workspace root all still work
+exactly as the CI and release workflows invoke them, unchanged. The GUI
+itself was verified against a real running `npack daemon`: the binary
+launches and stays alive with no panics, and a hand-sent request over the
+real daemon's socket (`nc -U`) confirmed the exact response shape
+`DaemonClient` expects. Screenshot capture is blocked in the environment
+this was built in, so the actual rendered window was not visually
+inspected as part of this work -- a reasonable next step for whoever picks
+up Phase 6 or 7 is a manual click-through on a normal desktop.
 
 ## Phase 6: COSMIC Store integration
 

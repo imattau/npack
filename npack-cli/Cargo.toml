@@ -1,0 +1,32 @@
+[package]
+name = "npack"
+version = "0.3.0"
+edition.workspace = true
+description = "A Nostr-native package manager"
+license.workspace = true
+default-run = "npack"
+
+[dependencies]
+anyhow = "1"
+bitcoin_hashes = "1.2"
+clap = { version = "4", features = ["derive"] }
+clap_mangen = "0.3"
+dirs = "6"
+goblin = "0.10"
+hex = "0.4"
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+nostr = { version = "0.45.3", features = ["os-rng"] }
+nostr-blossom = "0.45.0"
+nostr-sdk = "0.45.2"
+semver = "1"
+tar = "0.4"
+toml = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "process", "signal"] }
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3"

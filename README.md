@@ -45,10 +45,27 @@ See:
 
 ## Build
 
+This is a Cargo workspace: `npack-cli` (the `npack` CLI and npackd daemon)
+and `npack-gui` (a small reference GUI, see below). The commands below build
+and check both from the repo root.
+
 ```bash
 cargo build --release
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
+```
+
+## Reference GUI
+
+`npack-gui` is a small `egui`/`eframe` desktop app that exercises npackd's
+JSON-RPC service API (Search, Details, Install, Installed, Updates,
+Remove) purely as a client of its documented Unix-socket protocol -- it has
+no special access to `npack-cli`'s internals, proving `npackd` is
+frontend-independent before integrating with an existing desktop store.
+
+```bash
+npack daemon &            # start npackd-user in the background
+cargo run --release -p npack-gui
 ```
 
 ## Bootstrap installation
