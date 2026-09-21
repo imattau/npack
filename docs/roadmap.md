@@ -64,13 +64,19 @@ or session/system bus requirement, so it behaves the same in minimal and
 containerized environments. A D-Bus adapter in front of the same handlers
 remains possible later if a desktop-store integration phase needs it.
 
+npackd handles connections concurrently (each accepted connection is
+`tokio::spawn`ed), which required making the recursive dependency-install
+future `Send`.
+
 Remaining work:
 
 - `GetTransaction()`/`CancelTransaction()` and streamed progress events for
-  long-running `Install`/`Update` calls -- npackd currently handles one
-  connection at a time and responds only once an operation completes.
-- Expose progress and transaction events. GUI integrations should not need to
-  understand Nostr, Blossom, or `.npk` internals.
+  long-running `Install`/`Update` calls -- a client currently gets one
+  response once the whole operation completes, with no way to poll status or
+  interrupt it partway through. A safe `CancelTransaction` needs a real
+  cooperative checkpoint in the install path (e.g. between packages in a
+  dependency closure, never mid-file-write) rather than raw task abortion,
+  which risks leaving the store in a half-installed state.
 
 ## Phase 3: Security and privilege separation
 

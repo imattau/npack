@@ -468,10 +468,11 @@ Supported methods, mirroring the CLI operations above:
 | `CheckUpdates` | `package` (omit for all), `relay[]`, `trusted_publisher[]`, `user`, `store` | Array of `{reference, current_version, available_version}`. |
 
 An unknown method or a request that fails to deserialize its params returns
-`{"id": ..., "error": "..."}` instead of `result`. Connections are handled
-one at a time -- npackd does not yet stream install/update progress back to
-the client; a client sees the final result once the operation completes.
-GetTransaction/CancelTransaction-style progress reporting is future work.
+`{"id": ..., "error": "..."}` instead of `result`. Each connection is handled
+concurrently, but within a connection npackd does not yet stream
+install/update progress back to the client; a client sees the final result
+once the operation completes. GetTransaction/CancelTransaction-style progress
+reporting is future work.
 
 ## Configuration
 
