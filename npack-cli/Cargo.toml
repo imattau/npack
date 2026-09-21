@@ -27,6 +27,9 @@ tar = "0.4"
 toml = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "process", "signal"] }
 zstd = "0.13"
+indicatif = "0.17"
+reqwest = { version = "0.12", features = ["stream"] }
+futures-util = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

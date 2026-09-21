@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use bitcoin_hashes::sha256::Hash as Sha256Hash;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_mangen::Man;
+use futures_util::StreamExt;
 use goblin::Object;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use nostr_blossom::prelude::BlossomClient;
 use nostr_sdk::prelude::*;
 use semver::{Version, VersionReq};
@@ -12,13 +14,13 @@ use std::{
     collections::{HashMap, HashSet},
     env::consts::{ARCH, OS},
     fs,
-    io::{self, Read, Write},
+    io::{self, IsTerminal, Read, Write},
     os::unix::fs::PermissionsExt,
     os::unix::fs::symlink,
     path::{Path, PathBuf},
     sync::Arc,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const RELEASE_KIND: u16 = 9900;
@@ -27,6 +29,83 @@ const PROTOCOL_VERSION: &str = "1";
 const NETWORK_TIMEOUT_SECS: u64 = 15;
 
 type ServiceBackup = (PathBuf, Option<(Vec<u8>, fs::Permissions)>);
+
+/// A stderr status line that animates when stderr is a terminal and falls
+/// back to today's plain `eprint!`/`eprintln!` pair otherwise, so piped
+/// output (CI logs, `npack daemon` supervisors) is byte-for-byte unchanged.
+struct Spinner {
+    bar: Option<ProgressBar>,
+    message: String,
+}
+
+impl Spinner {
+    fn start(message: impl Into<String>) -> Self {
+        let message = message.into();
+        if std::io::stderr().is_terminal() {
+            let bar = ProgressBar::new_spinner();
+            bar.set_draw_target(ProgressDrawTarget::stderr());
+            bar.set_style(
+                ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                    .expect("static spinner template is valid"),
+            );
+            bar.set_message(message.clone());
+            bar.enable_steady_tick(Duration::from_millis(80));
+            Spinner {
+                bar: Some(bar),
+                message,
+            }
+        } else {
+            eprint!("{message}");
+            let _ = io::stderr().flush();
+            Spinner { bar: None, message }
+        }
+    }
+
+    /// Completes the status line, appending `suffix` (e.g. " done in 0.4s").
+    fn finish(self, suffix: &str) {
+        match &self.bar {
+            Some(bar) => bar.finish_with_message(format!("{}{suffix}", self.message)),
+            None => eprintln!("{suffix}"),
+        }
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        if let Some(bar) = &self.bar
+            && !bar.is_finished()
+        {
+            bar.finish_and_clear();
+        }
+    }
+}
+
+/// Whether human-readable stdout should be decorated with ANSI color,
+/// honoring the `NO_COLOR` convention (https://no-color.org) and disabling
+/// automatically when stdout isn't a terminal (piped output, `> file`).
+fn color_enabled() -> bool {
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn paint(code: &str, text: &str) -> String {
+    if color_enabled() {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+fn green(text: &str) -> String {
+    paint("32", text)
+}
+
+fn yellow(text: &str) -> String {
+    paint("33", text)
+}
+
+fn red(text: &str) -> String {
+    paint("31", text)
+}
 
 #[derive(Parser)]
 #[command(name = "npack", version, about = "A Nostr-native package manager")]
@@ -734,7 +813,8 @@ async fn main() -> Result<()> {
                     &allowed_capabilities,
                 )?;
                 println!(
-                    "installed {}/{} {}",
+                    "{} {}/{} {}",
+                    green("installed"),
                     display_publisher(&installed.publisher),
                     installed.name,
                     installed.version
@@ -1196,7 +1276,7 @@ async fn update_all_command(
                 if error.to_string()
                     == format!("no verified release found for {}", package.name) =>
             {
-                println!("  up to date");
+                println!("  {}", green("up to date"));
             }
             Err(error) => return Err(error),
         }
@@ -1294,9 +1374,9 @@ async fn check_updates_command(
     client.disconnect().await;
     let available = result?;
     if available > 0 {
-        println!("{available} update(s) available.");
+        println!("{available} update(s) {}.", yellow("available"));
     } else {
-        println!("Everything is up to date.");
+        println!("Everything is {}.", green("up to date"));
     }
     Ok(())
 }
@@ -1338,17 +1418,21 @@ async fn check_single_update(
             match installed {
                 Some(package) => {
                     println!(
-                        "{reference} {} -> {} available",
-                        package.version, resolved.version
+                        "{reference} {} -> {} {}",
+                        package.version,
+                        resolved.version,
+                        yellow("available")
                     )
                 }
-                None => println!("{reference} {} available", resolved.version),
+                None => println!("{reference} {} {}", resolved.version, yellow("available")),
             }
             Ok(true)
         }
         Err(error) if error.to_string() == format!("no verified release found for {name}") => {
             match installed {
-                Some(package) => println!("{reference} {} up to date", package.version),
+                Some(package) => {
+                    println!("{reference} {} {}", package.version, green("up to date"))
+                }
                 None => return Err(error),
             }
             Ok(false)
@@ -1681,20 +1765,13 @@ async fn fetch_blob(sha256: &str, servers: &[String], output: &Path) -> Result<(
     if servers.is_empty() {
         bail!("no Blossom servers configured; pass --server or configure [storage].blossom");
     }
-    let mut bytes = None;
-    for server in servers {
-        let candidate = match BlossomClient::new(Url::parse(server)?)
-            .get_blob::<Keys>(expected, None, None, None)
-            .await
-        {
-            Ok(candidate) => candidate,
-            Err(_) => continue,
-        };
-        if Sha256Hash::hash(&candidate) == expected {
-            bytes = Some(candidate);
-            break;
-        }
-    }
+    let server_urls = servers
+        .iter()
+        .map(|server| Url::parse(server))
+        .collect::<Result<Vec<_>, _>>()?;
+    let bar = download_progress_bar(format!("Fetching {sha256} ({} mirror(s))", servers.len()));
+    let bytes = download_matching_blob(&server_urls, expected, &bar).await;
+    bar.finish_and_clear();
     let bytes = bytes.context("no Blossom server returned the expected SHA-256")?;
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
@@ -1702,6 +1779,103 @@ async fn fetch_blob(sha256: &str, servers: &[String], output: &Path) -> Result<(
     fs::write(output, &bytes).with_context(|| format!("writing {}", output.display()))?;
     println!("fetched {} bytes to {}", bytes.len(), output.display());
     Ok(())
+}
+
+/// Progress-bar style for a download whose total size is known upfront
+/// (the server sent a `Content-Length` header).
+fn download_bar_style_determinate() -> ProgressStyle {
+    ProgressStyle::with_template("{msg} {bar:28.cyan/blue} {bytes}/{total_bytes} ({bytes_per_sec})")
+        .expect("static template is valid")
+        .progress_chars("=> ")
+}
+
+/// Progress-bar style for a download with no known total: an animated
+/// spinner plus a running byte count instead of a filled bar.
+fn download_bar_style_indeterminate() -> ProgressStyle {
+    ProgressStyle::with_template("{spinner:.cyan} {msg} {bytes} ({bytes_per_sec})")
+        .expect("static template is valid")
+}
+
+/// Downloads `sha256`'s blob from `server_url`'s Blossom endpoint, driving
+/// `bar`'s byte count as the response streams in and switching to a
+/// determinate bar once/if the server's `Content-Length` is known.
+///
+/// Bypasses `BlossomClient::get_blob`, which buffers the entire response
+/// internally with no progress hook; every call site here passes no Blossom
+/// signer, so this only needs to replicate the plain unauthenticated GET
+/// (`BlossomClient`'s own redirect handling is just `reqwest`'s default
+/// `Policy::limited(10)`, which `reqwest` already follows transparently).
+async fn download_blob_with_progress(
+    server_url: &Url,
+    sha256: Sha256Hash,
+    bar: &ProgressBar,
+) -> Result<Vec<u8>> {
+    let url = server_url
+        .join(&sha256.to_string())
+        .context("building blob URL")?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .context("building HTTP client")?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .context("requesting artifact")?
+        .error_for_status()
+        .context("artifact server returned an error status")?;
+    bar.set_position(0);
+    if let Some(total) = response.content_length() {
+        bar.set_length(total);
+        bar.set_style(download_bar_style_determinate());
+    } else {
+        bar.set_style(download_bar_style_indeterminate());
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("reading artifact download stream")?;
+        bytes.extend_from_slice(&chunk);
+        bar.inc(chunk.len() as u64);
+    }
+    Ok(bytes)
+}
+
+/// Tries each candidate URL in order until one streams back bytes matching
+/// `expected`, animating `bar` for whichever attempt is currently in
+/// flight. Mirrors that error or return the wrong hash are skipped, same as
+/// the previous `BlossomClient::get_blob`-based retry loop.
+async fn download_matching_blob(
+    candidates: &[Url],
+    expected: Sha256Hash,
+    bar: &ProgressBar,
+) -> Option<Vec<u8>> {
+    for server_url in candidates {
+        let candidate = match download_blob_with_progress(server_url, expected, bar).await {
+            Ok(candidate) => candidate,
+            Err(_) => continue,
+        };
+        if Sha256Hash::hash(&candidate) == expected {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// A byte-progress bar for a Blossom download: an animated bar on a
+/// terminal, or a no-op hidden bar when stderr is piped (matching the
+/// plain-text fallback used everywhere else in this file).
+fn download_progress_bar(message: String) -> ProgressBar {
+    if std::io::stderr().is_terminal() {
+        let bar = ProgressBar::new(0);
+        bar.set_draw_target(ProgressDrawTarget::stderr());
+        bar.set_style(download_bar_style_indeterminate());
+        bar.set_message(message);
+        bar.enable_steady_tick(Duration::from_millis(80));
+        bar
+    } else {
+        ProgressBar::hidden()
+    }
 }
 
 fn pack_npk(source: &Path, output: &Path) -> Result<()> {
@@ -1838,15 +2012,14 @@ async fn install_ref(
         if let Some(control) = &control {
             control.set_progress("connecting", None, None);
         }
-        eprint!("Connecting to {} relay(s)...", relays.len());
-        io::stderr().flush()?;
+        let spinner = Spinner::start(format!("Connecting to {} relay(s)...", relays.len()));
         let started = Instant::now();
         for relay in relays {
             client.add_relay(relay).await?;
         }
         connect_with_timeout(&client).await?;
         add_user_relays(&client, user_pubkey).await?;
-        eprintln!(" done in {:.1}s", started.elapsed().as_secs_f32());
+        spinner.finish(&format!(" done in {:.1}s", started.elapsed().as_secs_f32()));
     }
     let (root, prefix) = install_paths(store, user);
     let mut state = ResolverState {
@@ -2646,9 +2819,15 @@ fn install_remote_package<'a, 'b>(
             bail!("package {install_key} is not present in the lockfile");
         }
         state.visiting.push(install_key.clone());
-        if !state.offline {
-            eprintln!("Resolving {}...", display_package_reference(&install_key));
-        }
+        let resolve_started = Instant::now();
+        let resolving_spinner = if !state.offline {
+            Some(Spinner::start(format!(
+                "Resolving {}...",
+                display_package_reference(&install_key)
+            )))
+        } else {
+            None
+        };
         if let Some(control) = &state.control {
             control.set_progress("resolving", Some(&install_key), None);
         }
@@ -2691,6 +2870,12 @@ fn install_remote_package<'a, 'b>(
             cache_artifact(state.root, &artifact_event)?;
             artifact_event
         };
+        if let Some(spinner) = resolving_spinner {
+            spinner.finish(&format!(
+                " done in {:.1}s",
+                resolve_started.elapsed().as_secs_f32()
+            ));
+        }
         let (sha256, manifest) = resolved_manifest(&release, &artifact_event)?;
         let expected: Sha256Hash = sha256.parse()?;
         let staging = state.root.join("downloads").join(&sha256);
@@ -2710,13 +2895,18 @@ fn install_remote_package<'a, 'b>(
             if urls.is_empty() {
                 bail!("artifact event has no URL");
             }
-            eprint!(
-                "Downloading {}/{} {} ({} mirror(s))...",
+            let download_message = format!(
+                "Downloading {}/{} {} ({} mirror(s))",
                 display_publisher(&manifest.publisher),
                 manifest.name,
                 manifest.version,
                 urls.len()
             );
+            let interactive = std::io::stderr().is_terminal();
+            if !interactive {
+                eprint!("{download_message}...");
+                io::stderr().flush()?;
+            }
             if let Some(control) = &state.control {
                 control.set_progress(
                     "downloading",
@@ -2724,38 +2914,41 @@ fn install_remote_package<'a, 'b>(
                     Some(format!("{} mirror(s)", urls.len())),
                 );
             }
-            io::stderr().flush()?;
             let started = Instant::now();
-            let mut bytes = None;
-            for url in urls {
-                let mut server_url = match Url::parse(&url) {
-                    Ok(url) => url,
-                    Err(_) => continue,
-                };
-                server_url.set_path("/");
-                server_url.set_query(None);
-                server_url.set_fragment(None);
-                let candidate = match BlossomClient::new(server_url)
-                    .get_blob::<Keys>(expected, None, None, None)
-                    .await
-                {
-                    Ok(candidate) => candidate,
-                    Err(_) => continue,
-                };
-                if Sha256Hash::hash(&candidate) == expected {
-                    bytes = Some(candidate);
-                    break;
-                }
-            }
+            let server_urls: Vec<Url> = urls
+                .iter()
+                .filter_map(|url| {
+                    let mut server_url = Url::parse(url).ok()?;
+                    server_url.set_path("/");
+                    server_url.set_query(None);
+                    server_url.set_fragment(None);
+                    Some(server_url)
+                })
+                .collect();
+            let bar = download_progress_bar(download_message.clone());
+            let bytes = download_matching_blob(&server_urls, expected, &bar).await;
+            bar.finish_and_clear();
             let Some(bytes) = bytes else {
-                eprintln!(" failed");
+                if interactive {
+                    eprintln!("{download_message}... failed");
+                } else {
+                    eprintln!(" failed");
+                }
                 bail!("no artifact mirror returned the expected SHA-256");
             };
-            eprintln!(
-                " done in {:.1}s ({} bytes)",
-                started.elapsed().as_secs_f32(),
-                bytes.len()
-            );
+            if interactive {
+                eprintln!(
+                    "{download_message}... done in {:.1}s ({} bytes)",
+                    started.elapsed().as_secs_f32(),
+                    bytes.len()
+                );
+            } else {
+                eprintln!(
+                    " done in {:.1}s ({} bytes)",
+                    started.elapsed().as_secs_f32(),
+                    bytes.len()
+                );
+            }
             fs::write(&artifact_path, bytes)?;
         }
         if Sha256Hash::hash(&fs::read(&artifact_path)?) != expected {
@@ -2795,7 +2988,8 @@ fn install_remote_package<'a, 'b>(
             state.allowed_capabilities,
         )?;
         println!(
-            "installed {}/{} {}",
+            "{} {}/{} {}",
+            green("installed"),
             display_publisher(&manifest.publisher),
             manifest.name,
             manifest.version
@@ -3105,8 +3299,7 @@ async fn fetch_catalogue_from_relays(
     relays: &[String],
     user_pubkey: Option<&str>,
 ) -> Result<Catalogue> {
-    eprint!("Querying {} Nostr relay(s)...", relays.len());
-    io::stderr().flush()?;
+    let spinner = Spinner::start(format!("Querying {} Nostr relay(s)...", relays.len()));
     let started = Instant::now();
     let client = Client::default();
     for relay in relays {
@@ -3131,7 +3324,7 @@ async fn fetch_catalogue_from_relays(
         .filter(|event| event.verify().is_ok())
         .filter(revocation_event_is_v1)
         .collect::<Vec<_>>();
-    eprintln!(" done in {:.1}s", started.elapsed().as_secs_f32());
+    spinner.finish(&format!(" done in {:.1}s", started.elapsed().as_secs_f32()));
     client.disconnect().await;
     Ok(Catalogue {
         created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
@@ -3231,18 +3424,22 @@ fn info_command(reference: &str, trusted_publishers: &[String], root: &Path) -> 
     for entry in &entries {
         if seen_publishers.insert(entry.publisher.clone()) {
             let trust_note = if trusted_publishers.is_empty() {
-                ""
+                String::new()
             } else if trusted_publishers.contains(&entry.publisher) {
-                " (trusted)"
+                format!(" ({})", green("trusted"))
             } else {
-                " (not in trusted-publisher list)"
+                format!(" ({})", yellow("not in trusted-publisher list"))
             };
             println!(
                 "  publisher {}{trust_note}",
                 display_publisher(&entry.publisher)
             );
         }
-        let status = if entry.revoked { " [REVOKED]" } else { "" };
+        let status = if entry.revoked {
+            format!(" [{}]", red("REVOKED"))
+        } else {
+            String::new()
+        };
         println!(
             "    {} {}/{} {}{status}",
             entry.version, entry.os, entry.arch, entry.release_event_id
