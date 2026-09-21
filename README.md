@@ -104,9 +104,14 @@ npack verify-event ./release.json ./myapp.manifest.json
 npack revoke-event ./release.json --secret-key <secret-key> \
   --reason "security issue"
 
+# Rebuild the local package catalogue from Nostr relays, then browse it
+# without any further relay round trips
+npack refresh --relay wss://relay.example
+npack search myapp
+npack info <publisher>/myapp
+
 # Discover and install from Nostr
-npack search myapp --relay wss://relay.example
-npack search myapp --refresh   # bypass the local search cache
+npack search myapp --refresh   # rebuild the catalogue from relays, then search it
 npack install <publisher>/myapp --relay wss://relay.example --user
 npack update <publisher>/myapp --relay wss://relay.example --user
 npack update --user                 # check all installed packages

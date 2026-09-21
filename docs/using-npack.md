@@ -287,13 +287,26 @@ npack update npub1.../myapp \
 
 ## Discovering and installing from Nostr
 
-Search configured relays:
+Build the local catalogue once, then browse it with no further relay
+round trips:
 
 ```bash
-npack search myapp --relay wss://relay.example
-npack search myapp --refresh   # ignore the five-minute cache
-npack search myapp --no-cache  # do not read or write the cache
+npack refresh --relay wss://relay.example
+npack search myapp
+npack info myapp
 ```
+
+`npack search` reads the catalogue file (default `<npack state dir>/
+catalogue.json`, or `--store <path>` for an isolated one) by default and
+never touches a relay unless asked:
+
+```bash
+npack search myapp --relay wss://relay.example --refresh   # rebuild the catalogue from relays, then search it
+npack search myapp --relay wss://relay.example --no-cache  # query relays live for this search only, without touching the catalogue
+```
+
+If no catalogue exists yet, plain `npack search` fails with a message
+pointing at `npack refresh` rather than silently querying relays.
 
 Install a publisher-qualified package:
 
@@ -360,12 +373,36 @@ npub1.../otherapp 2.3.0 up to date
 1 update(s) available.
 ```
 
-Search displays progress on stderr while querying relays. Successful search
-results are cached locally for five minutes. The cache key includes the query,
-relay set, trusted-publisher filter, and NIP-65 identity, keeping results from
-different trust configurations separate. Results are then reduced to the
-newest valid SemVer release for each publisher/package pair, while retaining
-all platform artifacts belonging to that release.
+Search results are reduced to the newest valid SemVer release for each
+publisher/package pair, while retaining all platform artifacts belonging to
+that release; a `--trusted-publisher` filter and NIP-65 identity narrow which
+catalogue entries are considered, same as before.
+
+### `npack info`: a package's full picture from the catalogue
+
+```bash
+npack info myapp
+npack info npub1.../myapp
+```
+
+Unlike `search`, `info` has no `--refresh`/`--no-cache` escape hatch to
+relays -- it always reads the local catalogue, since showing every known
+version/publisher/platform combination for one package is exactly what the
+catalogue is for. Output lists each publisher (optionally annotated
+`(trusted)`/`(not in trusted-publisher list)` when `--trusted-publisher` is
+given), then every version for that publisher newest first, its os/arch, its
+release event id, and `[REVOKED]` when applicable:
+
+```text
+myapp
+  publisher npub1... (trusted)
+    1.2.0 linux/x86_64 76709197...
+    1.1.0 linux/x86_64 895abc98... [REVOKED]
+```
+
+AppStream-style fields (summary, description, homepage, ...) are not shown:
+release events don't currently carry Phase 1's `app` manifest metadata onto
+Nostr tags, so there is nothing for the catalogue to have captured yet.
 
 ## Resolving release metadata for other package managers
 
@@ -808,7 +845,9 @@ npack init <directory> --name <name> --publisher <npub-or-hex> [--version <semve
 npack manifest <file.npk> --output <manifest.json>
 npack install <file.npk> [--user|--system|--store <path>]
 npack verify <file.npk-or-manifest.json>
-npack search <query> [--relay <url>]
+npack refresh [--relay <url>] [--pubkey <hex>] [--store <path>]
+npack search <query> [--refresh] [--no-cache] [--relay <url>] [--store <path>]
+npack info [<publisher>/]<name> [--trusted-publisher <hex>] [--store <path>]
 npack install <publisher>/<name> [options]
 npack install-ref <publisher>/<name> [options]  # compatibility alias
 npack resolve <publisher>/<name> --relay <url> [options]
