@@ -212,10 +212,16 @@ Shipped (originally requested for NixOS integration, see
   array of resolved entries, so a derivation generator does not need a
   separate invocation per dependency.
 
+Validated: [a real Nix derivation built from `npack resolve`'s output against
+npack's own live-published release](nixos-integration-test.md), including a
+negative control confirming Nix rejects a tampered SHA-256.
+
 Remaining work:
 
-- Real-world validation of the output shape against an actual NixOS
-  flake/derivation, ideally with help from the issue's reporter.
+- Validation against a full NixOS system closure (a flake-based module or
+  package entry, not just a one-off derivation), and a package that actually
+  declares dependencies to exercise `npack resolve --recursive`, ideally with
+  help from the issue's reporter.
 
 ## Milestone order
 

@@ -359,7 +359,9 @@ This is intended for declarative package managers (such as Nix) that want to
 own fetching, unpacking, and rollback of the artifact themselves while
 leaving Nostr/Blossom discovery and trust verification to npack. `--relay`,
 `--requirement`, `--trusted-publisher`, `--pubkey`, `--lockfile`, and
-`--locked` behave the same as their `install-ref` counterparts.
+`--locked` behave the same as their `install-ref` counterparts. See
+[the Nix integration test](nixos-integration-test.md) for a worked example
+building a real Nix derivation from this output.
 
 Pass `--recursive` to resolve the full dependency closure in one call instead
 of a single package. The command then walks each declared dependency the same
