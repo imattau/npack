@@ -16,6 +16,8 @@ use std::{
     os::unix::fs::PermissionsExt,
     os::unix::fs::symlink,
     path::{Path, PathBuf},
+    sync::Arc,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -603,6 +605,7 @@ async fn main() -> Result<()> {
                     offline,
                     allowed_capabilities,
                     &config,
+                    None,
                 )
                 .await?;
             }
@@ -835,6 +838,7 @@ async fn main() -> Result<()> {
                     offline,
                     allowed_capabilities,
                     &config,
+                    None,
                 )
                 .await?
             } else {
@@ -914,6 +918,7 @@ async fn install_remote_command(
     offline: bool,
     allowed_capabilities: Vec<String>,
     config: &Config,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> Result<()> {
     let relays = if offline {
         Vec::new()
@@ -951,6 +956,7 @@ async fn install_remote_command(
             blossom_servers: &servers,
             allowed_capabilities: &allowed_capabilities,
             offline,
+            cancel,
         },
         requirement,
     )
@@ -999,6 +1005,7 @@ async fn update_all_command(
             false,
             allowed_capabilities.clone(),
             config,
+            None,
         )
         .await;
         match result {
@@ -1618,6 +1625,10 @@ struct InstallRefOptions<'a> {
     blossom_servers: &'a [String],
     allowed_capabilities: &'a [String],
     offline: bool,
+    /// Checked at the start of processing each package in the dependency
+    /// graph; never mid-download or mid-install of a package already in
+    /// progress, so cancellation cannot leave the store half-installed.
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 async fn install_ref(
@@ -1637,6 +1648,7 @@ async fn install_ref(
         blossom_servers,
         allowed_capabilities,
         offline,
+        cancel,
     } = options;
     let client = Client::default();
     if !offline {
@@ -1664,6 +1676,7 @@ async fn install_ref(
         installed: Vec::new(),
         selected: HashMap::new(),
         offline,
+        cancel,
     };
     install_remote_package(&mut state, name.to_owned(), publisher, requirement).await?;
     if !offline {
@@ -1905,6 +1918,7 @@ struct ResolverState<'a> {
     installed: Vec<String>,
     selected: HashMap<String, Manifest>,
     offline: bool,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 fn cached_release_path(root: &Path, package: &LockedPackage) -> PathBuf {
@@ -2371,6 +2385,13 @@ fn install_remote_package<'a, 'b>(
     requirement: Option<String>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
+        if state
+            .cancel
+            .as_deref()
+            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+        {
+            bail!("installation cancelled");
+        }
         let install_key = publisher.as_deref().map_or_else(
             || name.to_owned(),
             |publisher| format!("{publisher}/{name}"),
@@ -3053,8 +3074,13 @@ async fn search_matching_releases(
 // Requests and responses are newline-delimited JSON:
 //   {"id": 1, "method": "ListInstalled", "params": {"user": true}}
 //   {"id": 1, "result": [...]}
-// Transaction/progress-event streaming is deferred to a later phase; Install
-// and Update run to completion before responding.
+// Install and Update run synchronously (the response carries the final
+// result) unless params include "async": true, in which case they return
+// {"transaction_id": N} immediately and the caller polls GetTransaction.
+// CancelTransaction is cooperative: it is only checked between packages in a
+// dependency graph or update loop, never mid-download or mid-install of a
+// package already in progress, so a cancelled transaction cannot leave the
+// store half-installed.
 
 #[derive(Debug, Deserialize)]
 struct DaemonRequest {
@@ -3099,6 +3125,79 @@ fn daemon_socket_path(override_path: Option<PathBuf>) -> PathBuf {
     })
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+enum TransactionStatus {
+    Running,
+    Succeeded { result: serde_json::Value },
+    Failed { error: String },
+    Cancelled,
+}
+
+struct TransactionEntry {
+    status: TransactionStatus,
+    cancel: Arc<AtomicBool>,
+}
+
+struct DaemonState {
+    config: Config,
+    transactions: std::sync::Mutex<HashMap<u64, TransactionEntry>>,
+    next_transaction_id: AtomicU64,
+}
+
+impl DaemonState {
+    fn new(config: Config) -> Self {
+        Self {
+            config,
+            transactions: std::sync::Mutex::new(HashMap::new()),
+            next_transaction_id: AtomicU64::new(1),
+        }
+    }
+
+    /// Registers a new transaction and spawns `make_work` (given a fresh
+    /// cancellation flag) to run in the background, recording its outcome
+    /// once it completes. Returns the transaction id immediately.
+    fn start_transaction<F, Fut>(self: &Arc<Self>, make_work: F) -> u64
+    where
+        F: FnOnce(Arc<AtomicBool>) -> Fut,
+        Fut: Future<Output = Result<serde_json::Value>> + Send + 'static,
+    {
+        let id = self.next_transaction_id.fetch_add(1, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.transactions.lock().unwrap().insert(
+            id,
+            TransactionEntry {
+                status: TransactionStatus::Running,
+                cancel: cancel.clone(),
+            },
+        );
+        let work = make_work(cancel);
+        let state = self.clone();
+        tokio::spawn(async move {
+            let status = match work.await {
+                Ok(result) => TransactionStatus::Succeeded { result },
+                Err(error) if is_cancellation_error(&error) => TransactionStatus::Cancelled,
+                Err(error) => TransactionStatus::Failed {
+                    error: error.to_string(),
+                },
+            };
+            if let Ok(mut transactions) = state.transactions.lock()
+                && let Some(entry) = transactions.get_mut(&id)
+            {
+                entry.status = status;
+            }
+        });
+        id
+    }
+}
+
+fn is_cancellation_error(error: &anyhow::Error) -> bool {
+    matches!(
+        error.to_string().as_str(),
+        "installation cancelled" | "update cancelled"
+    )
+}
+
 async fn run_daemon(socket: Option<PathBuf>, config: Config) -> Result<()> {
     let socket_path = daemon_socket_path(socket);
     if let Some(parent) = socket_path.parent() {
@@ -3111,19 +3210,22 @@ async fn run_daemon(socket: Option<PathBuf>, config: Config) -> Result<()> {
     let listener = tokio::net::UnixListener::bind(&socket_path)
         .with_context(|| format!("binding {}", socket_path.display()))?;
     eprintln!("npackd listening on {}", socket_path.display());
-    let config = std::sync::Arc::new(config);
+    let state = Arc::new(DaemonState::new(config));
     loop {
         let (stream, _) = listener.accept().await?;
-        let config = config.clone();
+        let state = state.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_daemon_connection(stream, &config).await {
+            if let Err(error) = handle_daemon_connection(stream, &state).await {
                 eprintln!("npackd connection error: {error:#}");
             }
         });
     }
 }
 
-async fn handle_daemon_connection(stream: tokio::net::UnixStream, config: &Config) -> Result<()> {
+async fn handle_daemon_connection(
+    stream: tokio::net::UnixStream,
+    state: &Arc<DaemonState>,
+) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let (reader, mut writer) = stream.into_split();
     let mut lines = tokio::io::BufReader::new(reader).lines();
@@ -3134,7 +3236,7 @@ async fn handle_daemon_connection(stream: tokio::net::UnixStream, config: &Confi
         let response = match serde_json::from_str::<DaemonRequest>(&line) {
             Ok(request) => {
                 let id = request.id;
-                match dispatch_daemon_request(config, request).await {
+                match dispatch_daemon_request(state, request).await {
                     Ok(result) => DaemonResponse::ok(id, result),
                     Err(error) => DaemonResponse::err(id, error),
                 }
@@ -3154,17 +3256,19 @@ async fn handle_daemon_connection(stream: tokio::net::UnixStream, config: &Confi
 }
 
 async fn dispatch_daemon_request(
-    config: &Config,
+    state: &Arc<DaemonState>,
     request: DaemonRequest,
 ) -> Result<serde_json::Value> {
     match request.method.as_str() {
-        "Search" => daemon_search(config, request.params).await,
-        "GetPackage" => daemon_get_package(config, request.params).await,
-        "ListInstalled" => daemon_list_installed(config, request.params),
-        "Install" => daemon_install(config, request.params).await,
-        "Remove" => daemon_remove(config, request.params),
-        "Update" => daemon_update(config, request.params).await,
-        "CheckUpdates" => daemon_check_updates(config, request.params).await,
+        "Search" => daemon_search(&state.config, request.params).await,
+        "GetPackage" => daemon_get_package(&state.config, request.params).await,
+        "ListInstalled" => daemon_list_installed(&state.config, request.params),
+        "Install" => daemon_install(state, request.params).await,
+        "Remove" => daemon_remove(&state.config, request.params),
+        "Update" => daemon_update(state, request.params).await,
+        "CheckUpdates" => daemon_check_updates(&state.config, request.params).await,
+        "GetTransaction" => daemon_get_transaction(state, request.params),
+        "CancelTransaction" => daemon_cancel_transaction(state, request.params),
         other => bail!("unknown method {other}"),
     }
 }
@@ -3288,10 +3392,32 @@ struct InstallParams {
     store: Option<PathBuf>,
     #[serde(default)]
     allow_capability: Vec<String>,
+    /// Run in the background and return `{"transaction_id": N}` immediately
+    /// instead of waiting for the install to finish.
+    #[serde(default, rename = "async")]
+    background: bool,
 }
 
-async fn daemon_install(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
+async fn daemon_install(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
     let params: InstallParams = serde_json::from_value(params).context("invalid Install params")?;
+    if params.background {
+        let daemon_state = state.clone();
+        let id = state.start_transaction(move |cancel| async move {
+            daemon_install_sync(&daemon_state.config, params, Some(cancel)).await
+        });
+        return Ok(serde_json::json!({ "transaction_id": id }));
+    }
+    daemon_install_sync(&state.config, params, None).await
+}
+
+async fn daemon_install_sync(
+    config: &Config,
+    params: InstallParams,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<serde_json::Value> {
     let package = params.package.clone();
     install_remote_command(
         &package,
@@ -3308,6 +3434,7 @@ async fn daemon_install(config: &Config, params: serde_json::Value) -> Result<se
         false,
         params.allow_capability,
         config,
+        cancel,
     )
     .await?;
     let use_user = params.user || config.install.user;
@@ -3367,10 +3494,32 @@ struct UpdateParams {
     store: Option<PathBuf>,
     #[serde(default)]
     allow_capability: Vec<String>,
+    /// Run in the background and return `{"transaction_id": N}` immediately
+    /// instead of waiting for every package to finish updating.
+    #[serde(default, rename = "async")]
+    background: bool,
 }
 
-async fn daemon_update(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
+async fn daemon_update(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
     let params: UpdateParams = serde_json::from_value(params).context("invalid Update params")?;
+    if params.background {
+        let daemon_state = state.clone();
+        let id = state.start_transaction(move |cancel| async move {
+            daemon_update_sync(&daemon_state.config, params, Some(cancel)).await
+        });
+        return Ok(serde_json::json!({ "transaction_id": id }));
+    }
+    daemon_update_sync(&state.config, params, None).await
+}
+
+async fn daemon_update_sync(
+    config: &Config,
+    params: UpdateParams,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<serde_json::Value> {
     let use_user = params.user || config.install.user;
     let root = install_paths(params.store.as_deref(), use_user).0;
     let mut installed = installed_packages(Some(&root))?;
@@ -3392,6 +3541,12 @@ async fn daemon_update(config: &Config, params: serde_json::Value) -> Result<ser
     }
     let mut outcomes = Vec::new();
     for package in installed {
+        if cancel
+            .as_deref()
+            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+        {
+            bail!("update cancelled");
+        }
         let reference = installed_package_reference(&package);
         let result = install_remote_command(
             &reference,
@@ -3408,6 +3563,7 @@ async fn daemon_update(config: &Config, params: serde_json::Value) -> Result<ser
             false,
             params.allow_capability.clone(),
             config,
+            cancel.clone(),
         )
         .await;
         match result {
@@ -3440,6 +3596,38 @@ async fn daemon_update(config: &Config, params: serde_json::Value) -> Result<ser
         }
     }
     Ok(serde_json::to_value(outcomes)?)
+}
+
+#[derive(Debug, Deserialize)]
+struct TransactionIdParams {
+    transaction_id: u64,
+}
+
+fn daemon_get_transaction(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: TransactionIdParams =
+        serde_json::from_value(params).context("invalid GetTransaction params")?;
+    let transactions = state.transactions.lock().unwrap();
+    let entry = transactions
+        .get(&params.transaction_id)
+        .context("unknown transaction_id")?;
+    Ok(serde_json::to_value(&entry.status)?)
+}
+
+fn daemon_cancel_transaction(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: TransactionIdParams =
+        serde_json::from_value(params).context("invalid CancelTransaction params")?;
+    let transactions = state.transactions.lock().unwrap();
+    let entry = transactions
+        .get(&params.transaction_id)
+        .context("unknown transaction_id")?;
+    entry.cancel.store(true, Ordering::Relaxed);
+    Ok(serde_json::json!({ "cancel_requested": true }))
 }
 
 #[derive(Debug, Serialize)]
@@ -6587,10 +6775,10 @@ mod tests {
         fs::create_dir_all(&store)?;
 
         let listener = tokio::net::UnixListener::bind(&socket_path)?;
-        let config = Config::default();
+        let state = Arc::new(DaemonState::new(Config::default()));
         let server = async {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_daemon_connection(stream, &config).await.unwrap();
+            handle_daemon_connection(stream, &state).await.unwrap();
         };
 
         let client_work = async {
@@ -6672,5 +6860,92 @@ mod tests {
 
         daemon.abort();
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn install_remote_package_respects_cancellation_before_starting_a_package() -> Result<()>
+    {
+        let dir = tempdir()?;
+        let root = dir.path().join("root");
+        let prefix = dir.path().join("prefix");
+        fs::create_dir_all(&root)?;
+        fs::create_dir_all(&prefix)?;
+        let client = Client::default();
+        let mut state = ResolverState {
+            client: &client,
+            allowed_capabilities: &[],
+            user: false,
+            trusted_publishers: &[],
+            blossom_servers: &[],
+            root: &root,
+            prefix: &prefix,
+            locked_packages: None,
+            visiting: Vec::new(),
+            installed: Vec::new(),
+            selected: HashMap::new(),
+            offline: false,
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+        };
+        let error = install_remote_package(&mut state, "hello".into(), None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "installation cancelled");
+        assert!(state.installed.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transactions_report_running_then_succeeded_and_reject_unknown_ids() -> Result<()> {
+        let state = Arc::new(DaemonState::new(Config::default()));
+        let id = state.start_transaction(|_cancel| async { Ok(serde_json::json!({"ok": true})) });
+
+        let running = daemon_get_transaction(&state, serde_json::json!({ "transaction_id": id }))?;
+        assert_eq!(running["status"], "running");
+
+        let mut final_status = None;
+        for _ in 0..200 {
+            let status =
+                daemon_get_transaction(&state, serde_json::json!({ "transaction_id": id }))?;
+            if status["status"] != "running" {
+                final_status = Some(status);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let final_status = final_status.context("transaction never left the running state")?;
+        assert_eq!(final_status["status"], "succeeded");
+        assert_eq!(final_status["result"], serde_json::json!({"ok": true}));
+
+        assert!(
+            daemon_get_transaction(&state, serde_json::json!({ "transaction_id": 999_999 }))
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_transaction_stops_a_cooperative_task() -> Result<()> {
+        let state = Arc::new(DaemonState::new(Config::default()));
+        let id = state.start_transaction(|cancel| async move {
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    bail!("update cancelled");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+
+        daemon_cancel_transaction(&state, serde_json::json!({ "transaction_id": id }))?;
+
+        for _ in 0..200 {
+            let status =
+                daemon_get_transaction(&state, serde_json::json!({ "transaction_id": id }))?;
+            if status["status"] != "running" {
+                assert_eq!(status["status"], "cancelled");
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("transaction never reported cancelled");
     }
 }

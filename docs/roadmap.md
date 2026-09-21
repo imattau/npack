@@ -56,7 +56,8 @@ exposing:
 Search()          GetPackage()
 ListInstalled()   Install()
 Remove()          Update()
-CheckUpdates()
+CheckUpdates()    GetTransaction()
+CancelTransaction()
 ```
 
 Chose a Unix socket over D-Bus for this first slice: no new system dependency
@@ -68,15 +69,18 @@ npackd handles connections concurrently (each accepted connection is
 `tokio::spawn`ed), which required making the recursive dependency-install
 future `Send`.
 
+`Install`/`Update` run synchronously by default; passing `"async": true`
+returns `{"transaction_id": N}` immediately, pollable via `GetTransaction`.
+`CancelTransaction` is cooperative rather than raw task abortion: a shared
+cancellation flag is checked only between packages (before starting the next
+package in a dependency graph, or the next package in an `Update` loop),
+never mid-download or mid-install of a package already in progress -- a
+cancelled transaction cannot leave the store half-installed.
+
 Remaining work:
 
-- `GetTransaction()`/`CancelTransaction()` and streamed progress events for
-  long-running `Install`/`Update` calls -- a client currently gets one
-  response once the whole operation completes, with no way to poll status or
-  interrupt it partway through. A safe `CancelTransaction` needs a real
-  cooperative checkpoint in the install path (e.g. between packages in a
-  dependency closure, never mid-file-write) rather than raw task abortion,
-  which risks leaving the store in a half-installed state.
+- Streamed progress events (e.g. per-file download progress) rather than a
+  single final result once `GetTransaction` reports the transaction done.
 
 ## Phase 3: Security and privilege separation
 

@@ -462,17 +462,38 @@ Supported methods, mirroring the CLI operations above:
 | `Search` | `query`, `relay[]`, `trusted_publisher[]`, `pubkey`, `refresh`, `no_cache` | Array of matching releases. |
 | `GetPackage` | `package`, `relay[]`, `requirement`, `os`, `arch`, `trusted_publisher[]`, `store`, `user` | The same resolved-metadata object as `npack resolve`. |
 | `ListInstalled` | `user`, `store` | Array of installed packages. |
-| `Install` | `package`, `requirement`, `relay[]`, `server[]`, `user`, `store`, `allow_capability[]` | The installed package's record. |
+| `Install` | `package`, `requirement`, `relay[]`, `server[]`, `user`, `store`, `allow_capability[]`, `async` | The installed package's record, or `{"transaction_id": N}` if `async` is true. |
 | `Remove` | `package`, `user`, `store` | `{"removed": "<package>"}`. |
-| `Update` | `package` (omit for all), `relay[]`, `server[]`, `user`, `store`, `allow_capability[]` | Array of per-package update outcomes. |
+| `Update` | `package` (omit for all), `relay[]`, `server[]`, `user`, `store`, `allow_capability[]`, `async` | Array of per-package update outcomes, or `{"transaction_id": N}` if `async` is true. |
 | `CheckUpdates` | `package` (omit for all), `relay[]`, `trusted_publisher[]`, `user`, `store` | Array of `{reference, current_version, available_version}`. |
+| `GetTransaction` | `transaction_id` | `{"status": "running"}`, `{"status": "succeeded", "result": ...}`, `{"status": "failed", "error": "..."}`, or `{"status": "cancelled"}`. |
+| `CancelTransaction` | `transaction_id` | `{"cancel_requested": true}`. |
 
 An unknown method or a request that fails to deserialize its params returns
 `{"id": ..., "error": "..."}` instead of `result`. Each connection is handled
-concurrently, but within a connection npackd does not yet stream
-install/update progress back to the client; a client sees the final result
-once the operation completes. GetTransaction/CancelTransaction-style progress
-reporting is future work.
+concurrently.
+
+By default `Install` and `Update` run to completion before responding. Pass
+`"async": true` to get `{"transaction_id": N}` back immediately and poll
+`GetTransaction` for the final result:
+
+```text
+--> {"id": 1, "method": "Install", "params": {"package": "npub1.../myapp", "relay": ["wss://relay.example"], "async": true}}
+<-- {"id": 1, "result": {"transaction_id": 1}}
+
+--> {"id": 2, "method": "GetTransaction", "params": {"transaction_id": 1}}
+<-- {"id": 2, "result": {"status": "running"}}
+   ... later ...
+--> {"id": 3, "method": "GetTransaction", "params": {"transaction_id": 1}}
+<-- {"id": 3, "result": {"status": "succeeded", "result": {"publisher": "...", "name": "myapp", "version": "1.0.0", ...}}}
+```
+
+`CancelTransaction` is cooperative, not forcible: it is only checked between
+packages (before starting the next package in a dependency graph, or the
+next package in an `Update` loop), never mid-download or mid-install of a
+package already in progress. This means a package that has already started
+installing will finish before cancellation takes effect -- the store can
+never be left half-installed by a cancelled transaction.
 
 ## Configuration
 
