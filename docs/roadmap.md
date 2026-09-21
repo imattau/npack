@@ -172,7 +172,7 @@ exercised against real infrastructure, not simulated.
 Remaining work for this phase: richer publisher trust/revocation and
 capability-declaration formalisation.
 
-## Phase 4: App catalogue and index
+## Phase 4: App catalogue and index (done)
 
 Build a local catalogue that can be rebuilt from Nostr:
 
@@ -195,6 +195,41 @@ npack info <publisher>/firefox
 ```
 
 Interactive browsing should not query relays directly for every operation.
+
+Shipped: `npack refresh` fetches every release and revocation event from the
+configured/given relays and writes them into a durable local catalogue file
+(`<store>/catalogue.json`), replacing the old per-query, 5-minute-TTL search
+cache entirely. `npack search` now reads only this catalogue by default --
+zero relay round trips for a normal browsing session -- with `--refresh`
+rebuilding the catalogue from relays first and `--no-cache` doing a one-off
+live relay query without touching the catalogue file at all, so the old
+escape hatches for "I want fresh results right now" still exist, just
+repointed at the catalogue model. `npack info [<publisher>/]<name>` is new:
+it lists every known version across every publisher and os/arch
+combination for a package, newest first, annotated with revocation state
+and (given `--trusted-publisher`) trust status -- reading the catalogue only,
+with no relay fallback, since a single package's full picture is exactly
+what the catalogue exists for.
+
+Verified against real infrastructure, not simulated: `npack refresh`
+against `wss://relay.damus.io` and `wss://nos.lol` populated a real
+catalogue (500 releases fetched), `npack search npack` then found npack's
+own published releases from that catalogue in single-digit milliseconds
+with no relay traffic, `npack info npack` listed three real published
+versions with correct revocation/trust annotations, `--no-cache` was
+confirmed to leave the catalogue file's mtime untouched while still
+returning live results, `--refresh` was confirmed to update it, and the
+daemon's `Search` method was confirmed to serve the same catalogue over a
+real Unix socket.
+
+One gap knowingly left open: the roadmap's "AppStream metadata" column in
+the catalogue diagram above isn't populated. Phase 1's `app` manifest
+metadata (summary, description, icon, ...) is used locally by `npack
+appstream`, but publishing it into Nostr release-event tags was never
+built, so there is currently nothing for a relay-sourced catalogue to
+carry. `npack info` reflects this honestly by not fabricating AppStream
+fields; publishing `app` metadata to Nostr is unstarted future work, likely
+alongside Phase 5's reference GUI once there is a consumer that wants it.
 
 ## Phase 5: Reference GUI
 

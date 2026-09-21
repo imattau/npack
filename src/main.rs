@@ -200,7 +200,9 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         created_at: u64,
     },
-    /// Search Nostr relays for available packages.
+    /// Search the local package catalogue for available packages. Reads
+    /// the catalogue built by `npack refresh` by default; pass --refresh or
+    /// --no-cache to query relays directly instead.
     Search {
         query: String,
         #[arg(long = "relay")]
@@ -209,10 +211,48 @@ enum Command {
         trusted_publishers: Vec<String>,
         #[arg(long, help = "Nostr pubkey whose NIP-65 relay list should be used")]
         pubkey: Option<String>,
-        #[arg(long, help = "Ignore cached results and query relays now")]
+        #[arg(
+            long,
+            help = "Rebuild the local catalogue from relays now, then search it"
+        )]
         refresh: bool,
-        #[arg(long, help = "Do not read or write the local search cache")]
+        #[arg(
+            long,
+            help = "Query relays directly for this search only, without touching the local catalogue"
+        )]
         no_cache: bool,
+        #[arg(
+            long,
+            help = "Local catalogue directory; defaults to the npack state dir"
+        )]
+        store: Option<PathBuf>,
+    },
+    /// Rebuild the local package catalogue from Nostr relays, so `search`
+    /// and `info` can browse it without a relay round trip on every call.
+    Refresh {
+        #[arg(long = "relay")]
+        relays: Vec<String>,
+        #[arg(long, help = "Nostr pubkey whose NIP-65 relay list should be used")]
+        pubkey: Option<String>,
+        #[arg(
+            long,
+            help = "Local catalogue directory; defaults to the npack state dir"
+        )]
+        store: Option<PathBuf>,
+    },
+    /// Show a package's details from the local catalogue (run `npack
+    /// refresh` first): latest version(s), dependencies, and trust/
+    /// revocation state, without querying relays.
+    Info {
+        #[arg(help = "[<publisher>/]<name>")]
+        reference: String,
+        #[arg(long = "trusted-publisher")]
+        trusted_publishers: Vec<String>,
+        #[arg(
+            long,
+            help = "Local catalogue directory; defaults to the npack state dir"
+        )]
+        store: Option<PathBuf>,
     },
     /// Download an artifact by its SHA-256 hash.
     Fetch {
@@ -705,10 +745,12 @@ async fn main() -> Result<()> {
             pubkey,
             refresh,
             no_cache,
+            store,
         } => {
-            let relays = configured_relays(relays, &config)?;
+            let relays = normalize_relays(relays, &config);
             let trusted_publishers = configured_publishers(trusted_publishers, &config)?;
             let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
+            let root = store.unwrap_or_else(default_store);
             search_releases(
                 &query,
                 &relays,
@@ -716,8 +758,28 @@ async fn main() -> Result<()> {
                 pubkey.as_deref(),
                 refresh,
                 no_cache,
+                &root,
             )
             .await?
+        }
+        Command::Refresh {
+            relays,
+            pubkey,
+            store,
+        } => {
+            let relays = configured_relays(relays, &config)?;
+            let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
+            let root = store.unwrap_or_else(default_store);
+            refresh_command(&relays, pubkey.as_deref(), &root).await?
+        }
+        Command::Info {
+            reference,
+            trusted_publishers,
+            store,
+        } => {
+            let trusted_publishers = configured_publishers(trusted_publishers, &config)?;
+            let root = store.unwrap_or_else(default_store);
+            info_command(&reference, &trusted_publishers, &root)?
         }
         Command::Fetch {
             sha256,
@@ -2883,8 +2945,15 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
     })
 }
 
+/// The local package catalogue (Phase 4 of the roadmap): a durable,
+/// explicitly-rebuilt (`npack refresh`) snapshot of every release and
+/// revocation event seen on the configured relays, so `npack search` and
+/// `npack info` can browse locally without a relay round trip on every
+/// call. Unlike the per-query cache this replaces, it is not query-scoped
+/// and has no age-based expiry -- staleness is the user's call, made by
+/// running `npack refresh` again.
 #[derive(Debug, Serialize, Deserialize)]
-struct SearchCache {
+struct Catalogue {
     created_at: u64,
     releases: Vec<Event>,
     revocations: Vec<Event>,
@@ -2899,39 +2968,193 @@ fn revocation_pairs(events: &[Event]) -> Vec<(String, String)> {
         .collect()
 }
 
-fn search_cache_path(
-    query: &str,
-    relays: &[String],
-    trusted_publishers: &[String],
-    user_pubkey: Option<&str>,
-) -> PathBuf {
-    let key =
-        serde_json::to_vec(&(query, relays, trusted_publishers, user_pubkey)).unwrap_or_default();
-    let digest = Sha256::digest(key);
-    default_store()
-        .join("search-cache")
-        .join(format!("{}.json", hex::encode(digest)))
+fn catalogue_path(root: &Path) -> PathBuf {
+    root.join("catalogue.json")
 }
 
-fn load_search_cache(path: &Path, max_age: u64) -> Result<Option<SearchCache>> {
-    let cache: SearchCache = match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .with_context(|| format!("parsing search cache {}", path.display()))?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    if now.saturating_sub(cache.created_at) > max_age {
-        return Ok(None);
+fn load_catalogue(root: &Path) -> Result<Option<Catalogue>> {
+    let path = catalogue_path(root);
+    match fs::read(&path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
+            format!("parsing local catalogue {}", path.display())
+        })?)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
     }
-    Ok(Some(cache))
 }
 
-fn save_search_cache(path: &Path, cache: &SearchCache) -> Result<()> {
+fn save_catalogue(root: &Path, catalogue: &Catalogue) -> Result<()> {
+    let path = catalogue_path(root);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_vec(cache)?)?;
+    fs::write(path, serde_json::to_vec(catalogue)?)?;
+    Ok(())
+}
+
+/// Fetches every release and revocation event from `relays` (plus the
+/// relays in `user_pubkey`'s NIP-65 list, if any) -- the same broad,
+/// unfiltered-by-query fetch `npack refresh` persists and a live
+/// (`--refresh`/`--no-cache`) `npack search` uses directly.
+async fn fetch_catalogue_from_relays(
+    relays: &[String],
+    user_pubkey: Option<&str>,
+) -> Result<Catalogue> {
+    eprint!("Querying {} Nostr relay(s)...", relays.len());
+    io::stderr().flush()?;
+    let started = Instant::now();
+    let client = Client::default();
+    for relay in relays {
+        client
+            .add_relay(relay)
+            .await
+            .with_context(|| format!("adding relay {relay}"))?;
+    }
+    connect_with_timeout(&client).await?;
+    add_user_relays(&client, user_pubkey).await?;
+    let filter = Filter::new().kind(Kind::Custom(RELEASE_KIND)).limit(500);
+    let events = client
+        .fetch_events(filter)
+        .timeout(std::time::Duration::from_secs(10))
+        .await
+        .context("querying Nostr relays")?;
+    let revocation_events = client
+        .fetch_events(Filter::new().kind(Kind::Custom(REVOCATION_KIND)).limit(500))
+        .timeout(std::time::Duration::from_secs(10))
+        .await?
+        .into_iter()
+        .filter(|event| event.verify().is_ok())
+        .filter(revocation_event_is_v1)
+        .collect::<Vec<_>>();
+    eprintln!(" done in {:.1}s", started.elapsed().as_secs_f32());
+    client.disconnect().await;
+    Ok(Catalogue {
+        created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        releases: events.into_iter().collect(),
+        revocations: revocation_events,
+    })
+}
+
+/// Shows a package's known releases from the local catalogue: publisher(s),
+/// the latest version per publisher/os/arch combination, and revocation
+/// state. Reads only `npack refresh`'s catalogue, never a relay -- there is
+/// no `--refresh` escape hatch here, unlike `search`, since a single
+/// package's full picture (all its platform variants) is exactly what the
+/// catalogue is for.
+///
+/// AppStream fields (summary, description, homepage, ...) are not shown:
+/// release events don't currently carry them (Phase 1's `app` manifest
+/// metadata is used for `npack appstream` locally, but publishing it to
+/// Nostr tags is unstarted future work), so there is nothing here to read.
+struct CatalogueEntry {
+    publisher: String,
+    version: Version,
+    os: String,
+    arch: String,
+    release_event_id: String,
+    revoked: bool,
+}
+
+/// Filters a catalogue down to every valid, non-superseded-by-nothing (i.e.
+/// every version is kept, not just the latest) release matching `name` and,
+/// if given, `publisher`, sorted by publisher then newest version first.
+/// Pulled out of `info_command` so the matching/filtering logic is
+/// unit-testable without printing anything.
+fn catalogue_entries_for(
+    catalogue: &Catalogue,
+    publisher: Option<&str>,
+    name: &str,
+) -> Vec<CatalogueEntry> {
+    let revoked = revocation_pairs(&catalogue.revocations);
+    let mut entries = Vec::new();
+    for event in &catalogue.releases {
+        if event.verify().is_err() || !release_event_is_v1(event) {
+            continue;
+        }
+        let Some(event_name) = tag_value(event, "name") else {
+            continue;
+        };
+        if event_name != name {
+            continue;
+        }
+        let event_publisher = event.pubkey.to_hex();
+        if publisher.is_some_and(|publisher| publisher != event_publisher) {
+            continue;
+        }
+        let Some(version_text) = tag_value(event, "version") else {
+            continue;
+        };
+        let Ok(version) = Version::parse(version_text) else {
+            continue;
+        };
+        let is_revoked = revoked.iter().any(|(revoked_publisher, release_id)| {
+            revoked_publisher == &event_publisher && release_id == &event.id.to_hex()
+        });
+        entries.push(CatalogueEntry {
+            publisher: event_publisher,
+            version,
+            os: tag_value(event, "os").unwrap_or("any").to_owned(),
+            arch: tag_value(event, "arch").unwrap_or("any").to_owned(),
+            release_event_id: event.id.to_hex(),
+            revoked: is_revoked,
+        });
+    }
+    entries.sort_by(|a, b| {
+        a.publisher
+            .cmp(&b.publisher)
+            .then(b.version.cmp(&a.version))
+    });
+    entries
+}
+
+fn info_command(reference: &str, trusted_publishers: &[String], root: &Path) -> Result<()> {
+    let catalogue =
+        load_catalogue(root)?.context("no local catalogue found; run `npack refresh` first")?;
+    let (publisher, name) = reference
+        .split_once('/')
+        .map_or((None, reference), |(publisher, name)| {
+            (Some(normalize_publisher_reference(publisher)), name)
+        });
+
+    let entries = catalogue_entries_for(&catalogue, publisher.as_deref(), name);
+    if entries.is_empty() {
+        bail!("no release named {name} found in the local catalogue; try `npack refresh`");
+    }
+
+    println!("{name}");
+    let mut seen_publishers = HashSet::new();
+    for entry in &entries {
+        if seen_publishers.insert(entry.publisher.clone()) {
+            let trust_note = if trusted_publishers.is_empty() {
+                ""
+            } else if trusted_publishers.contains(&entry.publisher) {
+                " (trusted)"
+            } else {
+                " (not in trusted-publisher list)"
+            };
+            println!(
+                "  publisher {}{trust_note}",
+                display_publisher(&entry.publisher)
+            );
+        }
+        let status = if entry.revoked { " [REVOKED]" } else { "" };
+        println!(
+            "    {} {}/{} {}{status}",
+            entry.version, entry.os, entry.arch, entry.release_event_id
+        );
+    }
+    Ok(())
+}
+
+async fn refresh_command(relays: &[String], user_pubkey: Option<&str>, root: &Path) -> Result<()> {
+    let catalogue = fetch_catalogue_from_relays(relays, user_pubkey).await?;
+    let releases = catalogue.releases.len();
+    let revocations = catalogue.revocations.len();
+    save_catalogue(root, &catalogue)?;
+    println!(
+        "refreshed local catalogue: {releases} release(s), {revocations} revocation(s) from {} relay(s)",
+        relays.len()
+    );
     Ok(())
 }
 
@@ -2951,6 +3174,7 @@ async fn search_releases(
     user_pubkey: Option<&str>,
     refresh: bool,
     no_cache: bool,
+    root: &Path,
 ) -> Result<()> {
     for result in search_matching_releases(
         query,
@@ -2959,6 +3183,7 @@ async fn search_releases(
         user_pubkey,
         refresh,
         no_cache,
+        root,
     )
     .await?
     {
@@ -2979,62 +3204,38 @@ async fn search_matching_releases(
     user_pubkey: Option<&str>,
     refresh: bool,
     no_cache: bool,
+    root: &Path,
 ) -> Result<Vec<SearchResult>> {
-    const SEARCH_CACHE_MAX_AGE_SECS: u64 = 300;
-    let cache_path = search_cache_path(query, relays, trusted_publishers, user_pubkey);
-    let cached = if !refresh && !no_cache {
-        load_search_cache(&cache_path, SEARCH_CACHE_MAX_AGE_SECS).unwrap_or(None)
+    // Phase 4: browsing reads the local catalogue by default rather than
+    // querying relays on every call. `--no-cache` does a one-off live query
+    // without touching the catalogue file; `--refresh` rebuilds the
+    // catalogue from relays first (like running `npack refresh`) and then
+    // searches the fresh result.
+    let catalogue = if no_cache {
+        if relays.is_empty() {
+            bail!("no relays configured; pass --relay or configure [network].relays");
+        }
+        fetch_catalogue_from_relays(relays, user_pubkey).await?
+    } else if refresh {
+        if relays.is_empty() {
+            bail!("no relays configured; pass --relay or configure [network].relays");
+        }
+        let catalogue = fetch_catalogue_from_relays(relays, user_pubkey).await?;
+        save_catalogue(root, &catalogue)?;
+        catalogue
     } else {
-        None
-    };
-    let (events, revoked) = if let Some(cache) = cached {
+        let catalogue = load_catalogue(root)?.context(
+            "no local catalogue found; run `npack refresh` first, or pass --refresh/--no-cache to query relays directly",
+        )?;
         let age = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|now| now.as_secs().saturating_sub(cache.created_at))
+            .map(|now| now.as_secs().saturating_sub(catalogue.created_at))
             .unwrap_or_default();
-        eprintln!("Using cached search results ({age}s old)");
-        let revoked = revocation_pairs(&cache.revocations);
-        (cache.releases, revoked)
-    } else {
-        eprint!("Searching {} Nostr relay(s)...", relays.len());
-        io::stderr().flush()?;
-        let started = Instant::now();
-        let client = Client::default();
-        for relay in relays {
-            client
-                .add_relay(relay)
-                .await
-                .with_context(|| format!("adding relay {relay}"))?;
-        }
-        connect_with_timeout(&client).await?;
-        add_user_relays(&client, user_pubkey).await?;
-        let filter = Filter::new().kind(Kind::Custom(RELEASE_KIND)).limit(500);
-        let events = client
-            .fetch_events(filter)
-            .timeout(std::time::Duration::from_secs(10))
-            .await
-            .context("querying Nostr relays")?;
-        let revocation_events = client
-            .fetch_events(Filter::new().kind(Kind::Custom(REVOCATION_KIND)).limit(500))
-            .timeout(std::time::Duration::from_secs(10))
-            .await?
-            .into_iter()
-            .filter(|event| event.verify().is_ok())
-            .filter(revocation_event_is_v1)
-            .collect::<Vec<_>>();
-        let revoked = revocation_pairs(&revocation_events);
-        if !no_cache {
-            let cache = SearchCache {
-                created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-                releases: events.iter().cloned().collect(),
-                revocations: revocation_events,
-            };
-            let _ = save_search_cache(&cache_path, &cache);
-        }
-        eprintln!(" done in {:.1}s", started.elapsed().as_secs_f32());
-        client.disconnect().await;
-        (events.into_iter().collect(), revoked)
+        eprintln!("Searching local catalogue ({age}s old; run `npack refresh` to update)");
+        catalogue
     };
+    let revoked = revocation_pairs(&catalogue.revocations);
+    let events = catalogue.releases;
     let query = query.to_ascii_lowercase();
     let mut latest_versions = HashMap::<(String, String), Version>::new();
     let mut matches = Vec::new();
@@ -3472,13 +3673,16 @@ struct SearchParams {
     refresh: bool,
     #[serde(default)]
     no_cache: bool,
+    #[serde(default)]
+    store: Option<PathBuf>,
 }
 
 async fn daemon_search(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
     let params: SearchParams = serde_json::from_value(params).context("invalid Search params")?;
-    let relays = configured_relays(params.relay, config)?;
+    let relays = normalize_relays(params.relay, config);
     let trusted_publishers = configured_publishers(params.trusted_publisher, config)?;
     let pubkey = params.pubkey.or_else(|| config.identity.pubkey.clone());
+    let root = params.store.unwrap_or_else(default_store);
     let results = search_matching_releases(
         &params.query,
         &relays,
@@ -3486,6 +3690,7 @@ async fn daemon_search(config: &Config, params: serde_json::Value) -> Result<ser
         pubkey.as_deref(),
         params.refresh,
         params.no_cache,
+        &root,
     )
     .await?;
     Ok(serde_json::to_value(results)?)
@@ -4641,7 +4846,12 @@ fn load_config() -> Result<Config> {
     toml::from_str(&contents).with_context(|| format!("parsing npack config {}", path.display()))
 }
 
-fn configured_relays(cli_relays: Vec<String>, config: &Config) -> Result<Vec<String>> {
+/// Merges CLI-supplied relays with `[network].relays`, normalizing and
+/// deduplicating, without requiring the result be non-empty -- for callers
+/// like `npack search`'s default (catalogue-only) path that don't need a
+/// relay at all. `configured_relays` below adds that requirement back for
+/// callers that always need to reach a relay.
+fn normalize_relays(cli_relays: Vec<String>, config: &Config) -> Vec<String> {
     let relays = if cli_relays.is_empty() {
         config.network.relays.clone()
     } else {
@@ -4654,6 +4864,11 @@ fn configured_relays(cli_relays: Vec<String>, config: &Config) -> Result<Vec<Str
         .collect::<Vec<_>>();
     relays.sort();
     relays.dedup();
+    relays
+}
+
+fn configured_relays(cli_relays: Vec<String>, config: &Config) -> Result<Vec<String>> {
+    let relays = normalize_relays(cli_relays, config);
     if relays.is_empty() {
         bail!("no relays configured; pass --relay or configure [network].relays");
     }
@@ -6207,6 +6422,118 @@ mod tests {
         assert!(
             manifest_from_release(&duplicate, Path::new("artifact"), &manifest.sha256).is_err()
         );
+        Ok(())
+    }
+
+    fn sample_release_event(secret_hex: &str, name: &str, version: &str) -> Result<Event> {
+        let manifest = Manifest {
+            app: AppMetadata::default(),
+            publisher: Keys::parse(secret_hex)?.public_key().to_hex(),
+            name: name.into(),
+            version: version.into(),
+            artifact: format!("{name}-{version}.tar.gz").into(),
+            sha256: "00".repeat(32),
+            dependencies: vec![],
+            conflicts: vec![],
+            artifact_event: Some("artifact-event-id".into()),
+            repo: None,
+            commit: None,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            format: "tar.zst".into(),
+            runtime_requires: vec![],
+            provides: vec![],
+            post_install: vec![],
+        };
+        sign_release_event(&manifest, secret_hex, 1_700_000_000)
+    }
+
+    #[test]
+    fn catalogue_round_trips_through_save_and_load() -> Result<()> {
+        let dir = tempdir()?;
+        let event = sample_release_event(&"11".repeat(32), "hello", "1.0.0")?;
+        let catalogue = Catalogue {
+            created_at: 1_700_000_000,
+            releases: vec![event.clone()],
+            revocations: vec![],
+        };
+        save_catalogue(dir.path(), &catalogue)?;
+        assert!(load_catalogue(dir.path().join("nonexistent").as_path())?.is_none());
+        let loaded = load_catalogue(dir.path())?.context("expected a catalogue")?;
+        assert_eq!(loaded.created_at, 1_700_000_000);
+        assert_eq!(loaded.releases.len(), 1);
+        assert_eq!(loaded.releases[0].id, event.id);
+        Ok(())
+    }
+
+    #[test]
+    fn catalogue_entries_lists_every_version_newest_first_and_marks_revoked() -> Result<()> {
+        let secret = "11".repeat(32);
+        let publisher = Keys::parse(&secret)?.public_key().to_hex();
+        let v1 = sample_release_event(&secret, "hello", "1.0.0")?;
+        let v2 = sample_release_event(&secret, "hello", "2.0.0")?;
+        let revocation = sign_revocation_event(&v1, &secret, "superseded", 1_700_000_001)?;
+        let catalogue = Catalogue {
+            created_at: 0,
+            releases: vec![v1.clone(), v2.clone()],
+            revocations: vec![revocation],
+        };
+
+        let entries = catalogue_entries_for(&catalogue, None, "hello");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].version.to_string(), "2.0.0");
+        assert!(!entries[0].revoked);
+        assert_eq!(entries[1].version.to_string(), "1.0.0");
+        assert!(entries[1].revoked);
+
+        assert!(catalogue_entries_for(&catalogue, Some("not-the-publisher"), "hello").is_empty());
+        assert_eq!(
+            catalogue_entries_for(&catalogue, Some(&publisher), "hello").len(),
+            2
+        );
+        assert!(catalogue_entries_for(&catalogue, None, "nonexistent").is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_matching_releases_reads_the_local_catalogue_by_default() -> Result<()> {
+        let dir = tempdir()?;
+        let secret = "11".repeat(32);
+        let event = sample_release_event(&secret, "hello", "1.0.0")?;
+        save_catalogue(
+            dir.path(),
+            &Catalogue {
+                created_at: 0,
+                releases: vec![event.clone()],
+                revocations: vec![],
+            },
+        )?;
+
+        let results =
+            search_matching_releases("hello", &[], &[], None, false, false, dir.path()).await?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].release_event_id, event.id.to_hex());
+
+        assert!(
+            search_matching_releases("nomatch", &[], &[], None, false, false, dir.path())
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_matching_releases_errors_without_a_catalogue_or_relays() -> Result<()> {
+        let dir = tempdir()?;
+        let error = search_matching_releases("hello", &[], &[], None, false, false, dir.path())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("npack refresh"));
+
+        let error = search_matching_releases("hello", &[], &[], None, true, false, dir.path())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no relays configured"));
         Ok(())
     }
 

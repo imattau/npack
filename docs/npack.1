@@ -41,7 +41,13 @@ npack\-revoke\-event(1)
 Create a signed revocation event for a package release
 .TP
 npack\-search(1)
-Search Nostr relays for available packages
+Search the local package catalogue for available packages. Reads the catalogue built by `npack refresh` by default; pass \-\-refresh or \-\-no\-cache to query relays directly instead
+.TP
+npack\-refresh(1)
+Rebuild the local package catalogue from Nostr relays, so `search` and `info` can browse it without a relay round trip on every call
+.TP
+npack\-info(1)
+Show a package\*(Aqs details from the local catalogue (run `npack refresh` first): latest version(s), dependencies, and trust/ revocation state, without querying relays
 .TP
 npack\-fetch(1)
 Download an artifact by its SHA\-256 hash
