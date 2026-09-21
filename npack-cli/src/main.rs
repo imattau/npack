@@ -394,11 +394,11 @@ enum Command {
     },
     /// Render the complete command reference as a man page
     Man,
-    /// Install a package's latest available version, or (aliased as `update`,
-    /// with no package given) update all installed packages.
-    #[command(visible_alias = "update")]
+    /// Update all installed packages, or install/update one by name from
+    /// Nostr when a package is given (aliased as `install-ref`).
+    #[command(name = "update", visible_alias = "install-ref")]
     InstallRef {
-        #[arg(help = "[<publisher>/]<name>; omit (or use `npack update`) to update everything")]
+        #[arg(help = "[<publisher>/]<name>; omit to update every installed package")]
         package: Option<String>,
         #[arg(long = "relay", help = "Relay URL to query; repeatable")]
         relays: Vec<String>,
