@@ -505,6 +505,37 @@ package already in progress. This means a package that has already started
 installing will finish before cancellation takes effect -- the store can
 never be left half-installed by a cancelled transaction.
 
+### npackd-user vs. npackd-system, and PolicyKit
+
+Plain `npack daemon` is npackd-user: it runs as your own account and serves
+only your own `--user`/default store (`~/.local`) -- there is nothing to gate
+since it never acts on anyone else's behalf.
+
+```bash
+npack daemon --system
+```
+
+`npack daemon --system` is npackd-system: a privileged instance intended to
+run as a systemd system service (`packaging/npackd-system.service`), always
+as root, serving the system store (`/`, state in `/var/lib/npack`). It
+refuses to start unless it is actually running as root. Because its socket
+(`/run/npackd.sock` by default) is left world-connectable, it authorizes
+each request itself rather than relying on socket permissions: a root peer
+is trusted outright, but a non-root peer's `Install`, `Remove`, or `Update`
+is checked against PolicyKit before it runs, using the peer's real
+credentials read off the socket (`SO_PEERCRED`), not anything the client
+claims. This is the same model PackageKit and other system package
+services use.
+
+The three actions -- `io.npack.install`, `io.npack.remove`, `io.npack.update`
+-- are defined in [`packaging/io.npack.policy`](../packaging/io.npack.policy),
+which a system package installs to `/usr/share/polkit-1/actions/`. They
+default to `auth_admin`, so a non-root caller normally sees their desktop's
+usual "authenticate as an administrator" prompt (handled by whatever
+PolicyKit agent their session runs) the first time they ask npackd-system to
+install, remove, or update something. `GetTransaction`, `CancelTransaction`,
+and the read-only methods are never gated.
+
 ## Configuration
 
 Configuration is stored at the platform's user config path, normally:
@@ -787,5 +818,5 @@ npack verify-installed [--user|--system]
 npack remove <publisher>/<name> [--user|--system]
 npack publish <manifest> --secret-key <key> [options]
 npack appstream <file.npk> [--output <metainfo.xml>]
-npack daemon [--socket <path>]
+npack daemon [--socket <path>] [--system]
 ```

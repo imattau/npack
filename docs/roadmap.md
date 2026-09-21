@@ -130,9 +130,47 @@ deleting it; formalising file ownership/conflicts already existed
 (`ensure_install_paths_available`, `remove_stale_files`) and was not part of
 this slice.
 
-Remaining work for this phase: the `npackd-user`/`npackd-system` daemon
-split and PolicyKit-gated privileged installation, plus richer publisher
-trust/revocation and capability-declaration formalisation.
+Shipped: the `npackd-user`/`npackd-system` daemon split and PolicyKit-gated
+privileged installation. `npack daemon` (unchanged) is npackd-user, serving a
+single user's own `~/.local` store with no additional gating -- the daemon
+only ever acts on behalf of the account that started it. `npack daemon
+--system` is npackd-system: it refuses to start unless run as root (normally
+as the systemd system service in `packaging/npackd-system.service`), binds a
+world-connectable socket (`/run/npackd.sock`, mode 0666, matching how the
+system D-Bus and PackageKit sockets work), and reads each connecting peer's
+real uid and pid off the Unix socket itself via `SO_PEERCRED`
+(`UnixStream::peer_cred`) rather than trusting anything the client claims.
+
+A root peer of npackd-system is already fully privileged and is never
+gated. A non-root peer's `Install`, `Remove`, or `Update` request is checked
+against PolicyKit before it runs: npackd-system shells out to `pkcheck
+--action-id io.npack.<install|remove|update> --process <peer-pid>
+--allow-user-interaction`, which talks to `polkitd` over D-Bus on npack's
+behalf and can trigger a graphical authentication prompt via whatever
+polkit agent the peer's session is running. The three action ids are
+defined in `packaging/io.npack.policy` (installed to
+`/usr/share/polkit-1/actions/` by system packaging -- not written by npack
+at runtime) and default to `auth_admin`, the same "requires an administrator
+password" default PackageKit itself uses for `package-install`. A peer whose
+credentials can't be read at all is denied rather than treated as
+authorized, and `GetTransaction`/`CancelTransaction`/read-only methods are
+never gated, since cancelling only flips a flag the already-authorized
+transaction's own loop checks.
+
+Chose shelling out to `pkcheck` over a `zbus`/`zbus_polkit` D-Bus client: it
+is a single request/response authorization check, `pkcheck` is the tool
+PolicyKit itself ships for exactly this, and it avoids adding a D-Bus client
+library and its own async runtime integration for one call. Verified against
+the real `pkcheck`/`polkitd` on a machine with PolicyKit actually installed
+and running, not a mock authority: an unregistered action correctly denies a
+non-root peer before any package resolution happens (this ships as an
+automated test using the genuine `pkcheck` binary in CI), and a locally
+added `allow_active: yes` polkit rule for `io.npack.install` was confirmed
+to let the same request through -- so both the deny and the allow paths were
+exercised against real infrastructure, not simulated.
+
+Remaining work for this phase: richer publisher trust/revocation and
+capability-declaration formalisation.
 
 ## Phase 4: App catalogue and index
 
