@@ -27,7 +27,7 @@ Add first-class AppStream support:
 Goal: an npack package can describe itself in the language already understood
 by Linux application stores.
 
-## Phase 2: Stable service layer
+## Phase 2: Stable service layer (in progress)
 
 Introduce `npackd` as the common local backend for the CLI, GUI store plugins,
 and other tools:
@@ -48,18 +48,29 @@ CLI / GUI plugins / other tools
 Keep the API local and narrow. D-Bus is the leading Linux-native option; a
 Unix socket API remains an alternative.
 
-Core operations:
+Shipped: `npack daemon` runs npackd as a JSON-RPC-over-Unix-socket service
+(newline-delimited JSON, defaulting to `$XDG_RUNTIME_DIR/npackd.sock`)
+exposing:
 
 ```text
 Search()          GetPackage()
 ListInstalled()   Install()
 Remove()          Update()
-CheckUpdates()    GetTransaction()
-CancelTransaction()
+CheckUpdates()
 ```
 
-Expose progress and transaction events. GUI integrations should not need to
-understand Nostr, Blossom, or `.npk` internals.
+Chose a Unix socket over D-Bus for this first slice: no new system dependency
+or session/system bus requirement, so it behaves the same in minimal and
+containerized environments. A D-Bus adapter in front of the same handlers
+remains possible later if a desktop-store integration phase needs it.
+
+Remaining work:
+
+- `GetTransaction()`/`CancelTransaction()` and streamed progress events for
+  long-running `Install`/`Update` calls -- npackd currently handles one
+  connection at a time and responds only once an operation completes.
+- Expose progress and transaction events. GUI integrations should not need to
+  understand Nostr, Blossom, or `.npk` internals.
 
 ## Phase 3: Security and privilege separation
 

@@ -433,6 +433,46 @@ derivation generator would want to build one `fetchurl`-plus-unpack
 derivation per package in the graph, without needing a separate `npack
 resolve` invocation for every dependency.
 
+## Running npackd (local service API)
+
+`npack daemon` runs npackd, a common local backend that a GUI store or other
+tool can talk to without needing to understand Nostr, Blossom, or `.npk`
+internals -- the CLI itself is one possible client:
+
+```bash
+npack daemon --socket $XDG_RUNTIME_DIR/npackd.sock
+```
+
+`--socket` defaults to `$XDG_RUNTIME_DIR/npackd.sock`. The protocol is
+newline-delimited JSON over that Unix socket: one JSON object request per
+line, one JSON object response per line, matched by `id`.
+
+```text
+--> {"id": 1, "method": "ListInstalled", "params": {"user": true}}
+<-- {"id": 1, "result": [{"publisher": "npub1...", "name": "myapp", "version": "1.0.0", ...}]}
+
+--> {"id": 2, "method": "GetPackage", "params": {"package": "npub1.../myapp", "relay": ["wss://relay.example"]}}
+<-- {"id": 2, "result": {"publisher": "...", "name": "myapp", "version": "1.2.0", "sha256": "...", ...}}
+```
+
+Supported methods, mirroring the CLI operations above:
+
+| Method | Params | Result |
+| --- | --- | --- |
+| `Search` | `query`, `relay[]`, `trusted_publisher[]`, `pubkey`, `refresh`, `no_cache` | Array of matching releases. |
+| `GetPackage` | `package`, `relay[]`, `requirement`, `os`, `arch`, `trusted_publisher[]`, `store`, `user` | The same resolved-metadata object as `npack resolve`. |
+| `ListInstalled` | `user`, `store` | Array of installed packages. |
+| `Install` | `package`, `requirement`, `relay[]`, `server[]`, `user`, `store`, `allow_capability[]` | The installed package's record. |
+| `Remove` | `package`, `user`, `store` | `{"removed": "<package>"}`. |
+| `Update` | `package` (omit for all), `relay[]`, `server[]`, `user`, `store`, `allow_capability[]` | Array of per-package update outcomes. |
+| `CheckUpdates` | `package` (omit for all), `relay[]`, `trusted_publisher[]`, `user`, `store` | Array of `{reference, current_version, available_version}`. |
+
+An unknown method or a request that fails to deserialize its params returns
+`{"id": ..., "error": "..."}` instead of `result`. Connections are handled
+one at a time -- npackd does not yet stream install/update progress back to
+the client; a client sees the final result once the operation completes.
+GetTransaction/CancelTransaction-style progress reporting is future work.
+
 ## Configuration
 
 Configuration is stored at the platform's user config path, normally:
@@ -696,4 +736,5 @@ npack verify-installed [--user|--system]
 npack remove <publisher>/<name> [--user|--system]
 npack publish <manifest> --secret-key <key> [options]
 npack appstream <file.npk> [--output <metainfo.xml>]
+npack daemon [--socket <path>]
 ```
