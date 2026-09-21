@@ -466,7 +466,7 @@ Supported methods, mirroring the CLI operations above:
 | `Remove` | `package`, `user`, `store` | `{"removed": "<package>"}`. |
 | `Update` | `package` (omit for all), `relay[]`, `server[]`, `user`, `store`, `allow_capability[]`, `async` | Array of per-package update outcomes, or `{"transaction_id": N}` if `async` is true. |
 | `CheckUpdates` | `package` (omit for all), `relay[]`, `trusted_publisher[]`, `user`, `store` | Array of `{reference, current_version, available_version}`. |
-| `GetTransaction` | `transaction_id` | `{"status": "running"}`, `{"status": "succeeded", "result": ...}`, `{"status": "failed", "error": "..."}`, or `{"status": "cancelled"}`. |
+| `GetTransaction` | `transaction_id` | `{"status": "running", "progress": {...}}`, `{"status": "succeeded", "result": ...}`, `{"status": "failed", "error": "..."}`, or `{"status": "cancelled"}`. |
 | `CancelTransaction` | `transaction_id` | `{"cancel_requested": true}`. |
 
 An unknown method or a request that fails to deserialize its params returns
@@ -475,18 +475,28 @@ concurrently.
 
 By default `Install` and `Update` run to completion before responding. Pass
 `"async": true` to get `{"transaction_id": N}` back immediately and poll
-`GetTransaction` for the final result:
+`GetTransaction` for progress and the final result:
 
 ```text
 --> {"id": 1, "method": "Install", "params": {"package": "npub1.../myapp", "relay": ["wss://relay.example"], "async": true}}
 <-- {"id": 1, "result": {"transaction_id": 1}}
 
 --> {"id": 2, "method": "GetTransaction", "params": {"transaction_id": 1}}
-<-- {"id": 2, "result": {"status": "running"}}
+<-- {"id": 2, "result": {"status": "running", "progress": {"stage": "resolving", "package": "npub1.../myapp"}}}
    ... later ...
 --> {"id": 3, "method": "GetTransaction", "params": {"transaction_id": 1}}
-<-- {"id": 3, "result": {"status": "succeeded", "result": {"publisher": "...", "name": "myapp", "version": "1.0.0", ...}}}
+<-- {"id": 3, "result": {"status": "running", "progress": {"stage": "downloading", "package": "npub1.../myapp", "detail": "3 mirror(s)"}}}
+   ... later ...
+--> {"id": 4, "method": "GetTransaction", "params": {"transaction_id": 1}}
+<-- {"id": 4, "result": {"status": "succeeded", "result": {"publisher": "...", "name": "myapp", "version": "1.0.0", ...}}}
 ```
+
+`progress.stage` while `running` is one of `connecting`, `resolving`,
+`downloading`, `updating` (during `Update`), or `installed`, each paired with
+the publisher/name of the package currently being processed. This is
+per-package status, not a per-byte download progress bar -- it is updated at
+the same checkpoints `CancelTransaction` is checked at (see below), not on
+every downloaded chunk.
 
 `CancelTransaction` is cooperative, not forcible: it is only checked between
 packages (before starting the next package in a dependency graph, or the
