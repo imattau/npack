@@ -23,7 +23,7 @@ npack is an independent package manager whose registry metadata will be publishe
     npack search <query> [--relay <relay-url>] [--refresh] [--no-cache] [--store <path>]
     npack info [<publisher>/]<name> [--trusted-publisher <hex>] [--store <path>]
     npack fetch <sha256> --server <blossom-url> --output <path>
-    npack install-ref [<publisher>/]<name> --relay <relay-url> [--user|--system] [--store <path>] [--lockfile <path>] [--locked] [--allow-capability <capability>] [--check]
+    npack install-ref [<publisher>/]<name> --relay <relay-url> [--user|--system] [--store <path>] [--lockfile <path>] [--locked] [--allow-capability <capability>] [--check]  (visibly aliased as `npack update`)
     npack resolve [<publisher>/]<name> --relay <relay-url> [--requirement <semver>] [--lockfile <path>] [--locked] [--recursive]
     npack pack <source-directory> --output <package.npk>
     npack remove <publisher>/<name> [--user|--system] [--store <path>]

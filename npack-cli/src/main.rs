@@ -103,13 +103,23 @@ struct LockedPackage {
 #[derive(Subcommand)]
 enum Command {
     /// Calculate the SHA-256 hash of a file.
-    Hash { artifact: PathBuf },
+    Hash {
+        #[arg(help = "File to hash")]
+        artifact: PathBuf,
+    },
     /// Verify a package archive or external manifest.
-    Verify { target: PathBuf },
+    Verify {
+        #[arg(help = "Package archive (.npk) or manifest file to verify")]
+        target: PathBuf,
+    },
     /// Install a local .npk or resolve and install a package from Nostr.
     Install {
+        #[arg(help = "Path to a local .npk file, or [<publisher>/]<name> to resolve from Nostr")]
         target: String,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Package store root; defaults to /var/lib/npack, or ~/.local with --user"
+        )]
         store: Option<PathBuf>,
         #[arg(
             long,
@@ -123,26 +133,46 @@ enum Command {
             help = "Install into the system prefix (the default)"
         )]
         system: bool,
-        #[arg(long = "allow-capability")]
+        #[arg(
+            long = "allow-capability",
+            help = "Runtime capability this install may grant (e.g. service-manager); repeatable"
+        )]
         allowed_capabilities: Vec<String>,
-        #[arg(long = "relay")]
+        #[arg(long = "relay", help = "Relay URL to query; repeatable")]
         relays: Vec<String>,
-        #[arg(long = "server")]
+        #[arg(
+            long = "server",
+            help = "Blossom server URL to fetch the artifact from; repeatable"
+        )]
         servers: Vec<String>,
-        #[arg(long = "trusted-publisher")]
+        #[arg(
+            long = "trusted-publisher",
+            help = "Hex pubkey to trust for this operation; repeatable"
+        )]
         trusted_publishers: Vec<String>,
         #[arg(long, help = "Nostr pubkey whose NIP-65 relay list should be used")]
         pubkey: Option<String>,
         #[arg(long, help = "Write the resolved dependency graph to a lockfile")]
         lockfile: Option<PathBuf>,
-        #[arg(long, requires = "lockfile")]
+        #[arg(
+            long,
+            requires = "lockfile",
+            help = "Only install packages pinned in --lockfile, failing if the resolved graph differs"
+        )]
         locked: bool,
-        #[arg(long, requires = "locked")]
+        #[arg(
+            long,
+            requires = "locked",
+            help = "Use only the lockfile's pinned metadata; never contact relays or Blossom"
+        )]
         offline: bool,
     },
     /// List installed packages.
     List {
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Package store root; defaults to /var/lib/npack, or ~/.local with --user"
+        )]
         store: Option<PathBuf>,
         #[arg(
             long,
@@ -159,7 +189,10 @@ enum Command {
     },
     /// Verify the files and metadata of installed packages.
     VerifyInstalled {
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Package store root; defaults to /var/lib/npack, or ~/.local with --user"
+        )]
         store: Option<PathBuf>,
         #[arg(
             long,
@@ -176,38 +209,60 @@ enum Command {
     },
     /// Create a signed Nostr package release event.
     ReleaseEvent {
+        #[arg(help = "Path to the package manifest")]
         manifest: PathBuf,
         #[arg(
             long,
             help = "32-byte hex-encoded Nostr secret key; defaults to the registered key"
         )]
         secret_key: Option<String>,
-        #[arg(long, default_value_t = 0)]
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "Event timestamp in unix seconds; 0 uses the current time"
+        )]
         created_at: u64,
     },
     /// Verify a signed release event against a package manifest.
-    VerifyEvent { event: PathBuf, manifest: PathBuf },
+    VerifyEvent {
+        #[arg(help = "Path to the signed release event JSON")]
+        event: PathBuf,
+        #[arg(help = "Path to the package manifest to check it against")]
+        manifest: PathBuf,
+    },
     /// Create a signed revocation event for a package release.
     RevokeEvent {
+        #[arg(help = "Path to the release event being revoked")]
         event: PathBuf,
         #[arg(
             long,
             help = "32-byte hex-encoded Nostr secret key; defaults to the registered key"
         )]
         secret_key: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Human-readable reason for the revocation")]
         reason: String,
-        #[arg(long, default_value_t = 0)]
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "Event timestamp in unix seconds; 0 uses the current time"
+        )]
         created_at: u64,
     },
     /// Search the local package catalogue for available packages. Reads
     /// the catalogue built by `npack refresh` by default; pass --refresh or
     /// --no-cache to query relays directly instead.
     Search {
+        #[arg(help = "Text to match against package names and publishers")]
         query: String,
-        #[arg(long = "relay")]
+        #[arg(
+            long = "relay",
+            help = "Relay URL to query with --refresh/--no-cache; repeatable"
+        )]
         relays: Vec<String>,
-        #[arg(long = "trusted-publisher")]
+        #[arg(
+            long = "trusted-publisher",
+            help = "Hex pubkey to trust for this operation; repeatable"
+        )]
         trusted_publishers: Vec<String>,
         #[arg(long, help = "Nostr pubkey whose NIP-65 relay list should be used")]
         pubkey: Option<String>,
@@ -230,7 +285,7 @@ enum Command {
     /// Rebuild the local package catalogue from Nostr relays, so `search`
     /// and `info` can browse it without a relay round trip on every call.
     Refresh {
-        #[arg(long = "relay")]
+        #[arg(long = "relay", help = "Relay URL to query; repeatable")]
         relays: Vec<String>,
         #[arg(long, help = "Nostr pubkey whose NIP-65 relay list should be used")]
         pubkey: Option<String>,
@@ -246,7 +301,10 @@ enum Command {
     Info {
         #[arg(help = "[<publisher>/]<name>")]
         reference: String,
-        #[arg(long = "trusted-publisher")]
+        #[arg(
+            long = "trusted-publisher",
+            help = "Hex pubkey to trust for this operation; repeatable"
+        )]
         trusted_publishers: Vec<String>,
         #[arg(
             long,
@@ -256,36 +314,42 @@ enum Command {
     },
     /// Download an artifact by its SHA-256 hash.
     Fetch {
+        #[arg(help = "SHA-256 hash of the artifact to download")]
         sha256: String,
-        #[arg(long)]
+        #[arg(long, help = "Blossom server URL to fetch from")]
         server: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Path to write the downloaded artifact to")]
         output: PathBuf,
     },
     /// Upload an artifact and publish its package events.
     Publish {
+        #[arg(help = "Path to the package manifest")]
         manifest: PathBuf,
         #[arg(
             long,
             help = "32-byte hex-encoded Nostr secret key; defaults to the registered key"
         )]
         secret_key: Option<String>,
-        #[arg(long = "relay")]
+        #[arg(long = "relay", help = "Relay URL to publish to; repeatable")]
         relays: Vec<String>,
-        #[arg(long = "server")]
+        #[arg(
+            long = "server",
+            help = "Blossom server URL to upload the artifact to; repeatable"
+        )]
         servers: Vec<String>,
         #[arg(long, help = "Nostr pubkey whose NIP-65 write relays should be used")]
         pubkey: Option<String>,
     },
     /// Publish a signed Nostr text note
     Announce {
+        #[arg(help = "Note text; omit to publish only --release-event")]
         content: Option<String>,
         #[arg(
             long,
             help = "Nostr secret key in nsec or 32-byte hexadecimal form; defaults to the registered key"
         )]
         secret_key: Option<String>,
-        #[arg(long = "relay")]
+        #[arg(long = "relay", help = "Relay URL to publish to; repeatable")]
         relays: Vec<String>,
         #[arg(
             long,
@@ -315,10 +379,11 @@ enum Command {
     },
     /// Create package metadata for a new project.
     Init {
+        #[arg(help = "Directory to write the new manifest into")]
         directory: PathBuf,
-        #[arg(long)]
+        #[arg(long, help = "Package name")]
         name: String,
-        #[arg(long, default_value = "0.1.0")]
+        #[arg(long, default_value = "0.1.0", help = "Initial package version")]
         version: String,
         #[arg(long, help = "Publisher npub or hexadecimal public key")]
         publisher: String,
@@ -329,15 +394,23 @@ enum Command {
     },
     /// Render the complete command reference as a man page
     Man,
-    /// Install a package's latest available version, or update all packages.
-    #[command(alias = "update")]
+    /// Install a package's latest available version, or (aliased as `update`,
+    /// with no package given) update all installed packages.
+    #[command(visible_alias = "update")]
     InstallRef {
+        #[arg(help = "[<publisher>/]<name>; omit (or use `npack update`) to update everything")]
         package: Option<String>,
-        #[arg(long = "relay")]
+        #[arg(long = "relay", help = "Relay URL to query; repeatable")]
         relays: Vec<String>,
-        #[arg(long = "server")]
+        #[arg(
+            long = "server",
+            help = "Blossom server URL to fetch the artifact from; repeatable"
+        )]
         servers: Vec<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Package store root; defaults to /var/lib/npack, or ~/.local with --user"
+        )]
         store: Option<PathBuf>,
         #[arg(
             long,
@@ -351,17 +424,31 @@ enum Command {
             help = "Install into the system prefix (the default)"
         )]
         system: bool,
-        #[arg(long = "trusted-publisher")]
+        #[arg(
+            long = "trusted-publisher",
+            help = "Hex pubkey to trust for this operation; repeatable"
+        )]
         trusted_publishers: Vec<String>,
         #[arg(long, help = "Nostr pubkey whose NIP-65 relay list should be used")]
         pubkey: Option<String>,
         #[arg(long, help = "Write the resolved dependency graph to a lockfile")]
         lockfile: Option<PathBuf>,
-        #[arg(long, requires = "lockfile")]
+        #[arg(
+            long,
+            requires = "lockfile",
+            help = "Only install packages pinned in --lockfile, failing if the resolved graph differs"
+        )]
         locked: bool,
-        #[arg(long, requires = "locked")]
+        #[arg(
+            long,
+            requires = "locked",
+            help = "Use only the lockfile's pinned metadata; never contact relays or Blossom"
+        )]
         offline: bool,
-        #[arg(long = "allow-capability")]
+        #[arg(
+            long = "allow-capability",
+            help = "Runtime capability this install may grant (e.g. service-manager); repeatable"
+        )]
         allowed_capabilities: Vec<String>,
         #[arg(long, help = "Report available updates without installing them")]
         check: bool,
@@ -373,22 +460,30 @@ enum Command {
     /// declarative package manager (e.g. Nix) can fetch and manage the
     /// artifact itself.
     Resolve {
+        #[arg(help = "[<publisher>/]<name>")]
         package: String,
         #[arg(long, help = "Version requirement to resolve, e.g. '>=1.2.0'")]
         requirement: Option<String>,
-        #[arg(long = "relay")]
+        #[arg(long = "relay", help = "Relay URL to query; repeatable")]
         relays: Vec<String>,
         #[arg(long, help = "Target operating system; defaults to the host OS")]
         os: Option<String>,
         #[arg(long, help = "Target architecture; defaults to the host architecture")]
         arch: Option<String>,
-        #[arg(long = "trusted-publisher")]
+        #[arg(
+            long = "trusted-publisher",
+            help = "Hex pubkey to trust for this operation; repeatable"
+        )]
         trusted_publishers: Vec<String>,
         #[arg(long, help = "Nostr pubkey whose NIP-65 relay list should be used")]
         pubkey: Option<String>,
         #[arg(long, help = "Resolve against a pinned entry in this lockfile")]
         lockfile: Option<PathBuf>,
-        #[arg(long, requires = "lockfile")]
+        #[arg(
+            long,
+            requires = "lockfile",
+            help = "Only resolve a version pinned in --lockfile"
+        )]
         locked: bool,
         #[arg(
             long,
@@ -398,14 +493,19 @@ enum Command {
     },
     /// Build a deterministic .npk archive from a package directory.
     Pack {
+        #[arg(help = "Package source directory containing the manifest")]
         source: PathBuf,
-        #[arg(long)]
+        #[arg(long, help = "Path to write the .npk archive to")]
         output: PathBuf,
     },
     /// Remove an installed package.
     Remove {
+        #[arg(help = "<publisher>/<name>")]
         package: String,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Package store root; defaults to /var/lib/npack, or ~/.local with --user"
+        )]
         store: Option<PathBuf>,
         #[arg(
             long,
@@ -421,15 +521,20 @@ enum Command {
         system: bool,
     },
     /// Display metadata embedded in an .npk archive.
-    Inspect { artifact: PathBuf },
+    Inspect {
+        #[arg(help = "Path to the .npk archive")]
+        artifact: PathBuf,
+    },
     /// Extract the embedded manifest from an .npk archive.
     Manifest {
+        #[arg(help = "Path to the .npk archive")]
         artifact: PathBuf,
-        #[arg(long)]
+        #[arg(long, help = "Path to write the extracted manifest JSON to")]
         output: PathBuf,
     },
     /// Generate an AppStream component XML document from an .npk archive's manifest.
     Appstream {
+        #[arg(help = "Path to the .npk archive")]
         artifact: PathBuf,
         #[arg(long, help = "Write the AppStream XML to this path instead of stdout")]
         output: Option<PathBuf>,
