@@ -27,7 +27,7 @@ Add first-class AppStream support:
 Goal: an npack package can describe itself in the language already understood
 by Linux application stores.
 
-## Phase 2: Stable service layer (in progress)
+## Phase 2: Stable service layer (done)
 
 Introduce `npackd` as the common local backend for the CLI, GUI store plugins,
 and other tools:
@@ -77,10 +77,16 @@ package in a dependency graph, or the next package in an `Update` loop),
 never mid-download or mid-install of a package already in progress -- a
 cancelled transaction cannot leave the store half-installed.
 
-Remaining work:
+`GetTransaction` also reports a live progress snapshot (`connecting`,
+`resolving`/`downloading`/`updating` a named package, `installed`) while a
+transaction is `running`, updated at the same package-level checkpoints as
+cancellation -- not per-byte download progress, but enough for a GUI to show
+"resolving foo...", "downloading bar (3 mirrors)...", etc. without polling
+`ps` or scraping stderr.
 
-- Streamed progress events (e.g. per-file download progress) rather than a
-  single final result once `GetTransaction` reports the transaction done.
+Remaining work for a future phase: per-byte/per-file download progress
+within a single package's fetch, if a GUI needs a progress bar rather than a
+status line.
 
 ## Phase 3: Security and privilege separation
 

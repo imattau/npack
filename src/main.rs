@@ -918,7 +918,7 @@ async fn install_remote_command(
     offline: bool,
     allowed_capabilities: Vec<String>,
     config: &Config,
-    cancel: Option<Arc<AtomicBool>>,
+    control: Option<Arc<TransactionControl>>,
 ) -> Result<()> {
     let relays = if offline {
         Vec::new()
@@ -956,7 +956,7 @@ async fn install_remote_command(
             blossom_servers: &servers,
             allowed_capabilities: &allowed_capabilities,
             offline,
-            cancel,
+            control,
         },
         requirement,
     )
@@ -1625,10 +1625,11 @@ struct InstallRefOptions<'a> {
     blossom_servers: &'a [String],
     allowed_capabilities: &'a [String],
     offline: bool,
-    /// Checked at the start of processing each package in the dependency
-    /// graph; never mid-download or mid-install of a package already in
-    /// progress, so cancellation cannot leave the store half-installed.
-    cancel: Option<Arc<AtomicBool>>,
+    /// Cancellation is checked at the start of processing each package in
+    /// the dependency graph; never mid-download or mid-install of a package
+    /// already in progress, so it cannot leave the store half-installed.
+    /// Progress is updated at the same checkpoints.
+    control: Option<Arc<TransactionControl>>,
 }
 
 async fn install_ref(
@@ -1648,10 +1649,13 @@ async fn install_ref(
         blossom_servers,
         allowed_capabilities,
         offline,
-        cancel,
+        control,
     } = options;
     let client = Client::default();
     if !offline {
+        if let Some(control) = &control {
+            control.set_progress("connecting", None, None);
+        }
         eprint!("Connecting to {} relay(s)...", relays.len());
         io::stderr().flush()?;
         let started = Instant::now();
@@ -1676,7 +1680,7 @@ async fn install_ref(
         installed: Vec::new(),
         selected: HashMap::new(),
         offline,
-        cancel,
+        control,
     };
     install_remote_package(&mut state, name.to_owned(), publisher, requirement).await?;
     if !offline {
@@ -1918,7 +1922,7 @@ struct ResolverState<'a> {
     installed: Vec<String>,
     selected: HashMap<String, Manifest>,
     offline: bool,
-    cancel: Option<Arc<AtomicBool>>,
+    control: Option<Arc<TransactionControl>>,
 }
 
 fn cached_release_path(root: &Path, package: &LockedPackage) -> PathBuf {
@@ -2386,9 +2390,9 @@ fn install_remote_package<'a, 'b>(
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         if state
-            .cancel
+            .control
             .as_deref()
-            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+            .is_some_and(TransactionControl::is_cancelled)
         {
             bail!("installation cancelled");
         }
@@ -2463,6 +2467,9 @@ fn install_remote_package<'a, 'b>(
         if !state.offline {
             eprintln!("Resolving {}...", display_package_reference(&install_key));
         }
+        if let Some(control) = &state.control {
+            control.set_progress("resolving", Some(&install_key), None);
+        }
         let release = if state.offline {
             let package = locked_package.context("offline installs require a lockfile")?;
             let release = load_cached_release(state.root, package)?;
@@ -2528,6 +2535,13 @@ fn install_remote_package<'a, 'b>(
                 manifest.version,
                 urls.len()
             );
+            if let Some(control) = &state.control {
+                control.set_progress(
+                    "downloading",
+                    Some(&install_key),
+                    Some(format!("{} mirror(s)", urls.len())),
+                );
+            }
             io::stderr().flush()?;
             let started = Instant::now();
             let mut bytes = None;
@@ -2604,6 +2618,9 @@ fn install_remote_package<'a, 'b>(
             manifest.name,
             manifest.version
         );
+        if let Some(control) = &state.control {
+            control.set_progress("installed", Some(&install_key), None);
+        }
         state.visiting.pop();
         state.installed.push(install_key);
         Ok(())
@@ -3134,9 +3151,63 @@ enum TransactionStatus {
     Cancelled,
 }
 
+/// Snapshot of what a running transaction is doing right now. Updated at
+/// package-level checkpoints in the install path (connecting, resolving a
+/// package, downloading its artifact, finishing its install) -- not
+/// per-byte download progress.
+#[derive(Debug, Clone, Default, Serialize)]
+struct InstallProgress {
+    stage: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+/// Shared per-transaction cancellation flag and progress snapshot, threaded
+/// through `InstallRefOptions`/`ResolverState` into the install path.
+struct TransactionControl {
+    cancel: AtomicBool,
+    progress: std::sync::Mutex<InstallProgress>,
+}
+
+impl TransactionControl {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cancel: AtomicBool::new(false),
+            progress: std::sync::Mutex::new(InstallProgress::default()),
+        })
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    fn set_progress(&self, stage: &str, package: Option<&str>, detail: Option<String>) {
+        if let Ok(mut progress) = self.progress.lock() {
+            *progress = InstallProgress {
+                stage: stage.to_owned(),
+                package: package.map(str::to_owned),
+                detail,
+            };
+        }
+    }
+
+    fn snapshot(&self) -> InstallProgress {
+        self.progress
+            .lock()
+            .map(|progress| progress.clone())
+            .unwrap_or_default()
+    }
+}
+
 struct TransactionEntry {
     status: TransactionStatus,
-    cancel: Arc<AtomicBool>,
+    control: Arc<TransactionControl>,
 }
 
 struct DaemonState {
@@ -3155,23 +3226,23 @@ impl DaemonState {
     }
 
     /// Registers a new transaction and spawns `make_work` (given a fresh
-    /// cancellation flag) to run in the background, recording its outcome
+    /// `TransactionControl`) to run in the background, recording its outcome
     /// once it completes. Returns the transaction id immediately.
     fn start_transaction<F, Fut>(self: &Arc<Self>, make_work: F) -> u64
     where
-        F: FnOnce(Arc<AtomicBool>) -> Fut,
+        F: FnOnce(Arc<TransactionControl>) -> Fut,
         Fut: Future<Output = Result<serde_json::Value>> + Send + 'static,
     {
         let id = self.next_transaction_id.fetch_add(1, Ordering::Relaxed);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let control = TransactionControl::new();
         self.transactions.lock().unwrap().insert(
             id,
             TransactionEntry {
                 status: TransactionStatus::Running,
-                cancel: cancel.clone(),
+                control: control.clone(),
             },
         );
-        let work = make_work(cancel);
+        let work = make_work(control);
         let state = self.clone();
         tokio::spawn(async move {
             let status = match work.await {
@@ -3416,7 +3487,7 @@ async fn daemon_install(
 async fn daemon_install_sync(
     config: &Config,
     params: InstallParams,
-    cancel: Option<Arc<AtomicBool>>,
+    control: Option<Arc<TransactionControl>>,
 ) -> Result<serde_json::Value> {
     let package = params.package.clone();
     install_remote_command(
@@ -3434,7 +3505,7 @@ async fn daemon_install_sync(
         false,
         params.allow_capability,
         config,
-        cancel,
+        control,
     )
     .await?;
     let use_user = params.user || config.install.user;
@@ -3518,7 +3589,7 @@ async fn daemon_update(
 async fn daemon_update_sync(
     config: &Config,
     params: UpdateParams,
-    cancel: Option<Arc<AtomicBool>>,
+    control: Option<Arc<TransactionControl>>,
 ) -> Result<serde_json::Value> {
     let use_user = params.user || config.install.user;
     let root = install_paths(params.store.as_deref(), use_user).0;
@@ -3541,13 +3612,16 @@ async fn daemon_update_sync(
     }
     let mut outcomes = Vec::new();
     for package in installed {
-        if cancel
+        if control
             .as_deref()
-            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+            .is_some_and(TransactionControl::is_cancelled)
         {
             bail!("update cancelled");
         }
         let reference = installed_package_reference(&package);
+        if let Some(control) = &control {
+            control.set_progress("updating", Some(&reference), None);
+        }
         let result = install_remote_command(
             &reference,
             Some(format!(">{}", package.version)),
@@ -3563,7 +3637,7 @@ async fn daemon_update_sync(
             false,
             params.allow_capability.clone(),
             config,
-            cancel.clone(),
+            control.clone(),
         )
         .await;
         match result {
@@ -3613,7 +3687,16 @@ fn daemon_get_transaction(
     let entry = transactions
         .get(&params.transaction_id)
         .context("unknown transaction_id")?;
-    Ok(serde_json::to_value(&entry.status)?)
+    let mut value = serde_json::to_value(&entry.status)?;
+    if matches!(entry.status, TransactionStatus::Running)
+        && let serde_json::Value::Object(fields) = &mut value
+    {
+        fields.insert(
+            "progress".to_owned(),
+            serde_json::to_value(entry.control.snapshot())?,
+        );
+    }
+    Ok(value)
 }
 
 fn daemon_cancel_transaction(
@@ -3626,7 +3709,7 @@ fn daemon_cancel_transaction(
     let entry = transactions
         .get(&params.transaction_id)
         .context("unknown transaction_id")?;
-    entry.cancel.store(true, Ordering::Relaxed);
+    entry.control.request_cancel();
     Ok(serde_json::json!({ "cancel_requested": true }))
 }
 
@@ -6884,7 +6967,11 @@ mod tests {
             installed: Vec::new(),
             selected: HashMap::new(),
             offline: false,
-            cancel: Some(Arc::new(AtomicBool::new(true))),
+            control: Some({
+                let control = TransactionControl::new();
+                control.request_cancel();
+                control
+            }),
         };
         let error = install_remote_package(&mut state, "hello".into(), None, None)
             .await
@@ -6926,9 +7013,9 @@ mod tests {
     #[tokio::test]
     async fn cancel_transaction_stops_a_cooperative_task() -> Result<()> {
         let state = Arc::new(DaemonState::new(Config::default()));
-        let id = state.start_transaction(|cancel| async move {
+        let id = state.start_transaction(|control| async move {
             loop {
-                if cancel.load(Ordering::Relaxed) {
+                if control.is_cancelled() {
                     bail!("update cancelled");
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -6947,5 +7034,43 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!("transaction never reported cancelled");
+    }
+
+    #[tokio::test]
+    async fn get_transaction_reports_progress_while_running() -> Result<()> {
+        let state = Arc::new(DaemonState::new(Config::default()));
+        let id = state.start_transaction(|control| async move {
+            control.set_progress("resolving", Some("npub1.../myapp"), None);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Ok(serde_json::json!({"done": true}))
+        });
+
+        let mut saw_progress = false;
+        for _ in 0..200 {
+            let status =
+                daemon_get_transaction(&state, serde_json::json!({ "transaction_id": id }))?;
+            if status["status"] == "running" {
+                if status["progress"]["stage"] == "resolving" {
+                    assert_eq!(status["progress"]["package"], "npub1.../myapp");
+                    saw_progress = true;
+                    break;
+                }
+            } else {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(saw_progress, "never observed the resolving progress stage");
+
+        for _ in 0..200 {
+            let status =
+                daemon_get_transaction(&state, serde_json::json!({ "transaction_id": id }))?;
+            if status["status"] != "running" {
+                assert_eq!(status["status"], "succeeded");
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("transaction never completed");
     }
 }
