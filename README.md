@@ -121,6 +121,11 @@ npack resolve <publisher>/myapp --relay wss://relay.example
 # other tool that shouldn't need to know about Nostr, Blossom, or .npk
 npack daemon --socket $XDG_RUNTIME_DIR/npackd.sock
 
+# npackd-system: a privileged instance for the system store, normally run as
+# a systemd service (see packaging/npackd-system.service). Gates Install,
+# Remove, and Update from non-root peers through PolicyKit.
+npack daemon --system
+
 # Publish an artifact and its Nostr events
 npack publish ./myapp.manifest.json \
   --secret-key <secret-key> \

@@ -401,9 +401,14 @@ enum Command {
     Daemon {
         #[arg(
             long,
-            help = "Unix socket path to listen on; defaults to $XDG_RUNTIME_DIR/npackd.sock"
+            help = "Unix socket path to listen on; defaults to $XDG_RUNTIME_DIR/npackd.sock, or /run/npackd.sock with --system"
         )]
         socket: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Run as npackd-system: must run as root, binds a world-connectable socket, and requires PolicyKit authorization from non-root peers for Install/Remove/Update"
+        )]
+        system: bool,
     },
 }
 
@@ -897,7 +902,17 @@ async fn main() -> Result<()> {
         Command::Inspect { artifact } => inspect_artifact(&artifact)?,
         Command::Manifest { artifact, output } => write_manifest(&artifact, &output)?,
         Command::Appstream { artifact, output } => appstream_command(&artifact, output.as_deref())?,
-        Command::Daemon { socket } => run_daemon(socket, config).await?,
+        Command::Daemon { socket, system } => {
+            let role = if system {
+                if current_uid() != Some(0) {
+                    bail!("`npack daemon --system` must run as root");
+                }
+                DaemonRole::System
+            } else {
+                DaemonRole::User
+            };
+            run_daemon(socket, config, role).await?
+        }
     }
     Ok(())
 }
@@ -3134,12 +3149,83 @@ impl DaemonResponse {
     }
 }
 
-fn daemon_socket_path(override_path: Option<PathBuf>) -> PathBuf {
-    override_path.unwrap_or_else(|| {
-        dirs::runtime_dir()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonRole {
+    User,
+    System,
+}
+
+fn daemon_socket_path(override_path: Option<PathBuf>, role: DaemonRole) -> PathBuf {
+    override_path.unwrap_or_else(|| match role {
+        DaemonRole::User => dirs::runtime_dir()
             .unwrap_or_else(std::env::temp_dir)
-            .join("npackd.sock")
+            .join("npackd.sock"),
+        DaemonRole::System => PathBuf::from("/run/npackd.sock"),
     })
+}
+
+/// Reads the process's effective uid from `/proc/self/status`, matching the
+/// project's existing dependency-free `/proc` conventions rather than
+/// pulling in `libc` just for `geteuid()`.
+fn current_uid() -> Option<u32> {
+    let contents = fs::read_to_string("/proc/self/status").ok()?;
+    let line = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Maps an npackd RPC method to the PolicyKit action id that gates it when
+/// requested by a non-root peer of the system daemon. Read-only methods and
+/// transaction bookkeeping (`GetTransaction`/`CancelTransaction`) need no
+/// gate: cancelling only flips a flag the transaction's own install/update
+/// loop already checks, and the mutation it might stop was itself gated
+/// when the transaction started.
+fn polkit_action_for_method(method: &str) -> Option<&'static str> {
+    match method {
+        "Install" => Some("io.npack.install"),
+        "Remove" => Some("io.npack.remove"),
+        "Update" => Some("io.npack.update"),
+        _ => None,
+    }
+}
+
+/// Whether `method` needs a PolicyKit authorization check for this peer,
+/// and if so, which action id to check. Root peers of the system daemon are
+/// already fully privileged and never gated; the user daemon never gates.
+fn required_authorization(role: DaemonRole, peer_uid: u32, method: &str) -> Option<&'static str> {
+    if role != DaemonRole::System || peer_uid == 0 {
+        return None;
+    }
+    polkit_action_for_method(method)
+}
+
+/// Asks the system's `pkcheck` (part of PolicyKit) whether `pid` is
+/// authorized for `action_id`, shelling out rather than talking to
+/// `org.freedesktop.PolicyKit1.Authority` over D-Bus directly to avoid a
+/// D-Bus client dependency for a single request/response check.
+async fn authorize_system_action(action_id: &str, pid: Option<u32>) -> Result<()> {
+    let pid = pid.context("cannot authorize a request with no peer process id")?;
+    let output = tokio::process::Command::new("pkcheck")
+        .args([
+            "--action-id",
+            action_id,
+            "--process",
+            &pid.to_string(),
+            "--allow-user-interaction",
+        ])
+        .output()
+        .await
+        .context("running pkcheck (is polkit installed?)")?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let reason = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "not authorized for {action_id}: {}",
+            reason.trim().lines().next().unwrap_or("denied")
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3212,14 +3298,16 @@ struct TransactionEntry {
 
 struct DaemonState {
     config: Config,
+    role: DaemonRole,
     transactions: std::sync::Mutex<HashMap<u64, TransactionEntry>>,
     next_transaction_id: AtomicU64,
 }
 
 impl DaemonState {
-    fn new(config: Config) -> Self {
+    fn new(config: Config, role: DaemonRole) -> Self {
         Self {
             config,
+            role,
             transactions: std::sync::Mutex::new(HashMap::new()),
             next_transaction_id: AtomicU64::new(1),
         }
@@ -3269,8 +3357,8 @@ fn is_cancellation_error(error: &anyhow::Error) -> bool {
     )
 }
 
-async fn run_daemon(socket: Option<PathBuf>, config: Config) -> Result<()> {
-    let socket_path = daemon_socket_path(socket);
+async fn run_daemon(socket: Option<PathBuf>, config: Config, role: DaemonRole) -> Result<()> {
+    let socket_path = daemon_socket_path(socket, role);
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
@@ -3280,13 +3368,21 @@ async fn run_daemon(socket: Option<PathBuf>, config: Config) -> Result<()> {
     }
     let listener = tokio::net::UnixListener::bind(&socket_path)
         .with_context(|| format!("binding {}", socket_path.display()))?;
+    if role == DaemonRole::System {
+        // Authorization is enforced per-request via PolicyKit below, not by
+        // restricting who can connect to the socket -- matching how the
+        // system D-Bus and other system daemons (e.g. PackageKit) work.
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o666))
+            .with_context(|| format!("setting permissions on {}", socket_path.display()))?;
+    }
     eprintln!("npackd listening on {}", socket_path.display());
-    let state = Arc::new(DaemonState::new(config));
+    let state = Arc::new(DaemonState::new(config, role));
     loop {
         let (stream, _) = listener.accept().await?;
+        let peer = stream.peer_cred().ok();
         let state = state.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_daemon_connection(stream, &state).await {
+            if let Err(error) = handle_daemon_connection(stream, &state, peer).await {
                 eprintln!("npackd connection error: {error:#}");
             }
         });
@@ -3296,6 +3392,7 @@ async fn run_daemon(socket: Option<PathBuf>, config: Config) -> Result<()> {
 async fn handle_daemon_connection(
     stream: tokio::net::UnixStream,
     state: &Arc<DaemonState>,
+    peer: Option<tokio::net::unix::UCred>,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let (reader, mut writer) = stream.into_split();
@@ -3307,7 +3404,7 @@ async fn handle_daemon_connection(
         let response = match serde_json::from_str::<DaemonRequest>(&line) {
             Ok(request) => {
                 let id = request.id;
-                match dispatch_daemon_request(state, request).await {
+                match dispatch_daemon_request(state, request, peer.as_ref()).await {
                     Ok(result) => DaemonResponse::ok(id, result),
                     Err(error) => DaemonResponse::err(id, error),
                 }
@@ -3329,7 +3426,25 @@ async fn handle_daemon_connection(
 async fn dispatch_daemon_request(
     state: &Arc<DaemonState>,
     request: DaemonRequest,
+    peer: Option<&tokio::net::unix::UCred>,
 ) -> Result<serde_json::Value> {
+    match peer {
+        Some(peer) => {
+            if let Some(action_id) = required_authorization(state.role, peer.uid(), &request.method)
+            {
+                authorize_system_action(action_id, peer.pid().map(|pid| pid as u32)).await?;
+            }
+        }
+        // No peer credentials (e.g. `peer_cred()` failed): fail closed for
+        // anything the system daemon would otherwise gate, rather than
+        // silently treating an unidentifiable peer as authorized.
+        None if state.role == DaemonRole::System
+            && polkit_action_for_method(&request.method).is_some() =>
+        {
+            bail!("cannot authorize request: no peer credentials available");
+        }
+        None => {}
+    }
     match request.method.as_str() {
         "Search" => daemon_search(&state.config, request.params).await,
         "GetPackage" => daemon_get_package(&state.config, request.params).await,
@@ -7126,10 +7241,12 @@ mod tests {
         fs::create_dir_all(&store)?;
 
         let listener = tokio::net::UnixListener::bind(&socket_path)?;
-        let state = Arc::new(DaemonState::new(Config::default()));
+        let state = Arc::new(DaemonState::new(Config::default(), DaemonRole::User));
         let server = async {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_daemon_connection(stream, &state).await.unwrap();
+            handle_daemon_connection(stream, &state, None)
+                .await
+                .unwrap();
         };
 
         let client_work = async {
@@ -7168,6 +7285,110 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn required_authorization_gates_only_the_system_daemons_mutating_methods() {
+        assert_eq!(
+            required_authorization(DaemonRole::System, 1000, "Install"),
+            Some("io.npack.install")
+        );
+        assert_eq!(
+            required_authorization(DaemonRole::System, 1000, "Remove"),
+            Some("io.npack.remove")
+        );
+        assert_eq!(
+            required_authorization(DaemonRole::System, 1000, "Update"),
+            Some("io.npack.update")
+        );
+        assert_eq!(
+            required_authorization(DaemonRole::System, 1000, "ListInstalled"),
+            None
+        );
+        assert_eq!(
+            required_authorization(DaemonRole::System, 0, "Install"),
+            None,
+            "root peers of the system daemon are already fully privileged"
+        );
+        assert_eq!(
+            required_authorization(DaemonRole::User, 1000, "Install"),
+            None,
+            "the user daemon never gates its own owner's requests"
+        );
+    }
+
+    #[test]
+    fn current_uid_matches_the_running_processs_own_uid() {
+        let status = fs::read_to_string("/proc/self/status").unwrap();
+        let line = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .unwrap();
+        let expected: u32 = line.split_whitespace().nth(1).unwrap().parse().unwrap();
+        assert_eq!(current_uid(), Some(expected));
+    }
+
+    #[tokio::test]
+    async fn system_daemon_denies_install_from_an_unauthorized_non_root_peer() -> Result<()> {
+        // Exercises the real `pkcheck` binary (no mock authority): with no
+        // `io.npack.install` action registered on the test machine's
+        // polkit, a non-root peer must be denied before the request ever
+        // reaches package resolution.
+        if std::process::Command::new("pkcheck")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: pkcheck is not installed");
+            return Ok(());
+        }
+        if current_uid() == Some(0) {
+            eprintln!("skipping: running as root, which the system daemon never gates");
+            return Ok(());
+        }
+
+        let dir = tempdir()?;
+        let socket_path = dir.path().join("npackd-system.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path)?;
+        let state = Arc::new(DaemonState::new(Config::default(), DaemonRole::System));
+
+        let server = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let peer = stream.peer_cred().ok();
+            handle_daemon_connection(stream, &state, peer)
+                .await
+                .unwrap();
+        };
+
+        let client_work = async {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            let mut client = tokio::net::UnixStream::connect(&socket_path).await?;
+            let request = serde_json::json!({
+                "id": 1,
+                "method": "Install",
+                "params": { "package": "pub/pkg", "relay": [] },
+            });
+            client
+                .write_all(format!("{}\n", request).as_bytes())
+                .await?;
+            drop(client.shutdown().await);
+
+            let (read_half, _write_half) = client.into_split();
+            let mut lines = BufReader::new(read_half).lines();
+            let reply = lines.next_line().await?.context("expected a reply")?;
+            let reply: serde_json::Value = serde_json::from_str(&reply)?;
+            assert!(
+                reply["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("not authorized")),
+                "expected a not-authorized error, got {reply}"
+            );
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let ((), result) = tokio::join!(server, client_work);
+        result?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn daemon_serves_concurrent_connections() -> Result<()> {
         let dir = tempdir()?;
@@ -7175,7 +7396,11 @@ mod tests {
         let store = dir.path().join("store");
         fs::create_dir_all(&store)?;
 
-        let daemon = tokio::spawn(run_daemon(Some(socket_path.clone()), Config::default()));
+        let daemon = tokio::spawn(run_daemon(
+            Some(socket_path.clone()),
+            Config::default(),
+            DaemonRole::User,
+        ));
         // run_daemon loops forever binding the socket at startup; poll until
         // the socket file exists rather than sleeping a fixed guess.
         for _ in 0..100 {
@@ -7251,7 +7476,7 @@ mod tests {
 
     #[tokio::test]
     async fn transactions_report_running_then_succeeded_and_reject_unknown_ids() -> Result<()> {
-        let state = Arc::new(DaemonState::new(Config::default()));
+        let state = Arc::new(DaemonState::new(Config::default(), DaemonRole::User));
         let id = state.start_transaction(|_cancel| async { Ok(serde_json::json!({"ok": true})) });
 
         let running = daemon_get_transaction(&state, serde_json::json!({ "transaction_id": id }))?;
@@ -7280,7 +7505,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_transaction_stops_a_cooperative_task() -> Result<()> {
-        let state = Arc::new(DaemonState::new(Config::default()));
+        let state = Arc::new(DaemonState::new(Config::default(), DaemonRole::User));
         let id = state.start_transaction(|control| async move {
             loop {
                 if control.is_cancelled() {
@@ -7306,7 +7531,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_transaction_reports_progress_while_running() -> Result<()> {
-        let state = Arc::new(DaemonState::new(Config::default()));
+        let state = Arc::new(DaemonState::new(Config::default(), DaemonRole::User));
         let id = state.start_transaction(|control| async move {
             control.set_progress("resolving", Some("npub1.../myapp"), None);
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;

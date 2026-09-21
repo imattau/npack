@@ -1,0 +1,15 @@
+[Unit]
+Description=npackd-system, the privileged npack package service
+Documentation=https://github.com/imattau/npack
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/npack daemon --system
+Restart=on-failure
+RuntimeDirectory=npackd
+# No further sandboxing beyond running as root is applied here: npackd-system
+# writes to /usr, /etc, and /var/lib/npack, so a hardened profile would need
+# to be scoped to exactly those paths -- left for future packaging work.
+
+[Install]
+WantedBy=multi-user.target
