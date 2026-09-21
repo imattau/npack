@@ -81,6 +81,11 @@ npack manifest ./myapp-1.0.0.npk --output ./myapp-1.0.0.manifest.json
 npack hash ./myapp-1.0.0.npk
 npack inspect ./myapp-1.0.0.npk
 
+# Generate AppStream metadata from a manifest's `app` metadata (icons,
+# categories, screenshots, homepage, licence, summary, description) for
+# desktop application stores
+npack appstream ./myapp-1.0.0.npk --output ./myapp.metainfo.xml
+
 # Install and inspect local packages
 # The package metadata is embedded in the .npk.
 npack install ./myapp-1.0.0.npk --user

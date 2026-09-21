@@ -6,15 +6,23 @@ milestone is Phases 1–5: metadata compatibility, a stable service layer,
 security and privilege separation, a local catalogue, and a small reference
 GUI.
 
-## Phase 1: Package metadata compatibility
+## Phase 1: Package metadata compatibility (done)
 
 Add first-class AppStream support:
 
-- Map `.npk` metadata to AppStream fields.
-- Support icons, screenshots, categories, homepage, licence, summary, and description.
-- Add desktop-file validation.
-- Add `npack appstream <package>` output.
-- Validate against AppStream tooling in CI.
+- Map `.npk` metadata to AppStream fields via a manifest's optional `app`
+  object.
+- Support icons, screenshots, categories, homepage, licence, summary, and
+  description.
+- Add desktop-file validation: `npack pack` requires a declared
+  `app.desktop_file` to exist and satisfy the freedesktop.org Desktop Entry
+  spec (`Type`, `Name`, and `Exec` when `Type=Application`).
+- Add `npack appstream <package>` output, rendering a `console-application` or
+  `desktop-application` AppStream `<component>` document depending on whether
+  `app.desktop_file` is set.
+- Validate against AppStream tooling in CI: the `rust` CI job installs
+  `appstreamcli` and runs `appstreamcli validate --no-net` against a generated
+  sample document.
 
 Goal: an npack package can describe itself in the language already understood
 by Linux application stores.

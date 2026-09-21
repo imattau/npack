@@ -21,3 +21,28 @@ jobs:
         run: cargo test --all-targets --all-features
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features
+      - name: Install AppStream tooling
+        run: sudo apt-get update && sudo apt-get install -y appstream
+      - name: Validate generated AppStream metadata
+        run: |
+          mkdir -p /tmp/appstream-ci/source/.npack
+          cat > /tmp/appstream-ci/source/.npack/manifest.json <<'EOF'
+          {
+            "publisher": "483440dfc4efeb8776ca27413c929653ea60484ca2d0e6b97678a0622c6bf413",
+            "name": "npack",
+            "version": "0.0.0",
+            "artifact": "ci.npk",
+            "sha256": "",
+            "app": {
+              "summary": "A Nostr-native package manager",
+              "description": "npack discovers, verifies, and installs signed release artifacts published on Nostr and stored on Blossom.",
+              "homepage": "https://github.com/imattau/npack",
+              "license": "MIT",
+              "categories": ["System"],
+              "release_date": "2026-01-01"
+            }
+          }
+          EOF
+          cargo run --quiet -- pack /tmp/appstream-ci/source --output /tmp/appstream-ci/ci.npk
+          cargo run --quiet -- appstream /tmp/appstream-ci/ci.npk --output /tmp/appstream-ci/ci.metainfo.xml
+          appstreamcli validate --no-net /tmp/appstream-ci/ci.metainfo.xml

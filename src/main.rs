@@ -386,6 +386,12 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Generate an AppStream component XML document from an .npk archive's manifest.
+    Appstream {
+        artifact: PathBuf,
+        #[arg(long, help = "Write the AppStream XML to this path instead of stdout")]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -417,6 +423,34 @@ struct Manifest {
     provides: Vec<String>,
     #[serde(default)]
     post_install: Vec<PostInstallAction>,
+    #[serde(default)]
+    app: AppMetadata,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct AppMetadata {
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    homepage: Option<String>,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    categories: Vec<String>,
+    #[serde(default)]
+    icon: Option<PathBuf>,
+    #[serde(default)]
+    screenshots: Vec<String>,
+    #[serde(default)]
+    desktop_file: Option<PathBuf>,
+    /// RFC 3339 date this version was released, e.g. "2026-01-15". Optional
+    /// because a bare .npk built with `pack` has no release timestamp of its
+    /// own; set by publishers who want a `<releases>` entry in the generated
+    /// AppStream metadata.
+    #[serde(default)]
+    release_date: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -847,6 +881,7 @@ async fn main() -> Result<()> {
         )?,
         Command::Inspect { artifact } => inspect_artifact(&artifact)?,
         Command::Manifest { artifact, output } => write_manifest(&artifact, &output)?,
+        Command::Appstream { artifact, output } => appstream_command(&artifact, output.as_deref())?,
     }
     Ok(())
 }
@@ -1206,6 +1241,7 @@ fn init_package(
     }
     fs::create_dir_all(&metadata_dir)?;
     let manifest = Manifest {
+        app: AppMetadata::default(),
         publisher: publisher.to_owned(),
         name: name.to_owned(),
         version: version.to_owned(),
@@ -1299,6 +1335,144 @@ fn write_manifest(artifact: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
+fn appstream_command(artifact: &Path, output: Option<&Path>) -> Result<()> {
+    if artifact.extension().and_then(|ext| ext.to_str()) != Some("npk") {
+        bail!("appstream generation requires an .npk artifact");
+    }
+    let manifest = load_embedded_manifest(artifact)?;
+    let xml = appstream_xml(&manifest);
+    match output {
+        Some(output) => {
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(output, &xml)
+                .with_context(|| format!("writing appstream metadata {}", output.display()))?;
+            println!("wrote appstream metadata {}", output.display());
+        }
+        None => print!("{xml}"),
+    }
+    Ok(())
+}
+
+/// Renders an AppStream component document from a manifest's `app` metadata,
+/// per the freedesktop.org AppStream specification:
+/// <https://www.freedesktop.org/software/appstream/docs/chap-Metadata.html>.
+fn appstream_xml(manifest: &Manifest) -> String {
+    let app = &manifest.app;
+    let component_type = if app.desktop_file.is_some() {
+        "desktop-application"
+    } else {
+        "console-application"
+    };
+    // AppStream component IDs are conventionally reverse-DNS; npack has no
+    // domain per publisher (publishers are Nostr pubkeys), so namespace every
+    // generated ID under the npack project the way Flatpak namespaces IDs for
+    // developers without a domain (e.g. io.github.<user>.<app>).
+    let id = xml_escape(&format!(
+        "io.npack.{}.{}",
+        manifest.publisher, manifest.name
+    ));
+    let mut xml = String::new();
+    xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    xml.push_str(&format!("<component type=\"{component_type}\">\n"));
+    xml.push_str(&format!("  <id>{id}</id>\n"));
+    xml.push_str(&format!("  <name>{}</name>\n", xml_escape(&manifest.name)));
+    if let Some(summary) = &app.summary {
+        xml.push_str(&format!("  <summary>{}</summary>\n", xml_escape(summary)));
+    }
+    if let Some(license) = &app.license {
+        xml.push_str(&format!(
+            "  <project_license>{}</project_license>\n",
+            xml_escape(license)
+        ));
+    }
+    xml.push_str("  <metadata_license>CC0-1.0</metadata_license>\n");
+    if let Some(homepage) = &app.homepage {
+        xml.push_str(&format!(
+            "  <url type=\"homepage\">{}</url>\n",
+            xml_escape(homepage)
+        ));
+    }
+    if let Some(description) = &app.description {
+        xml.push_str(&format!(
+            "  <description>\n    <p>{}</p>\n  </description>\n",
+            xml_escape(description)
+        ));
+    }
+    if let Some(icon) = &app.icon {
+        // Metainfo documents may only reference "stock" (an icon-theme name)
+        // or "remote" (a URL) icons; "cached"/"local" are filled in later by
+        // an AppStream catalogue generator, not hand-written here.
+        let stock_name = icon
+            .file_stem()
+            .map(|stem| stem.to_string_lossy())
+            .unwrap_or_default();
+        xml.push_str(&format!(
+            "  <icon type=\"stock\">{}</icon>\n",
+            xml_escape(&stock_name)
+        ));
+    }
+    if !app.categories.is_empty() {
+        xml.push_str("  <categories>\n");
+        for category in &app.categories {
+            xml.push_str(&format!(
+                "    <category>{}</category>\n",
+                xml_escape(category)
+            ));
+        }
+        xml.push_str("  </categories>\n");
+    }
+    if !app.screenshots.is_empty() {
+        xml.push_str("  <screenshots>\n");
+        for (index, screenshot) in app.screenshots.iter().enumerate() {
+            let primary = if index == 0 { " type=\"default\"" } else { "" };
+            xml.push_str(&format!(
+                "    <screenshot{primary}>\n      <image>{}</image>\n    </screenshot>\n",
+                xml_escape(screenshot)
+            ));
+        }
+        xml.push_str("  </screenshots>\n");
+    }
+    if let Some(desktop_file) = &app.desktop_file {
+        let desktop_id = desktop_file
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default();
+        xml.push_str(&format!(
+            "  <launchable type=\"desktop-id\">{}</launchable>\n",
+            xml_escape(&desktop_id)
+        ));
+    } else {
+        // A console-application component must advertise the binary it
+        // provides; npack's packing convention installs it as bin/<name>.
+        xml.push_str(&format!(
+            "  <provides>\n    <binary>{}</binary>\n  </provides>\n",
+            xml_escape(&manifest.name)
+        ));
+    }
+    if let Some(release_date) = &app.release_date {
+        xml.push_str("  <releases>\n");
+        xml.push_str(&format!(
+            "    <release version=\"{}\" date=\"{}\"/>\n",
+            xml_escape(&manifest.version),
+            xml_escape(release_date)
+        ));
+        xml.push_str("  </releases>\n");
+    }
+    xml.push_str("</component>\n");
+    xml
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 async fn fetch_blob(sha256: &str, servers: &[String], output: &Path) -> Result<()> {
     let expected: Sha256Hash = sha256
         .parse()
@@ -1340,6 +1514,24 @@ fn pack_npk(source: &Path, output: &Path) -> Result<()> {
         let manifest: Manifest =
             serde_json::from_slice(&bytes).context("parsing embedded .npack/manifest.json")?;
         validate_manifest_metadata(&manifest, false)?;
+        if let Some(icon) = &manifest.app.icon
+            && !source.join(icon).is_file()
+        {
+            bail!(
+                "manifest app.icon {} not found in package source",
+                icon.display()
+            );
+        }
+        if let Some(desktop_file) = &manifest.app.desktop_file {
+            let desktop_path = source.join(desktop_file);
+            let contents = fs::read_to_string(&desktop_path).with_context(|| {
+                format!(
+                    "reading manifest app.desktop_file {}",
+                    desktop_path.display()
+                )
+            })?;
+            validate_desktop_file(&contents)?;
+        }
     }
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
@@ -2599,6 +2791,7 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
         bail!("release commit must be a non-empty commit identifier");
     }
     Ok(Manifest {
+        app: AppMetadata::default(),
         publisher: event.pubkey.to_hex(),
         name: tag_value(event, "name")
             .context("release has no name")?
@@ -3263,6 +3456,105 @@ fn validate_manifest_metadata(manifest: &Manifest, require_hash: bool) -> Result
         && (commit.is_empty() || commit.chars().any(char::is_whitespace))
     {
         bail!("manifest commit must be a non-empty commit identifier");
+    }
+    validate_app_metadata(&manifest.app)?;
+    Ok(())
+}
+
+fn is_safe_relative_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && !path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+}
+
+fn validate_app_metadata(app: &AppMetadata) -> Result<()> {
+    if let Some(icon) = &app.icon
+        && !is_safe_relative_path(icon)
+    {
+        bail!("manifest app.icon must be a package-relative path");
+    }
+    if let Some(desktop_file) = &app.desktop_file {
+        if !is_safe_relative_path(desktop_file) {
+            bail!("manifest app.desktop_file must be a package-relative path");
+        }
+        if desktop_file.extension().and_then(|ext| ext.to_str()) != Some("desktop") {
+            bail!("manifest app.desktop_file must have a .desktop extension");
+        }
+    }
+    for category in &app.categories {
+        if category.is_empty() || category.chars().any(char::is_whitespace) {
+            bail!("manifest app.categories entries must be non-empty and whitespace-free");
+        }
+    }
+    for screenshot in &app.screenshots {
+        if Url::parse(screenshot).is_err() {
+            bail!("manifest app.screenshots entries must be valid URLs");
+        }
+    }
+    if let Some(homepage) = &app.homepage
+        && Url::parse(homepage).is_err()
+    {
+        bail!("manifest app.homepage must be a valid URL");
+    }
+    if let Some(release_date) = &app.release_date {
+        let valid = release_date.len() == 10
+            && release_date.as_bytes()[4] == b'-'
+            && release_date.as_bytes()[7] == b'-'
+            && release_date
+                .bytes()
+                .enumerate()
+                .all(|(i, b)| matches!(i, 4 | 7) || b.is_ascii_digit());
+        if !valid {
+            bail!("manifest app.release_date must be a YYYY-MM-DD date");
+        }
+    }
+    Ok(())
+}
+
+/// Validates the freedesktop.org Desktop Entry syntax required by AppStream's
+/// `launchable` linkage: a `[Desktop Entry]` group with `Type` and `Name`,
+/// plus `Exec` when `Type=Application` (see
+/// <https://specifications.freedesktop.org/desktop-entry-spec/latest/>).
+fn validate_desktop_file(contents: &str) -> Result<()> {
+    let mut lines = contents.lines();
+    let first_group = lines
+        .by_ref()
+        .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'));
+    if first_group.map(str::trim) != Some("[Desktop Entry]") {
+        bail!("desktop file must start with a [Desktop Entry] group");
+    }
+    let mut entry_type = None;
+    let mut name = None;
+    let mut exec = None;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            break;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            bail!("desktop file line is not a comment, group header, or key=value pair: {trimmed}");
+        };
+        match key.trim() {
+            "Type" => entry_type = Some(value.trim()),
+            "Name" => name = Some(value.trim()),
+            "Exec" => exec = Some(value.trim()),
+            _ => {}
+        }
+    }
+    let entry_type = entry_type.context("desktop file must declare Type")?;
+    if !matches!(entry_type, "Application" | "Link" | "Directory") {
+        bail!("desktop file Type must be Application, Link, or Directory, got {entry_type}");
+    }
+    if name.is_none_or(str::is_empty) {
+        bail!("desktop file must declare a non-empty Name");
+    }
+    if entry_type == "Application" && exec.is_none_or(str::is_empty) {
+        bail!("desktop file with Type=Application must declare a non-empty Exec");
     }
     Ok(())
 }
@@ -4351,6 +4643,7 @@ mod tests {
         fs::write(&artifact, b"hello npack")?;
         let manifest_path = dir.path().join("hello.npack.json");
         let manifest = Manifest {
+            app: AppMetadata::default(),
             publisher: "npub1test".into(),
             name: "hello".into(),
             version: "1.0.0".into(),
@@ -4387,6 +4680,7 @@ mod tests {
         fs::write(&artifact, b"hello npack")?;
         let manifest_path = dir.path().join("hello.json");
         let manifest = Manifest {
+            app: AppMetadata::default(),
             publisher: "pub".into(),
             name: "hello".into(),
             version: "1.0.0".into(),
@@ -4631,6 +4925,7 @@ mod tests {
         let artifact = dir.path().join("app.bin");
         fs::write(&artifact, b"original")?;
         let manifest = Manifest {
+            app: AppMetadata::default(),
             publisher: "npub1test".into(),
             name: "app".into(),
             version: "1.0.0".into(),
@@ -4656,6 +4951,7 @@ mod tests {
     #[test]
     fn creates_signed_release_event() -> Result<()> {
         let manifest = Manifest {
+            app: AppMetadata::default(),
             publisher: "npub1test".into(),
             name: "hello".into(),
             version: "1.0.0".into(),
@@ -4736,6 +5032,7 @@ mod tests {
     fn validates_nip94_artifact_events() -> Result<()> {
         let keys = Keys::parse(&"11".repeat(32))?;
         let manifest = Manifest {
+            app: AppMetadata::default(),
             publisher: keys.public_key().to_hex(),
             name: "hello".into(),
             version: "1.0.0".into(),
@@ -4762,6 +5059,7 @@ mod tests {
     fn resolves_manifest_from_verified_release_and_artifact_events() -> Result<()> {
         let keys = Keys::parse(&"11".repeat(32))?;
         let manifest = Manifest {
+            app: AppMetadata::default(),
             publisher: keys.public_key().to_hex(),
             name: "hello".into(),
             version: "1.0.0".into(),
@@ -4803,6 +5101,7 @@ mod tests {
         let keys = Keys::parse(&"11".repeat(32))?;
         let other_keys = Keys::parse(&"22".repeat(32))?;
         let manifest = Manifest {
+            app: AppMetadata::default(),
             publisher: keys.public_key().to_hex(),
             name: "hello".into(),
             version: "1.0.0".into(),
@@ -4838,6 +5137,7 @@ mod tests {
     #[test]
     fn release_matches_target_treats_any_as_wildcard() -> Result<()> {
         let manifest = Manifest {
+            app: AppMetadata::default(),
             publisher: "npub1test".into(),
             name: "hello".into(),
             version: "1.0.0".into(),
@@ -5028,6 +5328,7 @@ mod tests {
     #[test]
     fn rejects_malformed_release_event_candidates() -> Result<()> {
         let manifest = Manifest {
+            app: AppMetadata::default(),
             publisher: "npub1test".into(),
             name: "hello".into(),
             version: "1.0.0".into(),
@@ -5057,6 +5358,7 @@ mod tests {
     #[test]
     fn creates_publisher_signed_revocation_event() -> Result<()> {
         let manifest = Manifest {
+            app: AppMetadata::default(),
             publisher: "npub1test".into(),
             name: "hello".into(),
             version: "1.0.0".into(),
@@ -5088,6 +5390,7 @@ mod tests {
     fn rejects_release_signed_by_the_wrong_publisher() -> Result<()> {
         let keys = Keys::parse(&"11".repeat(32))?;
         let manifest = Manifest {
+            app: AppMetadata::default(),
             publisher: keys.public_key().to_hex(),
             name: "hello".into(),
             version: "1.0.0".into(),
@@ -5135,6 +5438,7 @@ mod tests {
         fs::write(&artifact, b"app")?;
         let manifest_path = dir.path().join("app.npack.json");
         let manifest = Manifest {
+            app: AppMetadata::default(),
             publisher: "npub1test".into(),
             name: "app".into(),
             version: "1.0.0".into(),
@@ -5186,6 +5490,7 @@ mod tests {
             }])?,
         )?;
         let manifest = Manifest {
+            app: AppMetadata::default(),
             publisher: "pub".into(),
             name: "new".into(),
             version: "1.0.0".into(),
@@ -5240,6 +5545,7 @@ mod tests {
         fs::create_dir_all(source.join("bin"))?;
         fs::write(source.join("bin/hello"), b"hello")?;
         let embedded = Manifest {
+            app: AppMetadata::default(),
             publisher: "npub1test".into(),
             name: "hello".into(),
             version: "1.0.0".into(),
@@ -5275,11 +5581,144 @@ mod tests {
     }
 
     #[test]
+    fn packs_npk_with_desktop_file_and_icon_metadata() -> Result<()> {
+        let dir = tempdir()?;
+        let source = dir.path().join("source");
+        fs::create_dir_all(source.join(".npack"))?;
+        fs::create_dir_all(source.join("bin"))?;
+        fs::create_dir_all(source.join("share/icons"))?;
+        fs::write(source.join("bin/hello"), b"hello")?;
+        fs::write(source.join("share/icons/hello.png"), b"icon")?;
+        fs::write(
+            source.join("hello.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Hello\nExec=hello\n",
+        )?;
+        let manifest = sample_manifest_with_app(AppMetadata {
+            summary: Some("A friendly greeting".into()),
+            description: Some("Prints a friendly greeting to the terminal.".into()),
+            homepage: Some("https://example.com/hello".into()),
+            license: Some("MIT".into()),
+            categories: vec!["Utility".into()],
+            icon: Some("share/icons/hello.png".into()),
+            screenshots: vec!["https://example.com/hello/screenshot.png".into()],
+            desktop_file: Some("hello.desktop".into()),
+            release_date: Some("2026-01-15".into()),
+        });
+        fs::write(
+            source.join(".npack/manifest.json"),
+            serde_json::to_vec(&manifest)?,
+        )?;
+        let archive = dir.path().join("hello.npk");
+        pack_npk(&source, &archive)?;
+        let loaded = load_embedded_manifest(&archive)?;
+        assert_eq!(loaded.app.summary.as_deref(), Some("A friendly greeting"));
+        let xml = appstream_xml(&loaded);
+        assert!(xml.contains("<summary>A friendly greeting</summary>"));
+        assert!(xml.contains("<launchable type=\"desktop-id\">hello.desktop</launchable>"));
+        assert!(xml.contains("type=\"desktop-application\""));
+        assert!(xml.contains("<icon type=\"stock\">hello</icon>"));
+        assert!(xml.contains("<release version=\"1.0.0\" date=\"2026-01-15\"/>"));
+        assert!(xml.contains("<id>io.npack.npub1test.hello</id>"));
+        Ok(())
+    }
+
+    #[test]
+    fn console_application_appstream_advertises_its_binary() {
+        let manifest = sample_manifest_with_app(AppMetadata::default());
+        let xml = appstream_xml(&manifest);
+        assert!(xml.contains("type=\"console-application\""));
+        assert!(xml.contains("<provides>\n    <binary>hello</binary>\n  </provides>"));
+        assert!(!xml.contains("<launchable"));
+    }
+
+    #[test]
+    fn rejects_manifest_referencing_a_missing_desktop_file() -> Result<()> {
+        let dir = tempdir()?;
+        let source = dir.path().join("source");
+        fs::create_dir_all(source.join(".npack"))?;
+        let manifest = sample_manifest_with_app(AppMetadata {
+            desktop_file: Some("hello.desktop".into()),
+            ..AppMetadata::default()
+        });
+        fs::write(
+            source.join(".npack/manifest.json"),
+            serde_json::to_vec(&manifest)?,
+        )?;
+        let archive = dir.path().join("hello.npk");
+        let error = pack_npk(&source, &archive).unwrap_err();
+        assert!(error.to_string().contains("desktop_file"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_manifest_with_unsafe_app_icon_path() {
+        let manifest = sample_manifest_with_app(AppMetadata {
+            icon: Some("../escape.png".into()),
+            ..AppMetadata::default()
+        });
+        let error = validate_manifest_metadata(&manifest, false).unwrap_err();
+        assert!(error.to_string().contains("app.icon"));
+    }
+
+    #[test]
+    fn rejects_manifest_with_malformed_release_date() {
+        let manifest = sample_manifest_with_app(AppMetadata {
+            release_date: Some("15-01-2026".into()),
+            ..AppMetadata::default()
+        });
+        let error = validate_manifest_metadata(&manifest, false).unwrap_err();
+        assert!(error.to_string().contains("release_date"));
+    }
+
+    #[test]
+    fn validates_well_formed_application_desktop_files() {
+        validate_desktop_file("[Desktop Entry]\nType=Application\nName=Hello\nExec=hello\n")
+            .expect("valid desktop entry should be accepted");
+    }
+
+    #[test]
+    fn rejects_application_desktop_files_missing_exec() {
+        let error =
+            validate_desktop_file("[Desktop Entry]\nType=Application\nName=Hello\n").unwrap_err();
+        assert!(error.to_string().contains("Exec"));
+    }
+
+    #[test]
+    fn rejects_desktop_files_without_a_desktop_entry_group() {
+        let error =
+            validate_desktop_file("Type=Application\nName=Hello\nExec=hello\n").unwrap_err();
+        assert!(error.to_string().contains("[Desktop Entry]"));
+    }
+
+    fn sample_manifest_with_app(app: AppMetadata) -> Manifest {
+        Manifest {
+            app,
+            publisher: "npub1test".into(),
+            name: "hello".into(),
+            version: "1.0.0".into(),
+            artifact: "hello.npk".into(),
+            sha256: String::new(),
+            dependencies: vec![],
+            conflicts: vec![],
+            artifact_event: None,
+            repo: None,
+            commit: None,
+            os: default_os(),
+            arch: default_arch(),
+            format: "npk".into(),
+            runtime_requires: vec![],
+            provides: vec![],
+            post_install: vec![],
+        }
+    }
+
+    #[test]
     fn rejects_unsafe_embedded_manifest_artifact() -> Result<()> {
         let dir = tempdir()?;
         let source = dir.path().join("source");
         fs::create_dir_all(source.join(".npack"))?;
         let manifest = Manifest {
+            app: AppMetadata::default(),
             publisher: "npub1test".into(),
             name: "hello".into(),
             version: "1.0.0".into(),
@@ -5407,6 +5846,7 @@ mod tests {
     #[test]
     fn matches_publisher_qualified_package_requirements() {
         let manifest = Manifest {
+            app: AppMetadata::default(),
             publisher: "pub".into(),
             name: "libfoo".into(),
             version: "2.4.1".into(),
