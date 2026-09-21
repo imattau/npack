@@ -573,6 +573,21 @@ PolicyKit agent their session runs) the first time they ask npackd-system to
 install, remove, or update something. `GetTransaction`, `CancelTransaction`,
 and the read-only methods are never gated.
 
+### Reference GUI
+
+`npack-gui` (its own crate in this workspace) is a small `egui`/`eframe`
+desktop app that exercises this API -- Search, Details, Install, Installed,
+Updates, Remove -- purely as a client of the protocol documented above, with
+no dependency on `npack-cli`'s internals:
+
+```bash
+npack daemon &
+cargo run --release -p npack-gui
+```
+
+It reads/writes `$XDG_RUNTIME_DIR/npackd.sock` by default; the socket path
+is editable in its top bar for talking to a different instance.
+
 ## Configuration
 
 Configuration is stored at the platform's user config path, normally:
