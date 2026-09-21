@@ -85,6 +85,9 @@ Extract the embedded manifest from an .npk archive
 npack\-appstream(1)
 Generate an AppStream component XML document from an .npk archive\*(Aqs manifest
 .TP
+npack\-daemon(1)
+Run npackd, a local JSON\-RPC service over a Unix socket that exposes Search/GetPackage/ListInstalled/Install/Remove/Update/CheckUpdates to the CLI, GUI store plugins, and other tools without them needing to understand Nostr, Blossom, or .npk internals
+.TP
 npack\-help(1)
 Print this message or the help of the given subcommand(s)
 .SH VERSION

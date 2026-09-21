@@ -392,6 +392,17 @@ enum Command {
         #[arg(long, help = "Write the AppStream XML to this path instead of stdout")]
         output: Option<PathBuf>,
     },
+    /// Run npackd, a local JSON-RPC service over a Unix socket that exposes
+    /// Search/GetPackage/ListInstalled/Install/Remove/Update/CheckUpdates to
+    /// the CLI, GUI store plugins, and other tools without them needing to
+    /// understand Nostr, Blossom, or .npk internals.
+    Daemon {
+        #[arg(
+            long,
+            help = "Unix socket path to listen on; defaults to $XDG_RUNTIME_DIR/npackd.sock"
+        )]
+        socket: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -882,6 +893,7 @@ async fn main() -> Result<()> {
         Command::Inspect { artifact } => inspect_artifact(&artifact)?,
         Command::Manifest { artifact, output } => write_manifest(&artifact, &output)?,
         Command::Appstream { artifact, output } => appstream_command(&artifact, output.as_deref())?,
+        Command::Daemon { socket } => run_daemon(socket, config).await?,
     }
     Ok(())
 }
@@ -2870,6 +2882,15 @@ fn save_search_cache(path: &Path, cache: &SearchCache) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct SearchResult {
+    release_event_id: String,
+    publisher: String,
+    name: String,
+    version: String,
+    content: String,
+}
+
 async fn search_releases(
     query: &str,
     relays: &[String],
@@ -2878,6 +2899,34 @@ async fn search_releases(
     refresh: bool,
     no_cache: bool,
 ) -> Result<()> {
+    for result in search_matching_releases(
+        query,
+        relays,
+        trusted_publishers,
+        user_pubkey,
+        refresh,
+        no_cache,
+    )
+    .await?
+    {
+        println!(
+            "{} {} {}",
+            result.release_event_id,
+            display_publisher(&result.publisher),
+            result.content
+        );
+    }
+    Ok(())
+}
+
+async fn search_matching_releases(
+    query: &str,
+    relays: &[String],
+    trusted_publishers: &[String],
+    user_pubkey: Option<&str>,
+    refresh: bool,
+    no_cache: bool,
+) -> Result<Vec<SearchResult>> {
     const SEARCH_CACHE_MAX_AGE_SECS: u64 = 300;
     let cache_path = search_cache_path(query, relays, trusted_publishers, user_pubkey);
     let cached = if !refresh && !no_cache {
@@ -2977,6 +3026,7 @@ async fn search_releases(
         }
         matches.push(event);
     }
+    let mut results = Vec::new();
     for event in matches {
         let name = tag_value(&event, "name").unwrap_or_default();
         let version = tag_value(&event, "version").unwrap_or_default();
@@ -2985,15 +3035,502 @@ async fn search_releases(
             .get(&key)
             .is_some_and(|latest| latest == &Version::parse(version).unwrap())
         {
-            println!(
-                "{} {} {}",
-                event.id,
-                display_publisher(&event.pubkey.to_hex()),
-                event.content
-            );
+            results.push(SearchResult {
+                release_event_id: event.id.to_hex(),
+                publisher: event.pubkey.to_hex(),
+                name: name.to_owned(),
+                version: version.to_owned(),
+                content: event.content.clone(),
+            });
         }
     }
+    Ok(results)
+}
+
+// npackd: a local JSON-RPC-over-Unix-socket service exposing the core
+// operations a GUI store or other tool needs (Phase 2 of the roadmap), so
+// clients do not need to understand Nostr, Blossom, or .npk internals.
+// Requests and responses are newline-delimited JSON:
+//   {"id": 1, "method": "ListInstalled", "params": {"user": true}}
+//   {"id": 1, "result": [...]}
+// Transaction/progress-event streaming is deferred to a later phase; Install
+// and Update run to completion before responding.
+
+#[derive(Debug, Deserialize)]
+struct DaemonRequest {
+    id: u64,
+    method: String,
+    #[serde(default)]
+    params: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct DaemonResponse {
+    id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl DaemonResponse {
+    fn ok(id: u64, result: serde_json::Value) -> Self {
+        Self {
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    fn err(id: u64, error: impl std::fmt::Display) -> Self {
+        Self {
+            id,
+            result: None,
+            error: Some(error.to_string()),
+        }
+    }
+}
+
+fn daemon_socket_path(override_path: Option<PathBuf>) -> PathBuf {
+    override_path.unwrap_or_else(|| {
+        dirs::runtime_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("npackd.sock")
+    })
+}
+
+async fn run_daemon(socket: Option<PathBuf>, config: Config) -> Result<()> {
+    let socket_path = daemon_socket_path(socket);
+    if let Some(parent) = socket_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if socket_path.exists() {
+        fs::remove_file(&socket_path)
+            .with_context(|| format!("removing stale socket {}", socket_path.display()))?;
+    }
+    let listener = tokio::net::UnixListener::bind(&socket_path)
+        .with_context(|| format!("binding {}", socket_path.display()))?;
+    eprintln!("npackd listening on {}", socket_path.display());
+    // Connections are handled one at a time rather than spawned onto the
+    // runtime: the recursive dependency-install future is not `Send` (it
+    // uses `Pin<Box<dyn Future + 'a>>` without a `Send` bound), which rules
+    // out `tokio::spawn`. Concurrent request handling is future work.
+    loop {
+        let (stream, _) = listener.accept().await?;
+        if let Err(error) = handle_daemon_connection(stream, &config).await {
+            eprintln!("npackd connection error: {error:#}");
+        }
+    }
+}
+
+async fn handle_daemon_connection(stream: tokio::net::UnixStream, config: &Config) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let response = match serde_json::from_str::<DaemonRequest>(&line) {
+            Ok(request) => {
+                let id = request.id;
+                match dispatch_daemon_request(config, request).await {
+                    Ok(result) => DaemonResponse::ok(id, result),
+                    Err(error) => DaemonResponse::err(id, error),
+                }
+            }
+            Err(error) => DaemonResponse {
+                id: 0,
+                result: None,
+                error: Some(format!("invalid request: {error}")),
+            },
+        };
+        let mut serialized = serde_json::to_string(&response)?;
+        serialized.push('\n');
+        writer.write_all(serialized.as_bytes()).await?;
+        writer.flush().await?;
+    }
     Ok(())
+}
+
+async fn dispatch_daemon_request(
+    config: &Config,
+    request: DaemonRequest,
+) -> Result<serde_json::Value> {
+    match request.method.as_str() {
+        "Search" => daemon_search(config, request.params).await,
+        "GetPackage" => daemon_get_package(config, request.params).await,
+        "ListInstalled" => daemon_list_installed(config, request.params),
+        "Install" => daemon_install(config, request.params).await,
+        "Remove" => daemon_remove(config, request.params),
+        "Update" => daemon_update(config, request.params).await,
+        "CheckUpdates" => daemon_check_updates(config, request.params).await,
+        other => bail!("unknown method {other}"),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct SearchParams {
+    query: String,
+    #[serde(default)]
+    relay: Vec<String>,
+    #[serde(default)]
+    trusted_publisher: Vec<String>,
+    #[serde(default)]
+    pubkey: Option<String>,
+    #[serde(default)]
+    refresh: bool,
+    #[serde(default)]
+    no_cache: bool,
+}
+
+async fn daemon_search(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
+    let params: SearchParams = serde_json::from_value(params).context("invalid Search params")?;
+    let relays = configured_relays(params.relay, config)?;
+    let trusted_publishers = configured_publishers(params.trusted_publisher, config)?;
+    let pubkey = params.pubkey.or_else(|| config.identity.pubkey.clone());
+    let results = search_matching_releases(
+        &params.query,
+        &relays,
+        &trusted_publishers,
+        pubkey.as_deref(),
+        params.refresh,
+        params.no_cache,
+    )
+    .await?;
+    Ok(serde_json::to_value(results)?)
+}
+
+#[derive(Debug, Deserialize)]
+struct GetPackageParams {
+    package: String,
+    #[serde(default)]
+    relay: Vec<String>,
+    #[serde(default)]
+    requirement: Option<String>,
+    #[serde(default)]
+    os: Option<String>,
+    #[serde(default)]
+    arch: Option<String>,
+    #[serde(default)]
+    trusted_publisher: Vec<String>,
+    #[serde(default)]
+    store: Option<PathBuf>,
+    #[serde(default)]
+    user: bool,
+}
+
+async fn daemon_get_package(
+    config: &Config,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: GetPackageParams =
+        serde_json::from_value(params).context("invalid GetPackage params")?;
+    let relays = configured_relays(params.relay, config)?;
+    let trusted_publishers = configured_publishers(params.trusted_publisher, config)?;
+    let (publisher, name) = params
+        .package
+        .split_once('/')
+        .map_or((None, params.package.as_str()), |(publisher, name)| {
+            (Some(normalize_publisher_reference(publisher)), name)
+        });
+    let use_user = params.user || config.install.user;
+    let root = install_paths(params.store.as_deref(), use_user).0;
+    let client = Client::default();
+    for relay in &relays {
+        client.add_relay(relay).await?;
+    }
+    connect_with_timeout(&client).await?;
+    let resolved = resolve_release(
+        &client,
+        &root,
+        name,
+        publisher.as_deref(),
+        params.requirement.as_deref(),
+        &trusted_publishers,
+        None,
+        params.os.as_deref().unwrap_or(OS),
+        params.arch.as_deref().unwrap_or(ARCH),
+    )
+    .await;
+    client.disconnect().await;
+    Ok(serde_json::to_value(resolved?)?)
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ListInstalledParams {
+    #[serde(default)]
+    user: bool,
+    #[serde(default)]
+    store: Option<PathBuf>,
+}
+
+fn daemon_list_installed(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
+    let params: ListInstalledParams =
+        serde_json::from_value(params).context("invalid ListInstalled params")?;
+    let use_user = params.user || config.install.user;
+    let root = install_paths(params.store.as_deref(), use_user).0;
+    Ok(serde_json::to_value(installed_packages(Some(&root))?)?)
+}
+
+#[derive(Debug, Deserialize)]
+struct InstallParams {
+    package: String,
+    #[serde(default)]
+    requirement: Option<String>,
+    #[serde(default)]
+    relay: Vec<String>,
+    #[serde(default)]
+    server: Vec<String>,
+    #[serde(default)]
+    user: bool,
+    #[serde(default)]
+    store: Option<PathBuf>,
+    #[serde(default)]
+    allow_capability: Vec<String>,
+}
+
+async fn daemon_install(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
+    let params: InstallParams = serde_json::from_value(params).context("invalid Install params")?;
+    let package = params.package.clone();
+    install_remote_command(
+        &package,
+        params.requirement,
+        params.relay,
+        params.server,
+        params.store.clone(),
+        params.user,
+        false,
+        Vec::new(),
+        None,
+        None,
+        false,
+        false,
+        params.allow_capability,
+        config,
+    )
+    .await?;
+    let use_user = params.user || config.install.user;
+    let root = install_paths(params.store.as_deref(), use_user).0;
+    let (publisher, name) = package
+        .split_once('/')
+        .map_or((None, package.as_str()), |(publisher, name)| {
+            (Some(normalize_publisher_reference(publisher)), name)
+        });
+    let installed = installed_packages(Some(&root))?
+        .into_iter()
+        .find(|candidate| {
+            candidate.name == name
+                && publisher
+                    .as_deref()
+                    .is_none_or(|publisher| candidate.publisher == publisher)
+        })
+        .context("install reported success but the package was not found afterward")?;
+    Ok(serde_json::to_value(installed)?)
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoveParams {
+    package: String,
+    #[serde(default)]
+    user: bool,
+    #[serde(default)]
+    store: Option<PathBuf>,
+}
+
+fn daemon_remove(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
+    let params: RemoveParams = serde_json::from_value(params).context("invalid Remove params")?;
+    let use_user = params.user || config.install.user;
+    remove_package_at(&params.package, params.store.as_deref(), use_user)?;
+    Ok(serde_json::json!({ "removed": params.package }))
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateOutcome {
+    reference: String,
+    previous_version: String,
+    updated: bool,
+    new_version: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct UpdateParams {
+    #[serde(default)]
+    package: Option<String>,
+    #[serde(default)]
+    relay: Vec<String>,
+    #[serde(default)]
+    server: Vec<String>,
+    #[serde(default)]
+    user: bool,
+    #[serde(default)]
+    store: Option<PathBuf>,
+    #[serde(default)]
+    allow_capability: Vec<String>,
+}
+
+async fn daemon_update(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
+    let params: UpdateParams = serde_json::from_value(params).context("invalid Update params")?;
+    let use_user = params.user || config.install.user;
+    let root = install_paths(params.store.as_deref(), use_user).0;
+    let mut installed = installed_packages(Some(&root))?;
+    if let Some(package) = &params.package {
+        let (publisher, name) = package
+            .split_once('/')
+            .map_or((None, package.as_str()), |(publisher, name)| {
+                (Some(normalize_publisher_reference(publisher)), name)
+            });
+        installed.retain(|candidate| {
+            candidate.name == name
+                && publisher
+                    .as_deref()
+                    .is_none_or(|publisher| candidate.publisher == publisher)
+        });
+        if installed.is_empty() {
+            bail!("{package} is not installed");
+        }
+    }
+    let mut outcomes = Vec::new();
+    for package in installed {
+        let reference = installed_package_reference(&package);
+        let result = install_remote_command(
+            &reference,
+            Some(format!(">{}", package.version)),
+            params.relay.clone(),
+            params.server.clone(),
+            params.store.clone(),
+            params.user,
+            false,
+            Vec::new(),
+            None,
+            None,
+            false,
+            false,
+            params.allow_capability.clone(),
+            config,
+        )
+        .await;
+        match result {
+            Ok(()) => {
+                let new_version = installed_packages(Some(&root))?
+                    .into_iter()
+                    .find(|candidate| {
+                        candidate.name == package.name && candidate.publisher == package.publisher
+                    })
+                    .map(|candidate| candidate.version);
+                outcomes.push(UpdateOutcome {
+                    reference,
+                    previous_version: package.version,
+                    updated: true,
+                    new_version,
+                });
+            }
+            Err(error)
+                if error.to_string()
+                    == format!("no verified release found for {}", package.name) =>
+            {
+                outcomes.push(UpdateOutcome {
+                    reference,
+                    previous_version: package.version,
+                    updated: false,
+                    new_version: None,
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(serde_json::to_value(outcomes)?)
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateStatus {
+    reference: String,
+    current_version: String,
+    available_version: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CheckUpdatesParams {
+    #[serde(default)]
+    package: Option<String>,
+    #[serde(default)]
+    relay: Vec<String>,
+    #[serde(default)]
+    trusted_publisher: Vec<String>,
+    #[serde(default)]
+    user: bool,
+    #[serde(default)]
+    store: Option<PathBuf>,
+}
+
+async fn daemon_check_updates(
+    config: &Config,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: CheckUpdatesParams =
+        serde_json::from_value(params).context("invalid CheckUpdates params")?;
+    let relays = configured_relays(params.relay, config)?;
+    let trusted_publishers = configured_publishers(params.trusted_publisher, config)?;
+    let use_user = params.user || config.install.user;
+    let root = install_paths(params.store.as_deref(), use_user).0;
+    let mut installed = installed_packages(Some(&root))?;
+    if let Some(package) = &params.package {
+        let (publisher, name) = package
+            .split_once('/')
+            .map_or((None, package.as_str()), |(publisher, name)| {
+                (Some(normalize_publisher_reference(publisher)), name)
+            });
+        installed.retain(|candidate| {
+            candidate.name == name
+                && publisher
+                    .as_deref()
+                    .is_none_or(|publisher| candidate.publisher == publisher)
+        });
+        if installed.is_empty() {
+            bail!("{package} is not installed");
+        }
+    }
+    let client = Client::default();
+    for relay in &relays {
+        client.add_relay(relay).await?;
+    }
+    connect_with_timeout(&client).await?;
+    let mut statuses = Vec::new();
+    for package in &installed {
+        let requirement = format!(">{}", package.version);
+        let available = match resolve_release(
+            &client,
+            &root,
+            &package.name,
+            Some(&package.publisher),
+            Some(&requirement),
+            &trusted_publishers,
+            None,
+            OS,
+            ARCH,
+        )
+        .await
+        {
+            Ok(resolved) => Some(resolved.version),
+            Err(error)
+                if error.to_string()
+                    == format!("no verified release found for {}", package.name) =>
+            {
+                None
+            }
+            Err(error) => {
+                client.disconnect().await;
+                return Err(error);
+            }
+        };
+        statuses.push(UpdateStatus {
+            reference: installed_package_reference(package),
+            current_version: package.version.clone(),
+            available_version: available,
+        });
+    }
+    client.disconnect().await;
+    Ok(serde_json::to_value(statuses)?)
 }
 
 fn verify_release_event(event: &Event, manifest: &Manifest) -> Result<()> {
@@ -6039,6 +6576,56 @@ mod tests {
         )?;
         verify_locked_order(&lockfile, &installed)?;
         assert!(verify_locked_install(&capabilities, root.path()).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn daemon_serves_list_installed_and_rejects_unknown_methods() -> Result<()> {
+        let dir = tempdir()?;
+        let socket_path = dir.path().join("npackd.sock");
+        let store = dir.path().join("store");
+        fs::create_dir_all(&store)?;
+
+        let listener = tokio::net::UnixListener::bind(&socket_path)?;
+        let config = Config::default();
+        let server = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_daemon_connection(stream, &config).await.unwrap();
+        };
+
+        let client_work = async {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            let mut client = tokio::net::UnixStream::connect(&socket_path).await?;
+            let request = serde_json::json!({
+                "id": 1,
+                "method": "ListInstalled",
+                "params": { "store": store },
+            });
+            client
+                .write_all(format!("{}\n", request).as_bytes())
+                .await?;
+            client
+                .write_all(b"{\"id\":2,\"method\":\"NoSuchMethod\"}\n")
+                .await?;
+            drop(client.shutdown().await);
+
+            let (read_half, _write_half) = client.into_split();
+            let mut lines = BufReader::new(read_half).lines();
+
+            let first = lines.next_line().await?.context("expected first reply")?;
+            let first: serde_json::Value = serde_json::from_str(&first)?;
+            assert_eq!(first["id"], 1);
+            assert_eq!(first["result"], serde_json::json!([]));
+
+            let second = lines.next_line().await?.context("expected second reply")?;
+            let second: serde_json::Value = serde_json::from_str(&second)?;
+            assert_eq!(second["id"], 2);
+            assert!(second["error"].as_str().unwrap().contains("unknown method"));
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let ((), result) = tokio::join!(server, client_work);
+        result?;
         Ok(())
     }
 }

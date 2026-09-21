@@ -26,6 +26,7 @@ npack is an independent package manager whose registry metadata will be publishe
     npack remove <publisher>/<name> [--user|--system] [--store <path>]
     npack inspect <artifact>
     npack appstream <artifact> [--output <metainfo.xml>]
+    npack daemon [--socket <path>]
 
 ## Conventions
 
@@ -46,3 +47,4 @@ npack is an independent package manager whose registry metadata will be publishe
 - `npack update --check` (alias of `install-ref --check`) reports available updates for one or all installed packages without downloading or installing anything, the `apt update` counterpart to `update`'s `apt upgrade`.
 - A manifest's optional `app` object (`summary`, `description`, `homepage`, `license`, `categories`, `icon`, `screenshots`, `desktop_file`, `release_date`) carries desktop-store metadata; `icon` and `desktop_file` are package-relative paths validated to exist and, for `desktop_file`, to be a syntactically valid freedesktop.org Desktop Entry file with `Exec` required when `Type=Application`.
 - `npack appstream` maps a manifest's `app` metadata to an AppStream `<component>` document per the freedesktop.org AppStream spec: `console-application` when there is no `desktop_file` (advertising `<provides><binary>`), `desktop-application` otherwise (advertising `<launchable type="desktop-id">`). Component IDs are namespaced `io.npack.<publisher>.<name>` since publishers are Nostr pubkeys, not domains.
+- `npack daemon` runs npackd, a local JSON-RPC-over-Unix-socket service (newline-delimited JSON requests/responses) exposing `Search`, `GetPackage`, `ListInstalled`, `Install`, `Remove`, `Update`, and `CheckUpdates` so a GUI store or other tool does not need to understand Nostr, Blossom, or `.npk` internals. It defaults to `$XDG_RUNTIME_DIR/npackd.sock`. Connections are handled one at a time (the recursive install future is not `Send`, so it cannot be spawned onto the runtime); transaction/progress-event streaming is future work.

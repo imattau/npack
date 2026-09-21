@@ -117,6 +117,10 @@ npack update --user --check         # report available updates without installin
 # artifact themselves
 npack resolve <publisher>/myapp --relay wss://relay.example
 
+# Run npackd, a local JSON-RPC service over a Unix socket for a GUI store or
+# other tool that shouldn't need to know about Nostr, Blossom, or .npk
+npack daemon --socket $XDG_RUNTIME_DIR/npackd.sock
+
 # Publish an artifact and its Nostr events
 npack publish ./myapp.manifest.json \
   --secret-key <secret-key> \
