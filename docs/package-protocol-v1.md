@@ -60,10 +60,22 @@ Repeatable tags:
 | requires | Runtime capability requirement |
 | provides | Runtime capability supplied by the package |
 | post-install | action, relative-path |
+| install-input | JSON-encoded install-input descriptor |
 
 Unknown tags are ignored for forward compatibility. Required singleton tags
 must not be duplicated. Malformed dependency or post-install tags invalidate
 the release.
+
+Install-input descriptors are signed release metadata. Each descriptor has
+`id`, a namespaced `value_type`, `required`, `sensitive`, optional
+`description`, and an opaque JSON `constraints` value. The type namespace is
+open; clients may define platform-specific types. Clients that cannot handle
+a required type must stop before installing. Per-install values are supplied
+through npackd `Install.install_values`, keyed by descriptor id. npack checks
+that required values are present and rejects undeclared ids; type-specific
+interpretation belongs to clients/platform integrations. Values are not
+release metadata, are not persisted, and publisher-provided validators are
+never executed.
 
 ## Revocation events
 

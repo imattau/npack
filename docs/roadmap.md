@@ -90,6 +90,12 @@ status line.
 
 ## Phase 3: Security and privilege separation (in progress)
 
+Installer-neutral setup inputs are scoped in
+[Package setup](package-setup.md). The first slice now signs extensible input
+descriptors with releases, exposes them through `GetPackage`, and accepts and
+validates per-install values through npackd `Install`. Platform-specific type
+interpretation and applying those values remain client/integration work.
+
 Do this before connecting a graphical store. Separate user and system
 operations:
 

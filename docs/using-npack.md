@@ -178,6 +178,15 @@ The important fields are:
 | `post_install` | Declarative, capability-gated installation actions. |
 | `app` | Optional desktop-store metadata: `summary`, `description`, `homepage`, `license`, `categories`, `icon`, `screenshots`, `desktop_file`, `release_date`. See [AppStream metadata](#appstream-metadata) below. |
 
+Packages may also set `app.install_inputs` to an array of install-time input
+descriptors. Each has an identifier, a namespaced `value_type`, `required`,
+`sensitive`, optional `description`, and opaque JSON `constraints`. Type
+identifiers are open-ended so packages and platform integrations can define
+their own. npack signs and returns descriptors as release metadata; clients
+collect values and send them per install. npack checks required fields and
+rejects undeclared values, but does not interpret extension types or persist
+the supplied values.
+
 An external publishing manifest must contain the final SHA-256:
 
 ```bash
@@ -499,7 +508,7 @@ Supported methods, mirroring the CLI operations above:
 | `Search` | `query`, `relay[]`, `trusted_publisher[]`, `pubkey`, `refresh`, `no_cache` | Array of matching releases. |
 | `GetPackage` | `package`, `relay[]`, `requirement`, `os`, `arch`, `trusted_publisher[]`, `store`, `user` | The same resolved-metadata object as `npack resolve`. |
 | `ListInstalled` | `user`, `store` | Array of installed packages. |
-| `Install` | `package`, `requirement`, `relay[]`, `server[]`, `user`, `store`, `allow_capability[]`, `async` | The installed package's record, or `{"transaction_id": N}` if `async` is true. |
+| `Install` | `package`, `requirement`, `relay[]`, `server[]`, `user`, `store`, `allow_capability[]`, `install_values{}`, `async` | The installed package's record, or `{"transaction_id": N}` if `async` is true. `install_values` is a per-install object keyed by descriptor id. |
 | `Remove` | `package`, `user`, `store` | `{"removed": "<package>"}`. |
 | `Update` | `package` (omit for all), `relay[]`, `server[]`, `user`, `store`, `allow_capability[]`, `async` | Array of per-package update outcomes, or `{"transaction_id": N}` if `async` is true. |
 | `CheckUpdates` | `package` (omit for all), `relay[]`, `trusted_publisher[]`, `user`, `store` | Array of `{reference, current_version, available_version}`. |

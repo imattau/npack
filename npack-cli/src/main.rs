@@ -693,6 +693,24 @@ struct AppMetadata {
     /// AppStream metadata.
     #[serde(default)]
     release_date: Option<String>,
+    /// Extensible per-install value descriptors. Type identifiers are
+    /// namespaced; npack transports descriptors without executing validators.
+    #[serde(default)]
+    install_inputs: Vec<InstallInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct InstallInput {
+    id: String,
+    value_type: String,
+    #[serde(default)]
+    required: bool,
+    #[serde(default)]
+    sensitive: bool,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    constraints: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -718,6 +736,7 @@ struct ResolvedRelease {
     conflicts: Vec<Dependency>,
     runtime_requires: Vec<String>,
     provides: Vec<String>,
+    install_inputs: Vec<InstallInput>,
     release_event_id: String,
     artifact_event_id: String,
     verification: VerificationResult,
@@ -2535,6 +2554,7 @@ async fn resolve_release(
         conflicts: manifest.conflicts,
         runtime_requires: manifest.runtime_requires,
         provides: manifest.provides,
+        install_inputs: manifest.app.install_inputs,
         release_event_id: release.id.to_hex(),
         artifact_event_id: artifact_event.id.to_hex(),
         verification: VerificationResult {
@@ -3133,6 +3153,9 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
             "post-install" if values.len() != 3 => {
                 bail!("invalid post-install tag in release event");
             }
+            "install-input" if values.len() != 2 => {
+                bail!("invalid install-input tag in release event");
+            }
             _ => {}
         }
     }
@@ -3202,6 +3225,14 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
             })
         })
         .collect();
+    let install_inputs = event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind() == "install-input")
+        .filter_map(Tag::content)
+        .map(serde_json::from_str::<InstallInput>)
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_install_inputs(&install_inputs)?;
     validate_dependency_declarations(&dependencies)?;
     validate_dependency_declarations(&conflicts)?;
     validate_capability_declarations(&runtime_requires, "runtime requirement")?;
@@ -3217,7 +3248,10 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
         bail!("release commit must be a non-empty commit identifier");
     }
     Ok(Manifest {
-        app: AppMetadata::default(),
+        app: AppMetadata {
+            install_inputs,
+            ..AppMetadata::default()
+        },
         publisher: event.pubkey.to_hex(),
         name: tag_value(event, "name")
             .context("release has no name")?
@@ -4070,7 +4104,7 @@ fn daemon_list_installed(config: &Config, params: serde_json::Value) -> Result<s
     Ok(serde_json::to_value(installed_packages(Some(&root))?)?)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct InstallParams {
     package: String,
     #[serde(default)]
@@ -4085,6 +4119,9 @@ struct InstallParams {
     store: Option<PathBuf>,
     #[serde(default)]
     allow_capability: Vec<String>,
+    /// Per-install values keyed by install-input id. Kept only in memory.
+    #[serde(default)]
+    install_values: serde_json::Map<String, serde_json::Value>,
     /// Run in the background and return `{"transaction_id": N}` immediately
     /// instead of waiting for the install to finish.
     #[serde(default, rename = "async")]
@@ -4112,6 +4149,24 @@ async fn daemon_install_sync(
     control: Option<Arc<TransactionControl>>,
 ) -> Result<serde_json::Value> {
     let package = params.package.clone();
+    let input_metadata = daemon_get_package(
+        config,
+        serde_json::json!({
+            "package": params.package.clone(),
+            "requirement": params.requirement.clone(),
+            "relay": params.relay.clone(),
+            "user": params.user,
+            "store": params.store.clone(),
+        }),
+    )
+    .await?;
+    let inputs: Vec<InstallInput> = serde_json::from_value(
+        input_metadata
+            .get("install_inputs")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    )?;
+    validate_install_values(&inputs, &params.install_values)?;
     install_remote_command(
         &package,
         params.requirement,
@@ -4623,6 +4678,9 @@ fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) ->
             action.path.to_string_lossy().into_owned(),
         ]);
     }
+    for input in &manifest.app.install_inputs {
+        tags.push(vec!["install-input".into(), serde_json::to_string(input)?]);
+    }
     let content = format!(
         "npack release {}/{} {}",
         manifest.publisher, manifest.name, manifest.version
@@ -4900,6 +4958,7 @@ fn is_safe_relative_path(path: &Path) -> bool {
 }
 
 fn validate_app_metadata(app: &AppMetadata) -> Result<()> {
+    validate_install_inputs(&app.install_inputs)?;
     if let Some(icon) = &app.icon
         && !is_safe_relative_path(icon)
     {
@@ -4938,6 +4997,49 @@ fn validate_app_metadata(app: &AppMetadata) -> Result<()> {
                 .all(|(i, b)| matches!(i, 4 | 7) || b.is_ascii_digit());
         if !valid {
             bail!("manifest app.release_date must be a YYYY-MM-DD date");
+        }
+    }
+    Ok(())
+}
+
+fn validate_install_inputs(inputs: &[InstallInput]) -> Result<()> {
+    let mut identifiers = HashSet::new();
+    for input in inputs {
+        let valid_token = |value: &str| {
+            !value.is_empty()
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric()
+                        || matches!(character, '.' | '_' | '-' | '/' | ':')
+                })
+        };
+        if !valid_token(&input.id) || !identifiers.insert(&input.id) {
+            bail!("invalid or duplicate install input identifier: {}", input.id);
+        }
+        if !valid_token(&input.value_type) || !input.value_type.contains(':') {
+            bail!("install input type must be a namespaced identifier: {}", input.value_type);
+        }
+        if let Some(description) = &input.description
+            && description.chars().any(char::is_control)
+        {
+            bail!("install input description contains control characters");
+        }
+    }
+    Ok(())
+}
+
+fn validate_install_values(
+    inputs: &[InstallInput],
+    values: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    validate_install_inputs(inputs)?;
+    for name in values.keys() {
+        if !inputs.iter().any(|input| input.id == *name) {
+            bail!("unexpected install value: {name}");
+        }
+    }
+    for input in inputs {
+        if input.required && !values.contains_key(&input.id) {
+            bail!("missing required install value: {}", input.id);
         }
     }
     Ok(())
@@ -7003,6 +7105,7 @@ mod tests {
             conflicts: vec![],
             runtime_requires: vec![],
             provides: vec![],
+            install_inputs: vec![],
             release_event_id: "release-id".into(),
             artifact_event_id: "artifact-id".into(),
             verification: VerificationResult {
@@ -7035,6 +7138,7 @@ mod tests {
             conflicts: vec![],
             runtime_requires: vec![],
             provides: vec![],
+            install_inputs: vec![],
             release_event_id: "release-id".into(),
             artifact_event_id: "artifact-id".into(),
             verification: VerificationResult {
@@ -7423,6 +7527,7 @@ mod tests {
             screenshots: vec!["https://example.com/hello/screenshot.png".into()],
             desktop_file: Some("hello.desktop".into()),
             release_date: Some("2026-01-15".into()),
+            install_inputs: vec![],
         });
         fs::write(
             source.join(".npack/manifest.json"),
