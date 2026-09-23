@@ -70,6 +70,68 @@ jobs:
             --output "package-output/npack-${VERSION}.manifest.json"
           sha256sum "package-output/$artifact" > package-output/SHA256SUMS
 
+      - name: Build Debian and RPM packages
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev rpm
+          mkdir -p package-output/deb-root/usr/bin package-output/deb-root/usr/share/man/man1
+          install -m 0755 target/release/npack package-output/deb-root/usr/bin/npack
+          cargo run --quiet -- man > package-output/deb-root/usr/share/man/man1/npack.1
+          gzip -n -9 package-output/deb-root/usr/share/man/man1/npack.1
+
+          mkdir -p package-output/deb-root/DEBIAN
+          cat > package-output/deb-root/DEBIAN/control <<EOF
+          Package: npack
+          Version: ${VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Depends: libc6, ca-certificates
+          Maintainer: npack contributors
+          Description: A Nostr-native package manager
+           Discovers, verifies, and installs signed package releases.
+          EOF
+          dpkg-deb --root-owner-group --build package-output/deb-root \
+            "package-output/npack_${VERSION}_amd64.deb"
+
+          mkdir -p rpm-build/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          install -m 0755 target/release/npack rpm-build/SOURCES/npack
+          install -m 0644 package-output/deb-root/usr/share/man/man1/npack.1.gz rpm-build/SOURCES/npack.1.gz
+          rpm_version="${VERSION//-/_}"
+          cat > rpm-build/SPECS/npack.spec <<EOF
+          Name:           npack
+          Version:        ${rpm_version}
+          Release:        1%{?dist}
+          Summary:        A Nostr-native package manager
+          License:        MIT
+          BuildArch:      x86_64
+          Requires:       glibc
+          Requires:       ca-certificates
+          Source0:        npack
+          Source1:        npack.1.gz
+
+          %description
+          Discovers, verifies, and installs signed package releases.
+
+          %install
+          install -D -m 0755 %{SOURCE0} %{buildroot}/usr/bin/npack
+          install -D -m 0644 %{SOURCE1} %{buildroot}/usr/share/man/man1/npack.1.gz
+
+          %files
+          /usr/bin/npack
+          /usr/share/man/man1/npack.1.gz
+
+          %changelog
+          * Thu Jan 01 1970 npack contributors - ${rpm_version}-1
+          - Release build
+          EOF
+          rpmbuild -bb --define "_topdir $(pwd)/rpm-build" \
+            --define "_builddir $(pwd)" rpm-build/SPECS/npack.spec
+          cp rpm-build/RPMS/x86_64/*.rpm package-output/
+          rm -rf package-output/deb-root rpm-build
+
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
         with:
@@ -105,6 +167,8 @@ jobs:
         with:
           files: |
             package-output/*.npk
+            package-output/*.deb
+            package-output/*.rpm
             package-output/*.manifest.json
             package-output/SHA256SUMS
             package-output/npack.spdx.json
