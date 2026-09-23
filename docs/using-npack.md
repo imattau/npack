@@ -187,6 +187,18 @@ collect values and send them per install. npack checks required fields and
 rejects undeclared values, but does not interpret extension types or persist
 the supplied values.
 
+Two more optional top-level fields, `repo` and `commit`, link a release to
+its source. `commit` is any non-empty commit identifier. `repo` must be a
+NIP-34 `30617:<pubkey>:<identifier>` repository address, **not** a plain
+URL - `npack pack`/`npack publish` reject anything else with "manifest repo
+must be a NIP-34 kind:30617 address". Neither field has a dedicated CLI
+flag yet; set them by editing `repo`/`commit` directly in
+`.npack/manifest.json` after `npack init`, before `npack pack`. See
+[Release events](package-protocol-v1.md#release-events) for the full tag
+format - clients may use these for provenance display and repository-state
+verification, but source availability is never required to install an
+otherwise valid artifact.
+
 An external publishing manifest must contain the final SHA-256:
 
 ```bash
