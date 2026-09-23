@@ -5013,10 +5013,16 @@ fn validate_install_inputs(inputs: &[InstallInput]) -> Result<()> {
                 })
         };
         if !valid_token(&input.id) || !identifiers.insert(&input.id) {
-            bail!("invalid or duplicate install input identifier: {}", input.id);
+            bail!(
+                "invalid or duplicate install input identifier: {}",
+                input.id
+            );
         }
         if !valid_token(&input.value_type) || !input.value_type.contains(':') {
-            bail!("install input type must be a namespaced identifier: {}", input.value_type);
+            bail!(
+                "install input type must be a namespaced identifier: {}",
+                input.value_type
+            );
         }
         if let Some(description) = &input.description
             && description.chars().any(char::is_control)
