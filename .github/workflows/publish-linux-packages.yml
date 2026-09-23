@@ -1,0 +1,106 @@
+name: Publish Linux packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing GitHub release version, without the v prefix
+        required: true
+        default: "0.4.0"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  packages:
+    name: Build and upload .deb and .rpm
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate version and release
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Version must be a stable semantic version such as 0.4.0" >&2
+            exit 1
+          }
+          gh release view "v${VERSION}" >/dev/null
+
+      - name: Check out release source
+        uses: actions/checkout@v4
+        with:
+          ref: v${{ inputs.version }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build npack
+        run: cargo build -p npack --release --locked
+
+      - name: Build Debian and RPM packages
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev rpm
+          mkdir -p package-output/deb-root/usr/bin package-output/deb-root/usr/share/man/man1
+          install -m 0755 target/release/npack package-output/deb-root/usr/bin/npack
+          cargo run -p npack --release --quiet -- man > package-output/deb-root/usr/share/man/man1/npack.1
+          gzip -n -9 package-output/deb-root/usr/share/man/man1/npack.1
+
+          mkdir -p package-output/deb-root/DEBIAN
+          cat > package-output/deb-root/DEBIAN/control <<EOF
+          Package: npack
+          Version: ${VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Depends: libc6, ca-certificates
+          Maintainer: npack contributors
+          Description: A Nostr-native package manager
+           Discovers, verifies, and installs signed package releases.
+          EOF
+          dpkg-deb --root-owner-group --build package-output/deb-root \
+            "package-output/npack_${VERSION}_amd64.deb"
+
+          mkdir -p rpm-build/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          install -m 0755 target/release/npack rpm-build/SOURCES/npack
+          install -m 0644 package-output/deb-root/usr/share/man/man1/npack.1.gz rpm-build/SOURCES/npack.1.gz
+          cat > rpm-build/SPECS/npack.spec <<EOF
+          Name:           npack
+          Version:        ${VERSION}
+          Release:        1%{?dist}
+          Summary:        A Nostr-native package manager
+          License:        MIT
+          BuildArch:      x86_64
+          Requires:       glibc
+          Requires:       ca-certificates
+          Source0:        npack
+          Source1:        npack.1.gz
+
+          %description
+          Discovers, verifies, and installs signed package releases.
+
+          %install
+          install -D -m 0755 %{SOURCE0} %{buildroot}/usr/bin/npack
+          install -D -m 0644 %{SOURCE1} %{buildroot}/usr/share/man/man1/npack.1.gz
+
+          %files
+          /usr/bin/npack
+          /usr/share/man/man1/npack.1.gz
+
+          %changelog
+          * Thu Jan 01 1970 npack contributors - ${VERSION}-1
+          - Release build
+          EOF
+          rpmbuild -bb --define "_topdir $(pwd)/rpm-build" \
+            --define "_builddir $(pwd)" rpm-build/SPECS/npack.spec
+          cp rpm-build/RPMS/x86_64/*.rpm package-output/
+
+      - name: Upload packages to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: gh release upload "v${VERSION}" package-output/*.deb package-output/*.rpm

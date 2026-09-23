@@ -21,6 +21,12 @@ The native packages depend on the system C library and CA certificates. Their
 package manager metadata supports routine install and removal; npack's own
 `.npk` package format remains the source for Nostr-published releases.
 
+To add native packages to an existing GitHub Release, run the
+`Publish Linux packages` workflow from the Actions tab and enter the release
+version without its `v` prefix. It checks out that release's tag and uploads
+the matching `.deb` and `.rpm` files to that release. This workflow does not
+publish anything to Nostr.
+
 Set the repository variable `NOSTR_PUBLISHER` to the publisher's public key.
 Configure the protected `release` environment with the secret
 `NOSTR_SECRET_KEY`, containing a dedicated package-publisher private key. Add
