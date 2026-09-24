@@ -5840,6 +5840,29 @@ fn validate_post_install_actions(
     Ok(())
 }
 
+/// A symlink target is safe when it stays inside the archive root once
+/// resolved against the symlink's own directory. npm's `node_modules/.bin`
+/// shims are exactly this shape (`../acorn/bin/acorn`), while an absolute
+/// target or one that climbs above the root must be rejected.
+fn symlink_target_escapes(link_path: &Path, target: &Path) -> bool {
+    if target.is_absolute() {
+        return true;
+    }
+    let mut resolved: PathBuf = link_path.parent().unwrap_or(Path::new("")).to_path_buf();
+    for component in target.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                if !resolved.pop() {
+                    return true;
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => resolved.push(other.as_os_str()),
+        }
+    }
+    false
+}
+
 fn npk_entry_paths(archive_path: &Path) -> Result<Vec<PathBuf>> {
     let file = fs::File::open(archive_path)?;
     let decoder = zstd::Decoder::new(file)?;
@@ -5864,11 +5887,7 @@ fn npk_entry_paths(archive_path: &Path) -> Result<Vec<PathBuf>> {
         }
         if entry.header().entry_type().is_symlink() {
             let target = entry.link_name()?.context("symlink entry has no target")?;
-            if target.is_absolute()
-                || target
-                    .components()
-                    .any(|component| matches!(component, std::path::Component::ParentDir))
-            {
+            if symlink_target_escapes(&relative, &target) {
                 bail!(
                     "unsafe symlink target in .npk archive: {}",
                     target.display()
@@ -5927,6 +5946,13 @@ fn install_staged_npk(staging: &Path, prefix: &Path, entries: &[PathBuf]) -> Res
             rollback_directories(&created_directories)?;
             return Err(error);
         }
+    }
+    // The backups only exist to roll back this call's own writes and are
+    // never read again. Leaving them under staging/ would keep npack
+    // bookkeeping inside the payload root the host engine syncs from
+    // (and double every staged package's disk usage).
+    if backup_root.exists() {
+        let _ = fs::remove_dir_all(&backup_root);
     }
     Ok(installed)
 }
@@ -6037,11 +6063,7 @@ fn extract_npk(archive_path: &Path, destination: &Path) -> Result<Vec<PathBuf>> 
         }
         if entry.header().entry_type().is_symlink() {
             let target = entry.link_name()?.context("symlink entry has no target")?;
-            if target.is_absolute()
-                || target
-                    .components()
-                    .any(|component| matches!(component, std::path::Component::ParentDir))
-            {
+            if symlink_target_escapes(&relative, &target) {
                 bail!(
                     "unsafe symlink target in .npk archive: {}",
                     target.display()
@@ -6407,6 +6429,26 @@ mod tests {
         remove_package("npub1test/hello", Some(&store))?;
         assert!(installed_packages(Some(&store))?.is_empty());
         assert!(!installed.artifact.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn staged_install_cleans_backups_after_success() -> Result<()> {
+        let dir = tempdir()?;
+        let staging = dir.path().join("staging");
+        fs::create_dir_all(staging.join("var/www/app"))?;
+        fs::write(staging.join("var/www/app/hello.txt"), b"new contents")?;
+        let prefix = dir.path().join("prefix");
+        fs::create_dir_all(prefix.join("var/www/app"))?;
+        fs::write(prefix.join("var/www/app/hello.txt"), b"old")?;
+        let entries = vec![PathBuf::from("var/www/app/hello.txt")];
+        let installed = install_staged_npk(&staging, &prefix, &entries)?;
+        assert_eq!(installed, vec![prefix.join("var/www/app/hello.txt")]);
+        assert!(!staging.join(".npack-backups").exists());
+        assert_eq!(
+            fs::read(prefix.join("var/www/app/hello.txt"))?,
+            b"new contents"
+        );
         Ok(())
     }
 
@@ -7493,6 +7535,52 @@ mod tests {
         let destination = dir.path().join("extracted");
         extract_npk(&archive, &destination)?;
         assert_eq!(fs::read(destination.join(relative))?, b"long path contents");
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_npk_archive_with_npm_style_relative_symlinks() -> Result<()> {
+        let dir = tempdir()?;
+        let source = dir.path().join("source");
+        fs::create_dir_all(source.join("node_modules/.bin"))?;
+        fs::create_dir_all(source.join("node_modules/acorn/bin"))?;
+        fs::write(source.join("node_modules/acorn/bin/acorn"), b"#!node")?;
+        symlink("../acorn/bin/acorn", source.join("node_modules/.bin/acorn"))?;
+        let archive = dir.path().join("bin.npk");
+        pack_npk(&source, &archive)?;
+        let paths = npk_entry_paths(&archive)?;
+        assert!(paths.contains(&PathBuf::from("node_modules/.bin/acorn")));
+        let destination = dir.path().join("extracted");
+        extract_npk(&archive, &destination)?;
+        assert_eq!(
+            fs::read_link(destination.join("node_modules/.bin/acorn"))?,
+            PathBuf::from("../acorn/bin/acorn")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_npk_archive_with_escaping_symlink_targets() -> Result<()> {
+        let dir = tempdir()?;
+        let source = dir.path().join("source");
+        fs::create_dir_all(source.join("var/www/app"))?;
+        symlink("../../../../etc/passwd", source.join("var/www/app/escape"))?;
+        let archive = dir.path().join("escape.npk");
+        pack_npk(&source, &archive)?;
+        let listing = npk_entry_paths(&archive);
+        assert!(
+            listing
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("unsafe symlink target")),
+            "expected npk_entry_paths to reject the escaping target, got {listing:?}"
+        );
+        let extract = extract_npk(&archive, &dir.path().join("extracted"));
+        assert!(
+            extract
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("unsafe symlink target")),
+            "expected extract_npk to reject the escaping target, got {extract:?}"
+        );
         Ok(())
     }
 
