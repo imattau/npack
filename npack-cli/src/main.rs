@@ -1940,8 +1940,11 @@ fn pack_npk(source: &Path, output: &Path) -> Result<()> {
     for path in entries {
         let relative = path.strip_prefix(source)?;
         let metadata = fs::symlink_metadata(&path)?;
+        // Do NOT call Header::set_path here: it writes only the 100-byte
+        // name field and hard-fails on longer paths (deep node_modules
+        // trees). append_data -> prepare_header_path sets the path itself,
+        // emitting a GNU long-name extension entry when it does not fit.
         let mut header = tar::Header::new_gnu();
-        header.set_path(relative)?;
         header.set_mtime(0);
         header.set_uid(0);
         header.set_gid(0);
@@ -7464,6 +7467,32 @@ mod tests {
         let files = extract_npk(&archive, &destination)?;
         assert_eq!(files.len(), 2);
         assert_eq!(fs::read(destination.join("bin/hello"))?, b"hello");
+        Ok(())
+    }
+
+    #[test]
+    fn packs_and_extracts_npk_archive_with_long_paths() -> Result<()> {
+        let dir = tempdir()?;
+        let source = dir.path().join("source");
+        // Relative path over the 100-byte ustar name field: round-trips only
+        // when pack_npk lets append_data emit GNU long-name extensions
+        // instead of calling Header::set_path directly.
+        let relative = "var/www/app/node_modules/@astrojs/sitemap/node_modules/zod/src/v3/benchmarks/fixtures/eslint.config.mjs";
+        assert!(
+            relative.len() > 100,
+            "test path must overflow the name field"
+        );
+        let file = source.join(relative);
+        fs::create_dir_all(file.parent().unwrap())?;
+        fs::write(&file, b"long path contents")?;
+        let archive = dir.path().join("long.npk");
+        pack_npk(&source, &archive)?;
+        let archive_again = dir.path().join("long-again.npk");
+        pack_npk(&source, &archive_again)?;
+        assert_eq!(hash_file(&archive)?, hash_file(&archive_again)?);
+        let destination = dir.path().join("extracted");
+        extract_npk(&archive, &destination)?;
+        assert_eq!(fs::read(destination.join(relative))?, b"long path contents");
         Ok(())
     }
 
