@@ -1570,35 +1570,17 @@ fn init_package(
         directory.display(),
         manifest.artifact.display()
     );
+    println!(
+        "set app.icon (a package-relative path) in {} to carry a logo in the archive",
+        manifest_path.display()
+    );
     Ok(())
 }
 
 fn inspect_artifact(path: &Path) -> Result<()> {
     if path.extension().and_then(|ext| ext.to_str()) == Some("npk") {
         let manifest = load_embedded_manifest(path)?;
-        println!("format: npk");
-        println!("publisher: {}", display_publisher(&manifest.publisher));
-        println!("name: {}", manifest.name);
-        println!("version: {}", manifest.version);
-        println!("os: {}", manifest.os);
-        println!("arch: {}", manifest.arch);
-        println!("sha256: {}", manifest.sha256);
-        if manifest.dependencies.is_empty() {
-            println!("dependencies: none");
-        } else {
-            for dependency in &manifest.dependencies {
-                let publisher = dependency
-                    .publisher
-                    .as_deref()
-                    .map(display_publisher)
-                    .map(|publisher| format!("{publisher}/"))
-                    .unwrap_or_default();
-                println!(
-                    "dependency: {}{} {}",
-                    publisher, dependency.name, dependency.requirement
-                );
-            }
-        }
+        print!("{}", inspect_npk(&manifest));
         return Ok(());
     }
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
@@ -1625,6 +1607,39 @@ fn inspect_artifact(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Renders the `npack inspect` report for an .npk's embedded manifest.
+fn inspect_npk(manifest: &Manifest) -> String {
+    let mut lines = vec![
+        "format: npk".to_string(),
+        format!("publisher: {}", display_publisher(&manifest.publisher)),
+        format!("name: {}", manifest.name),
+        format!("version: {}", manifest.version),
+        format!("os: {}", manifest.os),
+        format!("arch: {}", manifest.arch),
+        format!("sha256: {}", manifest.sha256),
+    ];
+    if let Some(icon) = &manifest.app.icon {
+        lines.push(format!("icon: {}", icon.display()));
+    }
+    if manifest.dependencies.is_empty() {
+        lines.push("dependencies: none".to_string());
+    } else {
+        for dependency in &manifest.dependencies {
+            let publisher = dependency
+                .publisher
+                .as_deref()
+                .map(display_publisher)
+                .map(|publisher| format!("{publisher}/"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "dependency: {}{} {}",
+                publisher, dependency.name, dependency.requirement
+            ));
+        }
+    }
+    lines.join("\n") + "\n"
+}
+
 fn write_manifest(artifact: &Path, output: &Path) -> Result<()> {
     if artifact.extension().and_then(|ext| ext.to_str()) != Some("npk") {
         bail!("manifest generation requires an .npk artifact");
@@ -1644,6 +1659,12 @@ fn appstream_command(artifact: &Path, output: Option<&Path>) -> Result<()> {
         bail!("appstream generation requires an .npk artifact");
     }
     let manifest = load_embedded_manifest(artifact)?;
+    if manifest.app.desktop_file.is_some() && manifest.app.icon.is_none() {
+        eprintln!(
+            "warning: package declares app.desktop_file but no app.icon; \
+             the AppStream document will have no <icon> element"
+        );
+    }
     let xml = appstream_xml(&manifest);
     match output {
         Some(output) => {
@@ -7677,6 +7698,36 @@ mod tests {
         assert!(xml.contains("type=\"console-application\""));
         assert!(xml.contains("<provides>\n    <binary>hello</binary>\n  </provides>"));
         assert!(!xml.contains("<launchable"));
+    }
+
+    #[test]
+    fn inspect_reports_the_package_icon() -> Result<()> {
+        let dir = tempdir()?;
+        let source = dir.path().join("source");
+        fs::create_dir_all(source.join(".npack"))?;
+        fs::create_dir_all(source.join("share/icons"))?;
+        fs::write(source.join("share/icons/hello.png"), b"icon")?;
+        let manifest = sample_manifest_with_app(AppMetadata {
+            icon: Some("share/icons/hello.png".into()),
+            ..AppMetadata::default()
+        });
+        fs::write(
+            source.join(".npack/manifest.json"),
+            serde_json::to_vec(&manifest)?,
+        )?;
+        let archive = dir.path().join("hello.npk");
+        pack_npk(&source, &archive)?;
+        let loaded = load_embedded_manifest(&archive)?;
+        let report = inspect_npk(&loaded);
+        assert!(report.contains("icon: share/icons/hello.png\n"));
+        assert!(report.contains("dependencies: none\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_omits_the_icon_line_when_the_package_declares_none() {
+        let report = inspect_npk(&sample_manifest_with_app(AppMetadata::default()));
+        assert!(!report.contains("icon:"));
     }
 
     #[test]

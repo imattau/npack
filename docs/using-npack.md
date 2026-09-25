@@ -249,6 +249,13 @@ Linux application stores already understand:
 file (a `[Desktop Entry]` group with `Type` and `Name`, plus `Exec` when
 `Type=Application`).
 
+`npack inspect` prints the declared icon path with the rest of the embedded
+metadata. `npack appstream` references the icon as an icon-theme (stock) name
+derived from the file stem; a package that declares `app.desktop_file` but no
+`app.icon` gets a warning on stderr, because the generated document would
+silently lack an `<icon>` element. `npack init` prints a reminder that
+`app.icon` is where a package logo is declared.
+
 Generate an [AppStream](https://www.freedesktop.org/software/appstream/docs/)
 component document from a built archive:
 
