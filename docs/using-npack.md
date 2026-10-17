@@ -504,12 +504,40 @@ signed, v1, unrevoked, from a trusted publisher, and match the name and
 host os/arch; otherwise resolution fails rather than falling back. It cannot
 be combined with `--requirement`, `--lockfile`, or `--recursive`.
 
-The JSON output includes a `kind` field (`null` for ordinary packages). A
-manifest may set `"kind": "nix-recipe"` to publish a build recipe: a `.npk`
-(`os`/`arch` `any`) containing, for example, a `default.nix`. Such artifacts
-are consumed through `npack resolve` and refused by `npack install`/`update`.
-[`packaging/nix/npack-recipe.nix`](../packaging/nix/npack-recipe.nix) shows a
-Nix function that fetches a pinned recipe artifact and `callPackage`s it.
+The JSON output includes `kind` (`null` for ordinary packages) and
+`fork_of` (`null` unless the release declares provenance).
+
+### Nix recipes
+
+A manifest may set `"kind": "nix-recipe"` to publish a Nix build recipe: a
+`.npk` (`os`/`arch` `any`) containing a `default.nix` that is a
+`callPackage`-style function. `npack install`/`update` refuse such artifacts;
+they are consumed through `npack resolve`. To publish a modified copy of
+someone else's recipe, repack it under your own key with
+`"fork_of": {"publisher": "<hex>", "name": "<name>", "release": "<event-id>"}`.
+
+[`packaging/nix`](../packaging/nix) is the reusable consumer side:
+
+```bash
+# Resolve (recursively, with declared dependencies) and pin in a JSON file
+packaging/nix/npack-nix-pin --out npack-pins.json \
+  myapp=<publisher>/myapp -- --relay wss://relay.example --trusted-publisher <hex>
+```
+
+```nix
+# Evaluation is pure: the pins carry the sha256 and mirror URLs.
+(import ./lib.nix { inherit pkgs; }).fromPins ./npack-pins.json
+# or via the flake: npack.lib.${system}.fromPins ./npack-pins.json
+```
+
+Every pinned recipe is built in one scope, so a recipe can take its declared
+npack dependency as a function argument by name. Pin an exact release with
+`attr=<publisher>/<name>@<release-event-id>`; rerun `npack-nix-pin` to update.
+
+**Trust.** A recipe is Nix code that your machine evaluates and then builds,
+and evaluating it uses import-from-derivation. The signature and SHA-256 prove
+who published the bytes, not that the recipe is safe. Pass
+`--trusted-publisher` and review recipes (or pin exact releases) before use.
 
 ## Running npackd (local service API)
 

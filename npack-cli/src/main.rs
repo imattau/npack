@@ -671,6 +671,9 @@ struct Manifest {
     /// is consumed through `npack resolve` by an external tool, never installed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
+    /// Release this one was forked from; provenance only, never trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fork_of: Option<ForkOf>,
     #[serde(default)]
     runtime_requires: Vec<String>,
     #[serde(default)]
@@ -679,6 +682,14 @@ struct Manifest {
     post_install: Vec<PostInstallAction>,
     #[serde(default)]
     app: AppMetadata,
+}
+
+/// Provenance link to the release a recipe or package was forked from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ForkOf {
+    publisher: String,
+    name: String,
+    release: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -744,6 +755,7 @@ struct ResolvedRelease {
     arch: String,
     format: String,
     kind: Option<String>,
+    fork_of: Option<ForkOf>,
     artifact_urls: Vec<String>,
     dependencies: Vec<Dependency>,
     conflicts: Vec<Dependency>,
@@ -1575,6 +1587,7 @@ fn init_package(
         arch: arch.into(),
         format: "npk".into(),
         kind: None,
+        fork_of: None,
         runtime_requires: vec![],
         provides: vec![],
         post_install: vec![],
@@ -2671,6 +2684,7 @@ async fn finish_resolved_release(
         arch: manifest.arch,
         format: manifest.format,
         kind: manifest.kind,
+        fork_of: manifest.fork_of,
         artifact_urls,
         dependencies: manifest.dependencies,
         conflicts: manifest.conflicts,
@@ -3040,6 +3054,7 @@ fn install_remote_package<'a, 'b>(
             ));
         }
         let (sha256, manifest) = resolved_manifest(&release, &artifact_event)?;
+        ensure_installable_kind(&manifest)?;
         let expected: Sha256Hash = sha256.parse()?;
         let staging = state.root.join("downloads").join(&sha256);
         fs::create_dir_all(&staging)?;
@@ -3281,6 +3296,7 @@ async fn discover_blossom_servers(client: &Client, publisher: &PublicKey) -> Res
 fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result<Manifest> {
     for kind in [
         "d", "name", "version", "os", "arch", "format", "x", "artifact", "repo", "commit", "kind",
+        "fork-of",
     ] {
         let count = event.tags.iter().filter(|tag| tag.kind() == kind).count();
         if count > 1 {
@@ -3394,6 +3410,24 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
     if let Some(kind) = &kind {
         validate_artifact_kind(kind)?;
     }
+    let fork_of = event
+        .tags
+        .iter()
+        .find(|tag| tag.kind() == "fork-of")
+        .map(|tag| {
+            let values = tag.clone().to_vec();
+            if values.len() != 4 {
+                bail!("invalid fork-of tag in release event");
+            }
+            let fork = ForkOf {
+                publisher: values[1].clone(),
+                name: values[2].clone(),
+                release: values[3].clone(),
+            };
+            validate_fork_of(&fork)?;
+            Ok(fork)
+        })
+        .transpose()?;
     Ok(Manifest {
         app: AppMetadata {
             install_inputs,
@@ -3420,6 +3454,7 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
         arch: tag_value(event, "arch").unwrap_or("any").into(),
         format: tag_value(event, "format").unwrap_or("opaque").into(),
         kind,
+        fork_of,
         runtime_requires,
         provides,
         post_install,
@@ -4683,6 +4718,7 @@ fn verify_release_event(event: &Event, manifest: &Manifest) -> Result<()> {
         || event_manifest.repo != manifest.repo
         || event_manifest.commit != manifest.commit
         || event_manifest.kind != manifest.kind
+        || event_manifest.fork_of != manifest.fork_of
     {
         bail!("release event metadata does not match the package manifest");
     }
@@ -4695,7 +4731,7 @@ fn release_event_is_v1(event: &Event) -> bool {
     }
     if [
         "d", "v", "name", "version", "os", "arch", "format", "x", "artifact", "repo", "commit",
-        "kind",
+        "kind", "fork-of",
     ]
     .iter()
     .any(|kind| event.tags.iter().filter(|tag| tag.kind() == *kind).count() > 1)
@@ -4799,6 +4835,14 @@ fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) ->
     }
     if let Some(kind) = &manifest.kind {
         tags.push(vec!["kind".into(), kind.clone()]);
+    }
+    if let Some(fork) = &manifest.fork_of {
+        tags.push(vec![
+            "fork-of".into(),
+            fork.publisher.clone(),
+            fork.name.clone(),
+            fork.release.clone(),
+        ]);
     }
     for dependency in &manifest.dependencies {
         let mut tag = vec!["depends".into()];
@@ -5075,6 +5119,17 @@ fn validate_artifact_kind(kind: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_fork_of(fork: &ForkOf) -> Result<()> {
+    if fork.publisher.len() != 64 || !fork.publisher.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("fork-of publisher must be a 64-character hex public key");
+    }
+    validate_package_name(&fork.name, "fork-of package name")?;
+    fork.release
+        .parse::<EventId>()
+        .context("fork-of release must be a 64-character hex event ID")?;
+    Ok(())
+}
+
 /// Refuses to install artifacts that are not ordinary packages.
 fn ensure_installable_kind(manifest: &Manifest) -> Result<()> {
     match manifest.kind.as_deref() {
@@ -5113,6 +5168,9 @@ fn validate_manifest_metadata(manifest: &Manifest, require_hash: bool) -> Result
     }
     if let Some(kind) = &manifest.kind {
         validate_artifact_kind(kind)?;
+    }
+    if let Some(fork) = &manifest.fork_of {
+        validate_fork_of(fork)?;
     }
     validate_dependency_declarations(&manifest.dependencies)?;
     validate_dependency_declarations(&manifest.conflicts)?;
@@ -6596,6 +6654,7 @@ mod tests {
             arch: default_arch(),
             format: "opaque".into(),
             kind: None,
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -6736,6 +6795,7 @@ mod tests {
             arch: default_arch(),
             format: "opaque".into(),
             kind: None,
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -6982,6 +7042,7 @@ mod tests {
             arch: default_arch(),
             format: "opaque".into(),
             kind: None,
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7013,6 +7074,7 @@ mod tests {
             arch: "x86_64".into(),
             format: "tar.zst".into(),
             kind: None,
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7080,6 +7142,7 @@ mod tests {
             arch: "x86_64".into(),
             format: "tar.zst".into(),
             kind: None,
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7204,6 +7267,7 @@ mod tests {
             arch: "x86_64".into(),
             format: "npk".into(),
             kind: None,
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7236,6 +7300,7 @@ mod tests {
             arch: "x86_64".into(),
             format: "npk".into(),
             kind: None,
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7272,6 +7337,7 @@ mod tests {
             arch: "any".into(),
             format: "npk".into(),
             kind: kind.map(str::to_owned),
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7322,6 +7388,43 @@ mod tests {
     }
 
     #[test]
+    fn fork_of_tag_round_trips_and_is_validated() -> Result<()> {
+        let keys = Keys::parse(&"11".repeat(32))?;
+        let mut manifest = recipe_manifest(&keys, Some("nix-recipe"));
+        manifest.artifact_event = Some("cd".repeat(32));
+        manifest.fork_of = Some(ForkOf {
+            publisher: "22".repeat(32),
+            name: "fptn".into(),
+            release: "ab".repeat(32),
+        });
+        validate_manifest_metadata(&manifest, false)?;
+        let release = sign_release_event(&manifest, &"11".repeat(32), 1_700_000_000)?;
+        assert!(release_event_is_v1(&release));
+        let parsed = manifest_from_release(&release, Path::new("a"), &manifest.sha256)?;
+        assert_eq!(parsed.fork_of, manifest.fork_of);
+
+        for bad in [
+            ForkOf {
+                publisher: "zz".into(),
+                ..manifest.fork_of.clone().unwrap()
+            },
+            ForkOf {
+                name: "../x".into(),
+                ..manifest.fork_of.clone().unwrap()
+            },
+            ForkOf {
+                release: "nothex".into(),
+                ..manifest.fork_of.clone().unwrap()
+            },
+        ] {
+            let mut m = manifest.clone();
+            m.fork_of = Some(bad);
+            assert!(validate_manifest_metadata(&m, false).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn install_refuses_non_package_kinds() -> Result<()> {
         let keys = Keys::parse(&"11".repeat(32))?;
         assert!(ensure_installable_kind(&recipe_manifest(&keys, None)).is_ok());
@@ -7353,6 +7456,7 @@ mod tests {
             arch: "x86_64".into(),
             format: "npk".into(),
             kind: None,
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7390,6 +7494,7 @@ mod tests {
             arch: "x86_64".into(),
             format: "npk".into(),
             kind: None,
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7418,6 +7523,7 @@ mod tests {
             arch: "x86_64".into(),
             format: "npk".into(),
             kind: None,
+            fork_of: None,
             artifact_urls: vec!["https://example.com/a".into()],
             dependencies: vec![],
             conflicts: vec![],
@@ -7453,6 +7559,7 @@ mod tests {
             arch: "any".into(),
             format: "npk".into(),
             kind: None,
+            fork_of: None,
             artifact_urls: vec![],
             dependencies: vec![],
             conflicts: vec![],
@@ -7587,6 +7694,7 @@ mod tests {
             arch: "x86_64".into(),
             format: "npk".into(),
             kind: None,
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7618,6 +7726,7 @@ mod tests {
             arch: "x86_64".into(),
             format: "npk".into(),
             kind: None,
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7651,6 +7760,7 @@ mod tests {
             arch: "x86_64".into(),
             format: "npk".into(),
             kind: None,
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7704,6 +7814,7 @@ mod tests {
             arch: default_arch(),
             format: default_format(),
             kind: None,
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7757,6 +7868,7 @@ mod tests {
             arch: default_arch(),
             format: "opaque".into(),
             kind: None,
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7881,6 +7993,7 @@ mod tests {
             arch: default_arch(),
             format: "npk".into(),
             kind: None,
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -8060,6 +8173,7 @@ mod tests {
             arch: default_arch(),
             format: "npk".into(),
             kind: None,
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -8087,6 +8201,7 @@ mod tests {
             arch: default_arch(),
             format: "npk".into(),
             kind: None,
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -8216,6 +8331,7 @@ mod tests {
             arch: default_arch(),
             format: default_format(),
             kind: None,
+            fork_of: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],

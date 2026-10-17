@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Resolve npack nix-recipe packages and write a Nix pins file.
+
+usage: npack-nix-pin --out pins.json [--npack PATH] attr=<publisher>/<name>[@<release-event-id>] ... \
+           -- [extra `npack resolve` args, e.g. --relay wss://... --trusted-publisher HEX]
+
+Existing entries in --out are kept, so pins accumulate. Each package is resolved
+with `npack resolve` (signature, trust, revocation and os/arch checks happen
+there); only kind=nix-recipe artifacts are accepted. Dependencies are resolved recursively
+and pinned under their own package name. A pin to an event ID
+(`@<id>`) is exact; otherwise the newest matching version is pinned.
+Rerun to update. URLs are copied as published.
+"""
+import json, os, subprocess, sys
+
+def main(argv):
+    if "--" in argv:
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
+    else:
+        extra = []
+    out, npack, specs = None, "npack", []
+    it = iter(argv)
+    for a in it:
+        if a == "--out":
+            out = next(it)
+        elif a == "--npack":
+            npack = next(it)
+        else:
+            specs.append(a)
+    if not out or not specs:
+        sys.exit(__doc__)
+    pins = {}
+    if os.path.exists(out):
+        with open(out) as f:
+            pins = json.load(f)
+    spec_attrs = {sp.partition("=")[0]: True for sp in specs}
+    for spec in specs:
+        attr, _, ref = spec.partition("=")
+        if not attr or not ref:
+            sys.exit(f"bad spec {spec!r}: expected attr=publisher/name[@event-id]")
+        ref, _, release = ref.partition("@")
+        cmd = [npack, "resolve", ref, *extra]
+        cmd += ["--release", release] if release else ["--recursive"]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            sys.exit(f"npack resolve {ref} failed: {res.stderr.strip()}")
+        data = json.loads(res.stdout)
+        closure = data if isinstance(data, list) else [data]
+        pname = ref.rsplit("/", 1)[-1]
+        for r in closure:
+            if r.get("kind") != "nix-recipe":
+                sys.exit(f"{r['name']} is kind {r.get('kind')!r}, not nix-recipe")
+            # The requested package gets the chosen attr; dependencies are
+            # pinned under their own name so recipes can take them as arguments.
+            key = attr if r["name"] == pname else r["name"]
+            if key != attr and key in pins and spec_attrs.get(key):
+                continue
+            pins[key] = {
+                "name": r["name"],
+                "version": r["version"],
+                "publisher": r["publisher"],
+                "release_event_id": r["release_event_id"],
+                "sha256": r["sha256"],
+                "urls": r["artifact_urls"],
+                "kind": r["kind"],
+                "fork_of": r.get("fork_of"),
+            }
+            print(f"pinned {key} -> {r['name']} {r['version']} ({r['release_event_id']})", file=sys.stderr)
+    with open(out, "w") as f:
+        json.dump(pins, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+main(sys.argv[1:])
