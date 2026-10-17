@@ -1,74 +1,135 @@
 #!/usr/bin/env python3
 """Resolve npack nix-recipe packages and write a Nix pins file.
 
-usage: npack-nix-pin --out pins.json [--npack PATH] attr=<publisher>/<name>[@<release-event-id>] ... \
-           -- [extra `npack resolve` args, e.g. --relay wss://... --trusted-publisher HEX]
+usage: npack-nix-pin --out pins.json [--check] [--npack PATH] \
+           attr=<publisher>/<name>[@<release-event-id>] ... [-- npack resolve args]
 
-Existing entries in --out are kept, so pins accumulate. Each package is resolved
-with `npack resolve` (signature, trust, revocation and os/arch checks happen
-there); only kind=nix-recipe artifacts are accepted. Dependencies are resolved recursively
-and pinned under their own package name. A pin to an event ID
-(`@<id>`) is exact; otherwise the newest matching version is pinned.
-Rerun to update. URLs are copied as published.
+Each package is resolved with `npack resolve` (signature, trust, revocation
+and os/arch checks happen there), recursively, so declared dependencies are
+pinned under their own package name. Only kind=nix-recipe artifacts are
+accepted. `@<release-event-id>` pins that exact release (no dependency
+closure is walked for such a spec; pin dependencies explicitly too).
+Otherwise the newest matching version is pinned.
+
+Relays and trusted publishers come from npack's config; pass them after `--`
+(e.g. `-- --relay wss://relay.example --trusted-publisher <hex>`) to override.
+Existing entries in --out are kept. A summary of new/updated pins is printed.
+
+--check changes nothing: it exits 1 if any pin would change (like `apt update`
+for pins), so it can run in CI or before a rebuild.
 """
 import json, os, subprocess, sys
 
-def main(argv):
+
+def parse_args(argv):
+    extra = []
     if "--" in argv:
         i = argv.index("--")
         argv, extra = argv[:i], argv[i + 1:]
-    else:
-        extra = []
-    out, npack, specs = None, "npack", []
+    opts = {"out": None, "npack": "npack", "check": False}
+    specs = []
     it = iter(argv)
     for a in it:
         if a == "--out":
-            out = next(it)
+            opts["out"] = next(it, None)
         elif a == "--npack":
-            npack = next(it)
+            opts["npack"] = next(it, "npack")
+        elif a == "--check":
+            opts["check"] = True
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
         else:
             specs.append(a)
-    if not out or not specs:
+    if not opts["out"] or not specs:
         sys.exit(__doc__)
-    pins = {}
-    if os.path.exists(out):
-        with open(out) as f:
-            pins = json.load(f)
-    spec_attrs = {sp.partition("=")[0]: True for sp in specs}
+    return opts, specs, extra
+
+
+def resolve(npack, ref, release, extra):
+    cmd = [npack, "resolve", ref, *extra]
+    cmd += ["--release", release] if release else ["--recursive"]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        sys.exit(f"npack resolve {ref} failed: {res.stderr.strip()}")
+    data = json.loads(res.stdout)
+    return data if isinstance(data, list) else [data]
+
+
+def to_pin(r):
+    return {
+        "name": r["name"],
+        "version": r["version"],
+        "publisher": r["publisher"],
+        "release_event_id": r["release_event_id"],
+        "sha256": r["sha256"],
+        "urls": r["artifact_urls"],
+        "kind": r["kind"],
+        "fork_of": r.get("fork_of"),
+    }
+
+
+def main(argv):
+    opts, specs, extra = parse_args(argv)
+    old = {}
+    if os.path.exists(opts["out"]):
+        with open(opts["out"]) as f:
+            old = json.load(f)
+    new = dict(old)
+    explicit = {s.partition("=")[0] for s in specs}
     for spec in specs:
         attr, _, ref = spec.partition("=")
-        if not attr or not ref:
-            sys.exit(f"bad spec {spec!r}: expected attr=publisher/name[@event-id]")
         ref, _, release = ref.partition("@")
-        cmd = [npack, "resolve", ref, *extra]
-        cmd += ["--release", release] if release else ["--recursive"]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            sys.exit(f"npack resolve {ref} failed: {res.stderr.strip()}")
-        data = json.loads(res.stdout)
-        closure = data if isinstance(data, list) else [data]
+        if not attr or "/" not in ref:
+            sys.exit(f"bad spec {spec!r}: expected attr=publisher/name[@event-id]")
         pname = ref.rsplit("/", 1)[-1]
+        closure = resolve(opts["npack"], ref, release, extra)
+        root_publisher = next((r["publisher"] for r in closure if r["name"] == pname), "")
         for r in closure:
             if r.get("kind") != "nix-recipe":
                 sys.exit(f"{r['name']} is kind {r.get('kind')!r}, not nix-recipe")
-            # The requested package gets the chosen attr; dependencies are
-            # pinned under their own name so recipes can take them as arguments.
+            # The requested package gets the chosen attr; dependencies are pinned
+            # under their own name so recipes can take them as function arguments.
             key = attr if r["name"] == pname else r["name"]
-            if key != attr and key in pins and spec_attrs.get(key):
-                continue
-            pins[key] = {
-                "name": r["name"],
-                "version": r["version"],
-                "publisher": r["publisher"],
-                "release_event_id": r["release_event_id"],
-                "sha256": r["sha256"],
-                "urls": r["artifact_urls"],
-                "kind": r["kind"],
-                "fork_of": r.get("fork_of"),
-            }
-            print(f"pinned {key} -> {r['name']} {r['version']} ({r['release_event_id']})", file=sys.stderr)
-    with open(out, "w") as f:
-        json.dump(pins, f, indent=2, sort_keys=True)
+            if key in explicit and key != attr:
+                continue  # an explicit spec owns this attr
+            pin = to_pin(r)
+            prev = new.get(key)
+            if key not in explicit and prev and prev["publisher"] != pin["publisher"]:
+                sys.exit(
+                    f"dependency {key!r} resolves to publisher {pin['publisher']} but is "
+                    f"already pinned from {prev['publisher']}; pin the one you want "
+                    f"explicitly, e.g. {key}=<publisher>/{pin['name']}"
+                )
+            if r["name"] != pname and r["publisher"] != root_publisher:
+                print(f"warning: dependency {r['name']} of {ref} resolved to publisher "
+                      f"{r['publisher'][:12]}, not {root_publisher[:12]}; declare the "
+                      "publisher in the dependency to avoid substitution", file=sys.stderr)
+            new[key] = pin
+    changes = []
+    for key, pin in sorted(new.items()):
+        prev = old.get(key)
+        if prev is None:
+            changes.append(f"  + {key}: {pin['name']} {pin['version']} by {pin['publisher'][:12]} ({pin['release_event_id'][:12]})")
+        elif prev != pin:
+            what = f"{prev['version']} -> {pin['version']}" if prev["version"] != pin["version"] \
+                else f"release {prev['release_event_id'][:12]} -> {pin['release_event_id'][:12]}"
+            if prev["publisher"] != pin["publisher"]:
+                what += f", publisher {prev['publisher'][:12]} -> {pin['publisher'][:12]}"
+            changes.append(f"  ~ {key}: {pin['name']} {what}")
+    if not changes:
+        print("pins are up to date", file=sys.stderr)
+        return 0
+    print("\n".join(changes), file=sys.stderr)
+    if opts["check"]:
+        print(f"{len(changes)} pin(s) would change", file=sys.stderr)
+        return 1
+    with open(opts["out"], "w") as f:
+        json.dump(new, f, indent=2, sort_keys=True)
         f.write("\n")
+    print(f"wrote {opts['out']}; review changed recipes before building "
+          "(`npack unpack <publisher>/<name> --release <id> --output DIR`)", file=sys.stderr)
+    return 0
 
-main(sys.argv[1:])
+
+sys.exit(main(sys.argv[1:]))

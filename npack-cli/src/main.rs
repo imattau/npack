@@ -352,6 +352,11 @@ enum Command {
         refresh: bool,
         #[arg(
             long,
+            help = "Only show this artifact kind (e.g. nix-recipe, or package for ordinary packages)"
+        )]
+        kind: Option<String>,
+        #[arg(
+            long,
             help = "Query relays directly for this search only, without touching the local catalogue"
         )]
         no_cache: bool,
@@ -470,6 +475,57 @@ enum Command {
         os: Option<String>,
         #[arg(long, help = "Target architecture; defaults to the host architecture")]
         arch: Option<String>,
+        #[arg(
+            long,
+            help = "Artifact kind, e.g. nix-recipe; os and arch default to any for non-package kinds"
+        )]
+        kind: Option<String>,
+        #[arg(
+            long = "fork-of",
+            value_name = "PUBLISHER/NAME@RELEASE_ID",
+            help = "Record the release this package was forked from"
+        )]
+        fork_of: Option<String>,
+    },
+    /// Download, verify, and extract a published package into a directory,
+    /// optionally scaffolding a fork of it under your own publisher key.
+    Unpack {
+        #[arg(help = "[<publisher>/]<name>")]
+        package: String,
+        #[arg(long, help = "Directory to extract into; must be empty or absent")]
+        output: PathBuf,
+        #[arg(
+            long,
+            value_name = "EVENT_ID",
+            help = "Pin to this exact release event ID"
+        )]
+        release: Option<String>,
+        #[arg(long = "relay", help = "Relay URL to query; repeatable")]
+        relays: Vec<String>,
+        #[arg(
+            long = "server",
+            help = "Extra Blossom server to try for the artifact; repeatable"
+        )]
+        servers: Vec<String>,
+        #[arg(
+            long = "trusted-publisher",
+            help = "Hex pubkey to trust for this operation; repeatable"
+        )]
+        trusted_publishers: Vec<String>,
+        #[arg(long, help = "Nostr pubkey whose NIP-65 relay list should be used")]
+        pubkey: Option<String>,
+        #[arg(
+            long = "fork-as",
+            value_name = "PUBLISHER",
+            help = "Write a manifest so the directory can be repacked and published as your fork"
+        )]
+        fork_as: Option<String>,
+        #[arg(
+            long,
+            requires = "fork_as",
+            help = "Name for the fork; defaults to the original name"
+        )]
+        name: Option<String>,
     },
     /// Render the complete command reference as a man page
     Man,
@@ -973,6 +1029,7 @@ async fn main() -> Result<()> {
             trusted_publishers,
             pubkey,
             refresh,
+            kind,
             no_cache,
             store,
         } => {
@@ -987,6 +1044,7 @@ async fn main() -> Result<()> {
                 pubkey.as_deref(),
                 refresh,
                 no_cache,
+                kind.as_deref(),
                 &root,
             )
             .await?
@@ -1079,14 +1137,48 @@ async fn main() -> Result<()> {
             publisher,
             os,
             arch,
-        } => init_package(
-            &directory,
-            &name,
-            &version,
-            &publisher,
-            os.as_deref().unwrap_or(OS),
-            arch.as_deref().unwrap_or(ARCH),
-        )?,
+            kind,
+            fork_of,
+        } => {
+            let portable = kind.as_deref().is_some_and(|kind| kind != "package");
+            let default_os = if portable { "any" } else { OS };
+            let default_arch = if portable { "any" } else { ARCH };
+            init_package(
+                &directory,
+                &name,
+                &version,
+                &publisher,
+                os.as_deref().unwrap_or(default_os),
+                arch.as_deref().unwrap_or(default_arch),
+                kind,
+                fork_of.as_deref().map(parse_fork_reference).transpose()?,
+            )?
+        }
+        Command::Unpack {
+            package,
+            output,
+            release,
+            relays,
+            servers,
+            trusted_publishers,
+            pubkey,
+            fork_as,
+            name,
+        } => {
+            unpack_command(
+                &package,
+                &output,
+                release,
+                relays,
+                servers,
+                trusted_publishers,
+                pubkey,
+                fork_as,
+                name,
+                &config,
+            )
+            .await?
+        }
         Command::Man => {
             let command = Cli::command();
             Man::new(command).render(&mut io::stdout())?;
@@ -1538,6 +1630,7 @@ fn resolve_secret_key(cli_secret_key: Option<&str>) -> Result<String> {
         .context("no --secret-key supplied and no registered publisher key was found")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn init_package(
     directory: &Path,
     name: &str,
@@ -1545,8 +1638,13 @@ fn init_package(
     publisher: &str,
     os: &str,
     arch: &str,
+    kind: Option<String>,
+    fork_of: Option<ForkOf>,
 ) -> Result<()> {
     validate_package_name(name, "package name")?;
+    if let Some(kind) = &kind {
+        validate_artifact_kind(kind)?;
+    }
     Version::parse(version).context("package version must be valid SemVer")?;
     if publisher.is_empty()
         || publisher.contains('/')
@@ -1586,13 +1684,27 @@ fn init_package(
         os: os.into(),
         arch: arch.into(),
         format: "npk".into(),
-        kind: None,
-        fork_of: None,
+        kind,
+        fork_of,
         runtime_requires: vec![],
         provides: vec![],
         post_install: vec![],
     };
     fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    let recipe = directory.join("default.nix");
+    if manifest.kind.as_deref() == Some("nix-recipe") && !recipe.exists() {
+        fs::write(
+            &recipe,
+            format!(
+                "# npack Nix recipe: a callPackage-style function evaluated and built by Nix.\n\
+                 {{ stdenv, fetchurl }}:\n\
+                 stdenv.mkDerivation {{\n  pname = \"{name}\";\n  version = \"{version}\";\n  \
+                 src = fetchurl {{\n    url = \"https://example.com/{name}-{version}.tar.gz\";\n    \
+                 hash = \"\";\n  }};\n}}\n"
+            ),
+        )?;
+        println!("created recipe template {}", recipe.display());
+    }
     println!("created package scaffold at {}", directory.display());
     println!(
         "add payload files, then run: npack pack {} --output {}",
@@ -1602,6 +1714,177 @@ fn init_package(
     println!(
         "set app.icon (a package-relative path) in {} to carry a logo in the archive",
         manifest_path.display()
+    );
+    Ok(())
+}
+
+/// Origin (scheme + host) of an artifact URL; Blossom blobs are addressed by
+/// hash at the server root.
+fn blossom_origins(urls: &[String]) -> Vec<Url> {
+    urls.iter()
+        .filter_map(|url| {
+            let mut server_url = Url::parse(url).ok()?;
+            server_url.set_path("/");
+            server_url.set_query(None);
+            server_url.set_fragment(None);
+            Some(server_url)
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn unpack_command(
+    package: &str,
+    output: &Path,
+    release: Option<String>,
+    relays: Vec<String>,
+    servers: Vec<String>,
+    trusted_publishers: Vec<String>,
+    pubkey: Option<String>,
+    fork_as: Option<String>,
+    new_name: Option<String>,
+    config: &Config,
+) -> Result<()> {
+    if output.exists() && output.read_dir()?.next().is_some() {
+        bail!("output directory {} is not empty", output.display());
+    }
+    let release = release
+        .map(|id| {
+            id.parse::<EventId>()
+                .context("--release must be a 64-character hex event ID")
+        })
+        .transpose()?;
+    if let Some(name) = &new_name {
+        validate_package_name(name, "fork name")?;
+    }
+    let relays = configured_relays(relays, config)?;
+    let trusted_publishers = configured_publishers(trusted_publishers, config)?;
+    let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
+    let (publisher, name) = package
+        .split_once('/')
+        .map_or((None, package), |(publisher, name)| {
+            (Some(normalize_publisher_reference(publisher)), name)
+        });
+    let client = Client::default();
+    for relay in &relays {
+        client.add_relay(relay).await?;
+    }
+    connect_with_timeout(&client).await?;
+    add_user_relays(&client, pubkey.as_deref()).await?;
+    let root = default_store();
+    fs::create_dir_all(&root)?;
+    let resolved = if let Some(release_id) = release {
+        resolve_pinned_release(
+            &client,
+            &root,
+            release_id,
+            name,
+            publisher.as_deref(),
+            &trusted_publishers,
+            OS,
+            ARCH,
+        )
+        .await
+    } else {
+        resolve_release(
+            &client,
+            &root,
+            name,
+            publisher.as_deref(),
+            None,
+            &trusted_publishers,
+            None,
+            OS,
+            ARCH,
+        )
+        .await
+    };
+    client.disconnect().await;
+    let resolved = resolved?;
+    if resolved.format != "npk" {
+        bail!(
+            "only .npk artifacts can be unpacked, found {}",
+            resolved.format
+        );
+    }
+    let expected: Sha256Hash = resolved.sha256.parse()?;
+    let mut candidates = blossom_origins(&resolved.artifact_urls);
+    for server in configured_servers(servers, config).unwrap_or_default() {
+        candidates.push(Url::parse(&server)?);
+    }
+    let bar = download_progress_bar(format!(
+        "Downloading {} {}",
+        resolved.name, resolved.version
+    ));
+    let bytes = download_matching_blob(&candidates, expected, &bar).await;
+    bar.finish_and_clear();
+    let bytes = bytes.context("no artifact mirror returned the expected SHA-256")?;
+    let downloads = root.join("downloads");
+    fs::create_dir_all(&downloads)?;
+    let archive = downloads.join(format!("{}.npk", resolved.sha256));
+    fs::write(&archive, &bytes)?;
+    extract_npk(&archive, output)?;
+    println!(
+        "unpacked {}/{} {} ({}) to {}",
+        display_publisher(&resolved.publisher),
+        resolved.name,
+        resolved.version,
+        resolved.release_event_id,
+        output.display()
+    );
+    let Some(fork_publisher) = fork_as else {
+        return Ok(());
+    };
+    let embedded = output.join(".npack/manifest.json");
+    let mut manifest = if embedded.is_file() {
+        serde_json::from_slice::<Manifest>(&fs::read(&embedded)?)
+            .context("parsing embedded .npack/manifest.json")?
+    } else {
+        Manifest {
+            app: AppMetadata {
+                install_inputs: resolved.install_inputs.clone(),
+                ..AppMetadata::default()
+            },
+            publisher: String::new(),
+            name: String::new(),
+            version: resolved.version.clone(),
+            artifact: PathBuf::new(),
+            sha256: String::new(),
+            dependencies: resolved.dependencies.clone(),
+            conflicts: resolved.conflicts.clone(),
+            artifact_event: None,
+            repo: None,
+            commit: None,
+            os: resolved.os.clone(),
+            arch: resolved.arch.clone(),
+            format: resolved.format.clone(),
+            kind: resolved.kind.clone(),
+            fork_of: None,
+            runtime_requires: resolved.runtime_requires.clone(),
+            provides: resolved.provides.clone(),
+            post_install: vec![],
+        }
+    };
+    manifest.publisher = fork_publisher;
+    manifest.name = new_name.unwrap_or_else(|| resolved.name.clone());
+    manifest.artifact = format!("{}-{}.npk", manifest.name, manifest.version).into();
+    manifest.sha256 = String::new();
+    manifest.artifact_event = None;
+    manifest.repo = None;
+    manifest.commit = None;
+    manifest.fork_of = Some(ForkOf {
+        publisher: resolved.publisher.clone(),
+        name: resolved.name.clone(),
+        release: resolved.release_event_id.clone(),
+    });
+    validate_manifest_metadata(&manifest, false)?;
+    fs::create_dir_all(output.join(".npack"))?;
+    fs::write(&embedded, serde_json::to_vec_pretty(&manifest)?)?;
+    println!(
+        "wrote fork manifest {} -- edit the files, bump the version if needed, then run:\n  npack pack {} --output {}",
+        embedded.display(),
+        output.display(),
+        manifest.artifact.display()
     );
     Ok(())
 }
@@ -3293,6 +3576,44 @@ async fn discover_blossom_servers(client: &Client, publisher: &PublicKey) -> Res
     Ok(servers)
 }
 
+fn parse_fork_of(event: &Event) -> Result<Option<ForkOf>> {
+    event
+        .tags
+        .iter()
+        .find(|tag| tag.kind() == "fork-of")
+        .map(|tag| {
+            let values = tag.clone().to_vec();
+            if values.len() != 4 {
+                bail!("invalid fork-of tag in release event");
+            }
+            let fork = ForkOf {
+                publisher: values[1].clone(),
+                name: values[2].clone(),
+                release: values[3].clone(),
+            };
+            validate_fork_of(&fork)?;
+            Ok(fork)
+        })
+        .transpose()
+}
+
+/// Parses `<publisher>/<name>@<release-event-id>`.
+fn parse_fork_reference(reference: &str) -> Result<ForkOf> {
+    let (package, release) = reference
+        .split_once('@')
+        .context("fork reference must be <publisher>/<name>@<release-event-id>")?;
+    let (publisher, name) = package
+        .split_once('/')
+        .context("fork reference must be <publisher>/<name>@<release-event-id>")?;
+    let fork = ForkOf {
+        publisher: normalize_publisher_reference(publisher),
+        name: name.to_owned(),
+        release: release.to_owned(),
+    };
+    validate_fork_of(&fork)?;
+    Ok(fork)
+}
+
 fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result<Manifest> {
     for kind in [
         "d", "name", "version", "os", "arch", "format", "x", "artifact", "repo", "commit", "kind",
@@ -3410,24 +3731,7 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
     if let Some(kind) = &kind {
         validate_artifact_kind(kind)?;
     }
-    let fork_of = event
-        .tags
-        .iter()
-        .find(|tag| tag.kind() == "fork-of")
-        .map(|tag| {
-            let values = tag.clone().to_vec();
-            if values.len() != 4 {
-                bail!("invalid fork-of tag in release event");
-            }
-            let fork = ForkOf {
-                publisher: values[1].clone(),
-                name: values[2].clone(),
-                release: values[3].clone(),
-            };
-            validate_fork_of(&fork)?;
-            Ok(fork)
-        })
-        .transpose()?;
+    let fork_of = parse_fork_of(event)?;
     Ok(Manifest {
         app: AppMetadata {
             install_inputs,
@@ -3568,6 +3872,8 @@ struct CatalogueEntry {
     arch: String,
     release_event_id: String,
     revoked: bool,
+    kind: Option<String>,
+    fork_of: Option<ForkOf>,
 }
 
 /// Filters a catalogue down to every valid, non-superseded-by-nothing (i.e.
@@ -3612,6 +3918,8 @@ fn catalogue_entries_for(
             arch: tag_value(event, "arch").unwrap_or("any").to_owned(),
             release_event_id: event.id.to_hex(),
             revoked: is_revoked,
+            kind: tag_value(event, "kind").map(str::to_owned),
+            fork_of: parse_fork_of(event).ok().flatten(),
         });
     }
     entries.sort_by(|a, b| {
@@ -3661,6 +3969,17 @@ fn info_command(reference: &str, trusted_publishers: &[String], root: &Path) -> 
             "    {} {}/{} {}{status}",
             entry.version, entry.os, entry.arch, entry.release_event_id
         );
+        if let Some(kind) = entry.kind.as_deref().filter(|kind| *kind != "package") {
+            println!("      kind: {kind}");
+        }
+        if let Some(fork) = &entry.fork_of {
+            println!(
+                "      fork of {}/{} {}",
+                display_publisher(&fork.publisher),
+                fork.name,
+                fork.release
+            );
+        }
     }
     Ok(())
 }
@@ -3684,8 +4003,11 @@ struct SearchResult {
     name: String,
     version: String,
     content: String,
+    kind: Option<String>,
+    fork_of: Option<ForkOf>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn search_releases(
     query: &str,
     relays: &[String],
@@ -3693,6 +4015,7 @@ async fn search_releases(
     user_pubkey: Option<&str>,
     refresh: bool,
     no_cache: bool,
+    kind: Option<&str>,
     root: &Path,
 ) -> Result<()> {
     for result in search_matching_releases(
@@ -3705,13 +4028,26 @@ async fn search_releases(
         root,
     )
     .await?
+    .into_iter()
+    .filter(|result| kind.is_none_or(|kind| result.kind.as_deref().unwrap_or("package") == kind))
     {
-        println!(
+        let mut line = format!(
             "{} {} {}",
             result.release_event_id,
             display_publisher(&result.publisher),
             result.content
         );
+        if let Some(kind) = result.kind.as_deref().filter(|kind| *kind != "package") {
+            line.push_str(&format!(" [{kind}]"));
+        }
+        if let Some(fork) = &result.fork_of {
+            line.push_str(&format!(
+                " (fork of {}/{})",
+                display_publisher(&fork.publisher),
+                fork.name
+            ));
+        }
+        println!("{line}");
     }
     Ok(())
 }
@@ -3814,6 +4150,8 @@ async fn search_matching_releases(
                 name: name.to_owned(),
                 version: version.to_owned(),
                 content: event.content.clone(),
+                kind: tag_value(&event, "kind").map(str::to_owned),
+                fork_of: parse_fork_of(&event).ok().flatten(),
             });
         }
     }
@@ -7421,6 +7759,68 @@ mod tests {
             m.fork_of = Some(bad);
             assert!(validate_manifest_metadata(&m, false).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn parses_fork_references() -> Result<()> {
+        let fork = parse_fork_reference(&format!("{}/fptn@{}", "22".repeat(32), "ab".repeat(32)))?;
+        assert_eq!(fork.name, "fptn");
+        assert_eq!(fork.release, "ab".repeat(32));
+        for bad in [
+            "fptn",
+            "pub/fptn",
+            &format!("{}/fptn", "22".repeat(32)),
+            "zz/fptn@ab",
+        ] {
+            assert!(parse_fork_reference(bad).is_err(), "{bad}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn init_records_kind_and_fork_of() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let fork = ForkOf {
+            publisher: "22".repeat(32),
+            name: "fptn".into(),
+            release: "ab".repeat(32),
+        };
+        init_package(
+            dir.path(),
+            "fptn",
+            "0.1.0",
+            &"11".repeat(32),
+            "any",
+            "any",
+            Some("nix-recipe".into()),
+            Some(fork.clone()),
+        )?;
+        let manifest: Manifest =
+            serde_json::from_slice(&fs::read(dir.path().join(".npack/manifest.json"))?)?;
+        assert_eq!(manifest.kind.as_deref(), Some("nix-recipe"));
+        assert_eq!(manifest.fork_of, Some(fork));
+        assert_eq!(
+            (manifest.os.as_str(), manifest.arch.as_str()),
+            ("any", "any")
+        );
+
+        assert!(fs::read_to_string(dir.path().join("default.nix"))?.contains("pname = \"fptn\""));
+
+        let other = tempfile::tempdir()?;
+        assert!(
+            init_package(
+                other.path(),
+                "x",
+                "0.1.0",
+                "p",
+                "any",
+                "any",
+                Some("Bad Kind".into()),
+                None
+            )
+            .is_err()
+        );
         Ok(())
     }
 

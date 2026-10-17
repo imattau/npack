@@ -33,11 +33,22 @@ rec {
   # Reads a pins file written by npack-nix-pin: { attr = { name, sha256, urls, ... }; }
   # Recipes are built in one scope, so a recipe can take another pinned recipe
   # (e.g. a declared dependency) as a plain function argument by its attr name.
-  fromPins = pinsFile:
+  # With trustedPublishers (hex pubkeys), evaluation fails if any pin comes from
+  # another publisher, so a hand-edited or merged pins file cannot add one silently.
+  fromPinsWith = { pinsFile, trustedPublishers ? null }:
     let
       pins = builtins.fromJSON (builtins.readFile pinsFile);
+      checked = builtins.mapAttrs
+        (attr: pin:
+          assert trustedPublishers == null || pkgs.lib.assertMsg
+            (builtins.elem pin.publisher trustedPublishers)
+            "npack pin '${attr}' is from publisher ${pin.publisher}, which is not in trustedPublishers";
+          pin)
+        pins;
       scope = pkgs.lib.makeScope pkgs.newScope (self:
-        builtins.mapAttrs (_: pin: fetchRecipe (pin // { callPackage = self.callPackage; })) pins);
+        builtins.mapAttrs (_: pin: fetchRecipe (pin // { callPackage = self.callPackage; })) checked);
     in
     pkgs.lib.getAttrs (builtins.attrNames pins) scope;
+
+  fromPins = pinsFile: fromPinsWith { inherit pinsFile; };
 }

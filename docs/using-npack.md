@@ -509,35 +509,77 @@ The JSON output includes `kind` (`null` for ordinary packages) and
 
 ### Nix recipes
 
-A manifest may set `"kind": "nix-recipe"` to publish a Nix build recipe: a
-`.npk` (`os`/`arch` `any`) containing a `default.nix` that is a
-`callPackage`-style function. `npack install`/`update` refuse such artifacts;
-they are consumed through `npack resolve`. To publish a modified copy of
-someone else's recipe, repack it under your own key with
-`"fork_of": {"publisher": "<hex>", "name": "<name>", "release": "<event-id>"}`.
+A Nix recipe is a `.npk` (`os`/`arch` `any`) with `"kind": "nix-recipe"` that
+contains a `default.nix`, a `callPackage`-style function. `npack
+install`/`update` refuse these artifacts; Nix consumes them through the pins
+described below. Recipes are found like any package; `npack search <text>
+--kind nix-recipe` lists only recipes, and `search`/`info` show `[nix-recipe]`
+and `(fork of ...)`.
 
-[`packaging/nix`](../packaging/nix) is the reusable consumer side:
+**Publish a recipe**
 
 ```bash
-# Resolve (recursively, with declared dependencies) and pin in a JSON file
-packaging/nix/npack-nix-pin --out npack-pins.json \
-  myapp=<publisher>/myapp -- --relay wss://relay.example --trusted-publisher <hex>
+npack init myrecipe --name myapp --publisher <npub> --kind nix-recipe
+# edits: myrecipe/default.nix (a template is created)
+npack pack myrecipe --output myapp-0.1.0.npk
+# fill the manifest's sha256, then: npack publish <manifest> --relay ... --server ...
 ```
 
+**Fork someone else's recipe.** One command verifies and extracts the
+published recipe and writes a manifest for your copy that keeps the kind and
+records `fork_of`; nothing else needs to be specified:
+
+```bash
+npack unpack <publisher>/<name> --output myfork --fork-as <your-npub> [--name <new-name>]
+# edit myfork/default.nix, bump the version in myfork/.npack/manifest.json
+npack pack myfork --output myfork-1.0.1.npk   # then publish as above
+```
+
+Without `--fork-as`, `unpack` only extracts the verified recipe, which is how to
+review a recipe's code before using it. `--release <event-id>` unpacks an
+exact release.
+
+**Use recipes from Nix** with [`packaging/nix`](../packaging/nix). Add it as a
+flake input (`inputs.npack.url = "github:imattau/npack?dir=packaging/nix"`) or
+copy `lib.nix` and `npack-nix-pin`.
+
+```bash
+# Resolve recursively (dependencies are pinned under their own name) and write pins
+packaging/nix/npack-nix-pin --out npack-pins.json \
+  myapp=<publisher>/myapp [other=<publisher>/other@<release-event-id>]
+# Later: show what would change (exit 1 if anything), then apply
+packaging/nix/npack-nix-pin --out npack-pins.json --check myapp=<publisher>/myapp
+packaging/nix/npack-nix-pin --out npack-pins.json myapp=<publisher>/myapp
+```
+
+Relays and trusted publishers come from npack's config; override them after
+`--` (`-- --relay wss://relay.example --trusted-publisher <hex>`). The tool
+prints new and changed pins (version and publisher) so a pin update can be
+reviewed like any other lockfile change.
+
 ```nix
-# Evaluation is pure: the pins carry the sha256 and mirror URLs.
-(import ./lib.nix { inherit pkgs; }).fromPins ./npack-pins.json
-# or via the flake: npack.lib.${system}.fromPins ./npack-pins.json
+# NixOS configuration (flake)
+environment.systemPackages =
+  let recipes = inputs.npack.lib.${pkgs.system}.fromPinsWith {
+    pinsFile = ./npack-pins.json;
+    trustedPublishers = [ "<hex pubkey>" ];  # evaluation fails for any other publisher
+  };
+  in [ recipes.myapp ];
+# without a flake: (import ./lib.nix { inherit pkgs; }).fromPins ./npack-pins.json
 ```
 
 Every pinned recipe is built in one scope, so a recipe can take its declared
-npack dependency as a function argument by name. Pin an exact release with
-`attr=<publisher>/<name>@<release-event-id>`; rerun `npack-nix-pin` to update.
+npack dependency as a function argument by name (`{ stdenv, other }: ...`).
 
 **Trust.** A recipe is Nix code that your machine evaluates and then builds,
 and evaluating it uses import-from-derivation. The signature and SHA-256 prove
-who published the bytes, not that the recipe is safe. Pass
-`--trusted-publisher` and review recipes (or pin exact releases) before use.
+who published the bytes, not that the recipe is safe. Use
+`trustedPublishers`/`--trusted-publisher`, review recipes with `npack unpack`,
+and pin exact releases for anything important. A dependency declared without a
+publisher resolves to whichever trusted publisher has a package of that name,
+so recipes should declare the dependency's publisher; `npack-nix-pin` warns when
+a dependency comes from a different publisher than its dependent and refuses to
+silently replace an existing pin with one from another publisher.
 
 ## Running npackd (local service API)
 
