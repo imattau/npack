@@ -569,6 +569,13 @@ enum Command {
             help = "Resolve the full dependency closure and print a JSON array"
         )]
         recursive: bool,
+        #[arg(
+            long,
+            value_name = "EVENT_ID",
+            conflicts_with_all = ["requirement", "lockfile", "locked", "recursive"],
+            help = "Pin to this exact release event ID (64 hex characters)"
+        )]
+        release: Option<String>,
     },
     /// Build a deterministic .npk archive from a package directory.
     Pack {
@@ -659,6 +666,11 @@ struct Manifest {
     arch: String,
     #[serde(default = "default_format")]
     format: String,
+    /// Optional artifact kind (e.g. `nix-recipe`). Absent or `package` means
+    /// an ordinary installable package; any other kind is metadata-only and
+    /// is consumed through `npack resolve` by an external tool, never installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
     #[serde(default)]
     runtime_requires: Vec<String>,
     #[serde(default)]
@@ -731,6 +743,7 @@ struct ResolvedRelease {
     os: String,
     arch: String,
     format: String,
+    kind: Option<String>,
     artifact_urls: Vec<String>,
     dependencies: Vec<Dependency>,
     conflicts: Vec<Dependency>,
@@ -1138,6 +1151,7 @@ async fn main() -> Result<()> {
             lockfile,
             locked,
             recursive,
+            release,
         } => {
             resolve_command(
                 &package,
@@ -1150,6 +1164,7 @@ async fn main() -> Result<()> {
                 lockfile,
                 locked,
                 recursive,
+                release,
                 &config,
             )
             .await?
@@ -1559,6 +1574,7 @@ fn init_package(
         os: os.into(),
         arch: arch.into(),
         format: "npk".into(),
+        kind: None,
         runtime_requires: vec![],
         provides: vec![],
         post_install: vec![],
@@ -2556,6 +2572,87 @@ async fn resolve_release(
         target_arch,
     )
     .await?;
+    finish_resolved_release(client, root, release, trusted_publishers).await
+}
+
+/// Resolves exactly the release event `release_id`, applying the same
+/// verification, trust, revocation, name, and os/arch checks as discovery by
+/// name. Fails rather than falling back to another release.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_pinned_release(
+    client: &Client,
+    root: &Path,
+    release_id: EventId,
+    name: &str,
+    publisher: Option<&str>,
+    trusted_publishers: &[String],
+    target_os: &str,
+    target_arch: &str,
+) -> Result<ResolvedRelease> {
+    let events = client
+        .fetch_events(
+            Filter::new()
+                .kind(Kind::Custom(RELEASE_KIND))
+                .id(release_id),
+        )
+        .timeout(std::time::Duration::from_secs(10))
+        .await?;
+    let release = events
+        .into_iter()
+        .find(|event| event.id == release_id && event.verify().is_ok())
+        .with_context(|| format!("no verified release event {}", release_id.to_hex()))?;
+    if !release_event_is_v1(&release) {
+        bail!(
+            "release event {} is not a valid v1 release",
+            release_id.to_hex()
+        );
+    }
+    if tag_value(&release, "name") != Some(name) {
+        bail!(
+            "release event {} is not a release of {name}",
+            release_id.to_hex()
+        );
+    }
+    if let Some(publisher) = publisher
+        && release.pubkey.to_hex() != publisher
+    {
+        bail!(
+            "release event {} was not published by {publisher}",
+            release_id.to_hex()
+        );
+    }
+    if !trusted_publishers.is_empty()
+        && !trusted_publishers
+            .iter()
+            .any(|trusted| trusted == &release.pubkey.to_hex())
+    {
+        bail!(
+            "release event {} is from an untrusted publisher",
+            release_id.to_hex()
+        );
+    }
+    if !release_matches_target(&release, target_os, target_arch) {
+        bail!(
+            "release event {} does not match {target_os}/{target_arch}",
+            release_id.to_hex()
+        );
+    }
+    if fetch_revoked_release_ids(client)
+        .await?
+        .iter()
+        .any(|(publisher, id)| publisher == &release.pubkey.to_hex() && id == &release.id.to_hex())
+    {
+        bail!("release event {} has been revoked", release_id.to_hex());
+    }
+    finish_resolved_release(client, root, release, trusted_publishers).await
+}
+
+async fn finish_resolved_release(
+    client: &Client,
+    root: &Path,
+    release: Event,
+    trusted_publishers: &[String],
+) -> Result<ResolvedRelease> {
     cache_release(root, &release)?;
     let artifact_event = fetch_verified_artifact_event(client, &release).await?;
     cache_artifact(root, &artifact_event)?;
@@ -2573,6 +2670,7 @@ async fn resolve_release(
         os: manifest.os,
         arch: manifest.arch,
         format: manifest.format,
+        kind: manifest.kind,
         artifact_urls,
         dependencies: manifest.dependencies,
         conflicts: manifest.conflicts,
@@ -2709,8 +2807,15 @@ async fn resolve_command(
     lockfile: Option<PathBuf>,
     locked: bool,
     recursive: bool,
+    release: Option<String>,
     config: &Config,
 ) -> Result<()> {
+    let release = release
+        .map(|id| {
+            id.parse::<EventId>()
+                .context("--release must be a 64-character hex event ID")
+        })
+        .transpose()?;
     let target_os = os.unwrap_or_else(|| OS.to_owned());
     let target_arch = arch.unwrap_or_else(|| ARCH.to_owned());
     let relays = configured_relays(relays, config)?;
@@ -2763,18 +2868,32 @@ async fn resolve_command(
                         .is_none_or(|publisher| candidate.publisher == publisher)
             })
         });
-        let result = resolve_release(
-            &client,
-            &root,
-            name,
-            publisher.as_deref(),
-            requirement.as_deref(),
-            &trusted_publishers,
-            locked_package,
-            &target_os,
-            &target_arch,
-        )
-        .await;
+        let result = if let Some(release_id) = release {
+            resolve_pinned_release(
+                &client,
+                &root,
+                release_id,
+                name,
+                publisher.as_deref(),
+                &trusted_publishers,
+                &target_os,
+                &target_arch,
+            )
+            .await
+        } else {
+            resolve_release(
+                &client,
+                &root,
+                name,
+                publisher.as_deref(),
+                requirement.as_deref(),
+                &trusted_publishers,
+                locked_package,
+                &target_os,
+                &target_arch,
+            )
+            .await
+        };
         client.disconnect().await;
         println!("{}", serde_json::to_string_pretty(&result?)?);
     }
@@ -3161,7 +3280,7 @@ async fn discover_blossom_servers(client: &Client, publisher: &PublicKey) -> Res
 
 fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result<Manifest> {
     for kind in [
-        "d", "name", "version", "os", "arch", "format", "x", "artifact", "repo", "commit",
+        "d", "name", "version", "os", "arch", "format", "x", "artifact", "repo", "commit", "kind",
     ] {
         let count = event.tags.iter().filter(|tag| tag.kind() == kind).count();
         if count > 1 {
@@ -3271,6 +3390,10 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
     {
         bail!("release commit must be a non-empty commit identifier");
     }
+    let kind = tag_value(event, "kind").map(str::to_owned);
+    if let Some(kind) = &kind {
+        validate_artifact_kind(kind)?;
+    }
     Ok(Manifest {
         app: AppMetadata {
             install_inputs,
@@ -3296,6 +3419,7 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
         os: tag_value(event, "os").unwrap_or("any").into(),
         arch: tag_value(event, "arch").unwrap_or("any").into(),
         format: tag_value(event, "format").unwrap_or("opaque").into(),
+        kind,
         runtime_requires,
         provides,
         post_install,
@@ -4558,6 +4682,7 @@ fn verify_release_event(event: &Event, manifest: &Manifest) -> Result<()> {
         || event_manifest.artifact_event != manifest.artifact_event
         || event_manifest.repo != manifest.repo
         || event_manifest.commit != manifest.commit
+        || event_manifest.kind != manifest.kind
     {
         bail!("release event metadata does not match the package manifest");
     }
@@ -4570,6 +4695,7 @@ fn release_event_is_v1(event: &Event) -> bool {
     }
     if [
         "d", "v", "name", "version", "os", "arch", "format", "x", "artifact", "repo", "commit",
+        "kind",
     ]
     .iter()
     .any(|kind| event.tags.iter().filter(|tag| tag.kind() == *kind).count() > 1)
@@ -4670,6 +4796,9 @@ fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) ->
     }
     if let Some(commit) = &manifest.commit {
         tags.push(vec!["commit".into(), commit.clone()]);
+    }
+    if let Some(kind) = &manifest.kind {
+        tags.push(vec!["kind".into(), kind.clone()]);
     }
     for dependency in &manifest.dependencies {
         let mut tag = vec!["depends".into()];
@@ -4933,6 +5062,31 @@ fn load_manifest(path: &Path) -> Result<Manifest> {
     Ok(manifest)
 }
 
+/// Kinds are lowercase identifiers (`nix-recipe`); `package` is the
+/// installable default and is spelled by omitting the tag.
+fn validate_artifact_kind(kind: &str) -> Result<()> {
+    if kind.is_empty()
+        || !kind
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        bail!("artifact kind must be lowercase letters, digits, or '-'");
+    }
+    Ok(())
+}
+
+/// Refuses to install artifacts that are not ordinary packages.
+fn ensure_installable_kind(manifest: &Manifest) -> Result<()> {
+    match manifest.kind.as_deref() {
+        None | Some("package") => Ok(()),
+        Some(kind) => bail!(
+            "{}/{} is a {kind} artifact, not an installable package; use `npack resolve` to fetch its metadata",
+            manifest.publisher,
+            manifest.name
+        ),
+    }
+}
+
 fn validate_manifest_metadata(manifest: &Manifest, require_hash: bool) -> Result<()> {
     if manifest.publisher.is_empty() || manifest.name.is_empty() || manifest.version.is_empty() {
         bail!("manifest publisher, name, and version must not be empty");
@@ -4956,6 +5110,9 @@ fn validate_manifest_metadata(manifest: &Manifest, require_hash: bool) -> Result
         && (manifest.sha256.len() != 64 || !manifest.sha256.chars().all(|c| c.is_ascii_hexdigit()))
     {
         bail!("manifest sha256 must be 64 hexadecimal characters");
+    }
+    if let Some(kind) = &manifest.kind {
+        validate_artifact_kind(kind)?;
     }
     validate_dependency_declarations(&manifest.dependencies)?;
     validate_dependency_declarations(&manifest.conflicts)?;
@@ -5572,6 +5729,7 @@ fn install_with_capabilities_at(
     user: bool,
     allowed_capabilities: &[String],
 ) -> Result<InstalledPackage> {
+    ensure_installable_kind(manifest)?;
     let (root, default_prefix) = install_paths(store, user);
     let prefix = prefix_override.unwrap_or(&default_prefix);
     ensure_dependencies_available(manifest, &root)?;
@@ -6437,6 +6595,7 @@ mod tests {
             os: default_os(),
             arch: default_arch(),
             format: "opaque".into(),
+            kind: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -6576,6 +6735,7 @@ mod tests {
             os: default_os(),
             arch: default_arch(),
             format: "opaque".into(),
+            kind: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -6821,6 +6981,7 @@ mod tests {
             os: default_os(),
             arch: default_arch(),
             format: "opaque".into(),
+            kind: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -6851,6 +7012,7 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             format: "tar.zst".into(),
+            kind: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -6917,6 +7079,7 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             format: "tar.zst".into(),
+            kind: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7040,6 +7203,7 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             format: "npk".into(),
+            kind: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7071,6 +7235,7 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             format: "npk".into(),
+            kind: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7087,6 +7252,84 @@ mod tests {
         assert_eq!(resolved.name, "hello");
         assert_eq!(resolved.version, "1.0.0");
         assert_eq!(resolved.dependencies, manifest.dependencies);
+        Ok(())
+    }
+
+    fn recipe_manifest(keys: &Keys, kind: Option<&str>) -> Manifest {
+        Manifest {
+            app: AppMetadata::default(),
+            publisher: keys.public_key().to_hex(),
+            name: "fptn".into(),
+            version: "1.0.0".into(),
+            artifact: "fptn.npk".into(),
+            sha256: "ab".repeat(32),
+            dependencies: vec![],
+            conflicts: vec![],
+            artifact_event: None,
+            repo: None,
+            commit: None,
+            os: "any".into(),
+            arch: "any".into(),
+            format: "npk".into(),
+            kind: kind.map(str::to_owned),
+            runtime_requires: vec![],
+            provides: vec![],
+            post_install: vec![],
+        }
+    }
+
+    #[test]
+    fn kind_tag_round_trips_through_release_event() -> Result<()> {
+        let keys = Keys::parse(&"11".repeat(32))?;
+        let manifest = recipe_manifest(&keys, Some("nix-recipe"));
+        let artifact_event = sign_artifact_event(&manifest, "https://b.example/a", 42, &keys)?;
+        let mut release_manifest = manifest.clone();
+        release_manifest.artifact_event = Some(artifact_event.id.to_hex());
+        let release = sign_release_event(&release_manifest, &"11".repeat(32), 1_700_000_000)?;
+        assert_eq!(tag_value(&release, "kind"), Some("nix-recipe"));
+        assert!(release_event_is_v1(&release));
+        let (_, resolved) = resolved_manifest(&release, &artifact_event)?;
+        assert_eq!(resolved.kind.as_deref(), Some("nix-recipe"));
+
+        let mut plain = recipe_manifest(&keys, None);
+        plain.artifact_event = Some(artifact_event.id.to_hex());
+        let plain_release = sign_release_event(&plain, &"11".repeat(32), 1_700_000_000)?;
+        assert_eq!(tag_value(&plain_release, "kind"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_malformed_kind_and_duplicate_kind_tags() -> Result<()> {
+        let keys = Keys::parse(&"11".repeat(32))?;
+        assert!(
+            validate_manifest_metadata(&recipe_manifest(&keys, Some("Nix Recipe")), false).is_err()
+        );
+        assert!(validate_manifest_metadata(&recipe_manifest(&keys, Some("")), false).is_err());
+        assert!(
+            validate_manifest_metadata(&recipe_manifest(&keys, Some("nix-recipe")), false).is_ok()
+        );
+
+        let mut manifest = recipe_manifest(&keys, Some("nix-recipe"));
+        manifest.artifact_event = Some("cd".repeat(32));
+        let release = sign_release_event(&manifest, &"11".repeat(32), 1_700_000_000)?;
+        let mut tags = release.tags.to_vec();
+        tags.push(Tag::parse(["kind", "other"])?);
+        let duplicated = EventBuilder::new(Kind::Custom(RELEASE_KIND), "")
+            .tags(tags)
+            .finalize(&keys)?;
+        assert!(!release_event_is_v1(&duplicated));
+        Ok(())
+    }
+
+    #[test]
+    fn install_refuses_non_package_kinds() -> Result<()> {
+        let keys = Keys::parse(&"11".repeat(32))?;
+        assert!(ensure_installable_kind(&recipe_manifest(&keys, None)).is_ok());
+        assert!(ensure_installable_kind(&recipe_manifest(&keys, Some("package"))).is_ok());
+        let error = ensure_installable_kind(&recipe_manifest(&keys, Some("nix-recipe")))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nix-recipe artifact"), "{error}");
         Ok(())
     }
 
@@ -7109,6 +7352,7 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             format: "npk".into(),
+            kind: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7145,6 +7389,7 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             format: "npk".into(),
+            kind: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7172,6 +7417,7 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             format: "npk".into(),
+            kind: None,
             artifact_urls: vec!["https://example.com/a".into()],
             dependencies: vec![],
             conflicts: vec![],
@@ -7193,6 +7439,7 @@ mod tests {
         assert_eq!(value["artifact_urls"][0], "https://example.com/a");
         assert_eq!(value["verification"]["revoked"], false);
         assert_eq!(value["verification"]["publisher_trusted"], true);
+        assert!(value["kind"].is_null());
         Ok(())
     }
 
@@ -7205,6 +7452,7 @@ mod tests {
             os: "any".into(),
             arch: "any".into(),
             format: "npk".into(),
+            kind: None,
             artifact_urls: vec![],
             dependencies: vec![],
             conflicts: vec![],
@@ -7338,6 +7586,7 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             format: "npk".into(),
+            kind: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7368,6 +7617,7 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             format: "npk".into(),
+            kind: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7400,6 +7650,7 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             format: "npk".into(),
+            kind: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7452,6 +7703,7 @@ mod tests {
             os: default_os(),
             arch: default_arch(),
             format: default_format(),
+            kind: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7504,6 +7756,7 @@ mod tests {
             os: default_os(),
             arch: default_arch(),
             format: "opaque".into(),
+            kind: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7627,6 +7880,7 @@ mod tests {
             os: default_os(),
             arch: default_arch(),
             format: "npk".into(),
+            kind: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7805,6 +8059,7 @@ mod tests {
             os: default_os(),
             arch: default_arch(),
             format: "npk".into(),
+            kind: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7831,6 +8086,7 @@ mod tests {
             os: default_os(),
             arch: default_arch(),
             format: "npk".into(),
+            kind: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],
@@ -7959,6 +8215,7 @@ mod tests {
             os: default_os(),
             arch: default_arch(),
             format: default_format(),
+            kind: None,
             runtime_requires: vec![],
             provides: vec![],
             post_install: vec![],

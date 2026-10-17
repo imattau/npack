@@ -51,6 +51,13 @@ non-empty commit identifier. Clients may use these values for provenance
 display and later repository-state verification; source availability is not
 required to install an otherwise valid artifact.
 
+The optional singleton `kind` tag classifies the artifact. It is a lowercase
+identifier (letters, digits, `-`). Absent, or `package`, means an ordinary
+installable package. Any other value, such as `nix-recipe`, marks a
+metadata-style artifact consumed by an external tool through `npack resolve`;
+npack refuses to install it. Clients that do not recognise a kind must not
+install the artifact.
+
 Repeatable tags:
 
 | Tag | Values |

@@ -498,6 +498,19 @@ derivation generator would want to build one `fetchurl`-plus-unpack
 derivation per package in the graph, without needing a separate `npack
 resolve` invocation for every dependency.
 
+Pass `--release <event-id>` to pin resolution to one exact release event
+instead of picking the newest matching version. The event must still be
+signed, v1, unrevoked, from a trusted publisher, and match the name and
+host os/arch; otherwise resolution fails rather than falling back. It cannot
+be combined with `--requirement`, `--lockfile`, or `--recursive`.
+
+The JSON output includes a `kind` field (`null` for ordinary packages). A
+manifest may set `"kind": "nix-recipe"` to publish a build recipe: a `.npk`
+(`os`/`arch` `any`) containing, for example, a `default.nix`. Such artifacts
+are consumed through `npack resolve` and refused by `npack install`/`update`.
+[`packaging/nix/npack-recipe.nix`](../packaging/nix/npack-recipe.nix) shows a
+Nix function that fetches a pinned recipe artifact and `callPackage`s it.
+
 ## Running npackd (local service API)
 
 `npack daemon` runs npackd, a common local backend that a GUI store or other
