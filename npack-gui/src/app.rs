@@ -17,6 +17,7 @@ enum Tab {
     Installed,
     Browse,
     Updates,
+    Health,
     Settings,
 }
 
@@ -91,6 +92,8 @@ enum Event {
     Rollbacks(Result<Vec<Value>, UiError>),
     /// `GetHistory`: recent changes to installed packages, newest first.
     History(Result<Vec<Value>, UiError>),
+    /// `RunDoctor`: the health check's findings.
+    Health(Result<Value, UiError>),
     /// A verified icon fetched by npackd (`GetIcon`), keyed by its SHA-256.
     Icon {
         sha256: String,
@@ -175,6 +178,12 @@ pub struct NpackGuiApp {
     auto_checked: bool,
     /// reference -> version it can be switched back to.
     rollbacks: HashMap<String, String>,
+    /// Findings from the last health check, in report order.
+    health: Vec<Value>,
+    health_running: bool,
+    /// Why the last health check couldn't run (shown in the tab, not as a banner).
+    health_error: Option<UiError>,
+    auto_health: bool,
     history: Vec<Value>,
     relays_text: String,
     blossom_text: String,
@@ -219,6 +228,10 @@ impl NpackGuiApp {
             icons_requested: HashSet::new(),
             auto_checked: false,
             rollbacks: HashMap::new(),
+            health: Vec::new(),
+            health_running: false,
+            health_error: None,
+            auto_health: false,
             history: Vec::new(),
             relays_text: String::new(),
             blossom_text: String::new(),
@@ -691,6 +704,19 @@ impl NpackGuiApp {
                         .collect();
                 }
                 Event::History(Ok(items)) => self.history = items,
+                Event::Health(Ok(reply)) => {
+                    self.health_running = false;
+                    self.health_error = None;
+                    self.health = reply
+                        .get("findings")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                }
+                Event::Health(Err(error)) => {
+                    self.health_running = false;
+                    self.health_error = Some(error);
+                }
                 // Rollback and history are extras; failing to load them must
                 // not raise an error banner over the installed list.
                 Event::Rollbacks(Err(_)) | Event::History(Err(_)) => {}
@@ -776,6 +802,10 @@ impl NpackGuiApp {
                     if !first_run && !self.auto_browsed {
                         self.auto_browsed = true;
                         self.browse(false);
+                    }
+                    if !first_run && !self.auto_health {
+                        self.auto_health = true;
+                        self.run_health_check();
                     }
                 }
                 Event::Config(Err(error)) => self.fail("Updating settings", error),
@@ -898,6 +928,53 @@ fn short_npub(npub: &str) -> String {
 }
 
 const ICON_SIZE: f32 = 40.0;
+
+/// (problems that stop npack working, warnings) in a health check's findings.
+fn health_counts(findings: &[Value]) -> (usize, usize) {
+    let count = |level: &str| {
+        findings
+            .iter()
+            .filter(|finding| finding.get("level").and_then(Value::as_str) == Some(level))
+            .count()
+    };
+    (count("fail"), count("warn"))
+}
+
+fn health_headline(failures: usize, warnings: usize) -> String {
+    match (failures, warnings) {
+        (0, 0) => "Everything looks good.".to_owned(),
+        (0, warnings) => format!("npack is working. {warnings} thing(s) to look at."),
+        (failures, 0) => format!("{failures} problem(s) stop npack working properly."),
+        (failures, warnings) => {
+            format!(
+                "{failures} problem(s) stop npack working properly, plus {warnings} thing(s) to look at."
+            )
+        }
+    }
+}
+
+/// Findings grouped by area, in the order each area first appears.
+fn group_findings_by_area(findings: &[Value]) -> Vec<(String, Vec<&Value>)> {
+    let mut groups: Vec<(String, Vec<&Value>)> = Vec::new();
+    for finding in findings {
+        let area = value_str(finding, "area");
+        match groups.iter_mut().find(|(name, _)| *name == area) {
+            Some((_, members)) => members.push(finding),
+            None => groups.push((area, vec![finding])),
+        }
+    }
+    groups
+}
+
+/// The marker and colour for a finding's level.
+fn finding_marker(finding: &Value) -> (&'static str, egui::Color32) {
+    match finding.get("level").and_then(Value::as_str) {
+        Some("ok") => ("✓", egui::Color32::from_rgb(40, 150, 70)),
+        Some("warn") => ("!", egui::Color32::from_rgb(200, 130, 20)),
+        Some("fail") => ("✗", egui::Color32::from_rgb(200, 50, 40)),
+        _ => ("·", egui::Color32::GRAY),
+    }
+}
 
 /// "5 minutes ago", "3 days ago".
 fn describe_age(now: u64, then: u64) -> String {
@@ -1116,6 +1193,7 @@ impl eframe::App for NpackGuiApp {
         egui::CentralPanel::default().show(ui, |ui| {
             self.show_error_banner(ui);
             self.show_revoked_warning(ui);
+            self.show_health_warning(ui);
             if self.is_first_run() {
                 self.show_welcome(ui);
                 return;
@@ -1128,6 +1206,12 @@ impl eframe::App for NpackGuiApp {
                     count => format!("Updates ({count})"),
                 };
                 ui.selectable_value(&mut self.tab, Tab::Updates, updates_label);
+                let health_label = match health_counts(&self.health) {
+                    (0, 0) => "Health".to_owned(),
+                    (0, warnings) => format!("Health ({warnings})"),
+                    _ => "Health ✗".to_owned(),
+                };
+                ui.selectable_value(&mut self.tab, Tab::Health, health_label);
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
             });
             ui.separator();
@@ -1136,6 +1220,7 @@ impl eframe::App for NpackGuiApp {
                 Tab::Installed => self.show_installed_tab(ui),
                 Tab::Browse => self.show_browse_tab(ui),
                 Tab::Updates => self.show_updates_tab(ui),
+                Tab::Health => self.show_health_tab(ui),
                 Tab::Settings => self.show_settings_tab(ui),
             }
         });
@@ -1225,6 +1310,102 @@ impl NpackGuiApp {
                 self.welcome_dismissed = true;
             }
         });
+    }
+
+    /// Runs the daemon's health check in the background (same checks as
+    /// `npack doctor`). Ignored while one is already running.
+    fn run_health_check(&mut self) {
+        if self.health_running {
+            return;
+        }
+        self.health_running = true;
+        self.spawn(|client| {
+            Event::Health(
+                client
+                    .call("RunDoctor", serde_json::json!({}))
+                    .map_err(|error| UiError::from_anyhow(&error)),
+            )
+        });
+    }
+
+    /// A strip on every tab while the last check found something that stops
+    /// npack working (warnings alone only show on the tab's badge).
+    fn show_health_warning(&mut self, ui: &mut egui::Ui) {
+        if health_counts(&self.health).0 == 0 {
+            return;
+        }
+        let mut open = false;
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgba_unmultiplied(220, 60, 40, 50))
+            .inner_margin(egui::Margin::same(8))
+            .corner_radius(4)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("⚠ npack found a problem that stops it working properly.");
+                    if ui.button("See what to do").clicked() {
+                        open = true;
+                    }
+                });
+            });
+        ui.add_space(6.0);
+        if open {
+            self.tab = Tab::Health;
+        }
+    }
+
+    fn show_health_tab(&mut self, ui: &mut egui::Ui) {
+        let mut recheck = false;
+        ui.horizontal(|ui| {
+            ui.heading("Health check");
+            if self.health_running {
+                ui.spinner();
+                ui.weak("Checking...");
+            } else if ui.button("Check again").clicked() {
+                recheck = true;
+            }
+        });
+        if let Some(error) = &self.health_error {
+            ui.colored_label(egui::Color32::from_rgb(200, 50, 40), error.headline());
+            ui.weak(&error.detail);
+        }
+        if self.health.is_empty() && self.health_error.is_none() && !self.health_running {
+            ui.weak("Not checked yet.");
+        }
+        if !self.health.is_empty() {
+            let (failures, warnings) = health_counts(&self.health);
+            ui.label(health_headline(failures, warnings));
+        }
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("health")
+            .show(ui, |ui| {
+                for (area, findings) in group_findings_by_area(&self.health) {
+                    ui.add_space(6.0);
+                    ui.strong(area);
+                    for finding in findings {
+                        let (mark, color) = finding_marker(finding);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.colored_label(color, mark);
+                            ui.label(value_str(finding, "title"));
+                        });
+                        if let Some(detail) = finding.get("detail").and_then(Value::as_str) {
+                            for line in detail.lines() {
+                                ui.indent(("detail", line), |ui| {
+                                    ui.weak(line);
+                                });
+                            }
+                        }
+                        if let Some(fix) = finding.get("fix").and_then(Value::as_str) {
+                            ui.indent(("fix", fix), |ui| {
+                                ui.label(format!("→ {fix}"));
+                            });
+                        }
+                    }
+                }
+            });
+        if recheck {
+            self.run_health_check();
+        }
     }
 
     fn show_settings_tab(&mut self, ui: &mut egui::Ui) {
@@ -1845,6 +2026,52 @@ mod tests {
             (Some(""), Some(true))
         );
         assert_eq!(everything["sort"], "name");
+    }
+
+    #[test]
+    fn health_findings_are_counted_summarised_and_grouped() {
+        let findings = vec![
+            serde_json::json!({"level": "ok", "area": "Config", "title": "fine"}),
+            serde_json::json!({"level": "warn", "area": "Store", "title": "hmm"}),
+            serde_json::json!({"level": "fail", "area": "Relays", "title": "down"}),
+            serde_json::json!({"level": "info", "area": "Config", "title": "note"}),
+            serde_json::json!({"level": "warn", "area": "Relays", "title": "one slow"}),
+        ];
+        assert_eq!(health_counts(&findings), (1, 2));
+        assert_eq!(health_counts(&[]), (0, 0));
+
+        let groups = group_findings_by_area(&findings);
+        let areas: Vec<&str> = groups.iter().map(|(area, _)| area.as_str()).collect();
+        assert_eq!(
+            areas,
+            ["Config", "Store", "Relays"],
+            "first-appearance order"
+        );
+        assert_eq!(groups[0].1.len(), 2, "same-area findings are together");
+
+        assert_eq!(health_headline(0, 0), "Everything looks good.");
+        assert!(health_headline(0, 2).contains("npack is working. 2 thing(s)"));
+        assert!(health_headline(1, 0).starts_with("1 problem(s) stop npack working"));
+        assert!(health_headline(1, 2).contains("plus 2 thing(s)"));
+    }
+
+    #[test]
+    fn finding_markers_distinguish_problems_from_notes() {
+        let marker = |level: &str| finding_marker(&serde_json::json!({"level": level})).0;
+        assert_eq!(
+            (
+                marker("ok"),
+                marker("warn"),
+                marker("fail"),
+                marker("info"),
+                marker("??")
+            ),
+            ("✓", "!", "✗", "·", "·")
+        );
+        assert_ne!(
+            finding_marker(&serde_json::json!({"level": "fail"})).1,
+            finding_marker(&serde_json::json!({"level": "ok"})).1
+        );
     }
 
     #[test]

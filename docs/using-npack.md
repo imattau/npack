@@ -675,6 +675,7 @@ Supported methods, mirroring the CLI operations above:
 | `GetConfig` | none | `{first_run, config_path, relays[], blossom[], relays_defaulted, blossom_defaulted, trusted_publishers[{publisher, npub}]}`. `first_run` is true when no `config.toml` exists yet. |
 | `ListTrustedPublishers` | none | Array of `{publisher, npub}`. |
 | `AddTrustedPublisher` | `publisher` (npub, hex, or a NIP-05 `name@domain`) | `{publisher, npub}` (plus `nip05`/`label` when a name was given); the resolved key is written to `[trust].publishers` in `config.toml`. |
+| `RunDoctor` | `offline`, `user`, `store` | `{healthy, findings[{level, area, title, detail?, fix?}]}`: the same checks as `npack doctor`, with `level` one of `ok`, `info`, `warn`, `fail` and `healthy` false only if some finding is `fail`. Read-only, so not gated by PolicyKit. It can take up to about eight seconds (the relay and download checks); `offline` skips them. See "Health check" below. |
 | `GetHistory` | `package`, `limit`, `user`, `store` | Array of `{at, action, publisher, name, from?, to?, reference}`, newest first. |
 | `ListRollbacks` | `user`, `store` | Array of `{reference, current_version, previous_version}` for packages that can be switched back right now (archive and metadata verified). |
 | `Rollback` | `package`, `allow_capability[]`, `user`, `store` | `{package, from_version, to_version}`. Gated like `Update` on the system daemon. |
@@ -703,6 +704,12 @@ publisher key or relay URL was rejected), `nip05_failed`, `not_authorized`, `no_
 `download_failed`, `cancelled`, `no_catalogue` (nothing to browse until the catalogue has been fetched: call `Search` with `refresh`), `not_found`, `no_icon`, `no_rollback`, `rollback_blocked`, and `internal` for anything else.
 A `failed` `GetTransaction` status carries `error_code` the same way. The
 field is additive; older daemons omit it.
+
+**Health check.** `RunDoctor` is read-only and open to every local user, so the
+daemon runs one check at a time and reuses a finished result for three seconds,
+which absorbs a burst of identical requests without making "Check again" stale.
+The checks that hash installed archives run on a blocking thread so they do not
+hold up other requests.
 
 **Store icons.** `GetIcon` fetches the icon named by a release already in the
 daemon's local catalogue; a caller cannot supply a URL, so it is not a general
@@ -1129,6 +1136,13 @@ Each finding is one of four kinds: a tick (fine), a dot (just worth knowing),
 The command exits with status 1 only when there is a `✗`, so it can be used in
 scripts. A missing relay is a warning; having *no* working relay is a failure.
 A missing optional helper is never more than a note.
+
+The GUI has the same check as a **Health** tab, driven by the daemon's
+`RunDoctor` method. It runs once when the app starts, shows a badge on the tab
+(`Health (2)` for warnings, `Health ✗` when something stops npack working), and
+shows a warning strip on every tab for the latter. "Check again" reruns it. When
+run by the daemon, the "is the service running" check is replaced by "This
+service is running", since a service cannot meaningfully ask itself.
 
 It runs even when the config file is broken, which stops every other command at
 startup, and shows the line the parser objected to. Pass `--user`, `--system` or

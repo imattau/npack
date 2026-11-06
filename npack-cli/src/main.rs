@@ -4957,6 +4957,13 @@ struct TransactionEntry {
     control: Arc<TransactionControl>,
 }
 
+/// (when it ran, which request it answered, its findings)
+type DoctorCacheEntry = (
+    std::time::Instant,
+    (bool, bool, Option<PathBuf>),
+    Vec<Finding>,
+);
+
 struct DaemonState {
     /// Live config. Trust and network settings edited over RPC are written
     /// back to `config_path` and swapped in here, so later requests see them
@@ -4970,6 +4977,9 @@ struct DaemonState {
     /// Verified publisher names (NIP-05) looked up recently, so a GUI listing
     /// the same publishers repeatedly does not re-query relays and domains.
     identities: std::sync::Mutex<HashMap<String, (std::time::Instant, PublisherIdentity)>>,
+    /// Serialises `RunDoctor` and holds its last result for a few seconds.
+    doctor_gate: tokio::sync::Mutex<()>,
+    doctor_cache: std::sync::Mutex<Option<DoctorCacheEntry>>,
     role: DaemonRole,
     transactions: std::sync::Mutex<HashMap<u64, TransactionEntry>>,
     next_transaction_id: AtomicU64,
@@ -4987,6 +4997,8 @@ impl DaemonState {
             config_path,
             config_mtime,
             identities: std::sync::Mutex::new(HashMap::new()),
+            doctor_gate: tokio::sync::Mutex::new(()),
+            doctor_cache: std::sync::Mutex::new(None),
             role,
             transactions: std::sync::Mutex::new(HashMap::new()),
             next_transaction_id: AtomicU64::new(1),
@@ -5177,6 +5189,7 @@ async fn dispatch_daemon_request(
         "GetConfig" => daemon_get_config(state),
         "ListTrustedPublishers" => daemon_list_trusted_publishers(state),
         "GetIcon" => daemon_get_icon(request.params).await,
+        "RunDoctor" => daemon_run_doctor(state, request.params).await,
         "ListCategories" => daemon_list_categories(&state.config(), request.params).await,
         "GetHistory" => daemon_get_history(&state.config(), request.params),
         "ListRollbacks" => daemon_list_rollbacks(&state.config(), request.params),
@@ -9989,31 +10002,80 @@ fn render_doctor_report(findings: &[Finding]) -> String {
     out
 }
 
-/// `npack doctor`. Returns false if anything that stops npack working was found.
-async fn doctor_command(
-    store: Option<&Path>,
-    user: bool,
+/// Everything a doctor run needs to know, so the CLI and the daemon share the
+/// same checks and tests can point them at temporary directories.
+#[derive(Debug, Clone)]
+struct DoctorPlan {
+    config_path: Option<PathBuf>,
+    package_root: PathBuf,
+    catalogue_root: PathBuf,
     offline: bool,
-    json: bool,
-) -> Result<bool> {
-    let (mut findings, config) = doctor_config(config_file_path().as_deref());
-    let package_root = install_paths(store, user).0;
-    let catalogue_root = store.map_or_else(default_store, Path::to_path_buf);
-    findings.extend(doctor_store(&package_root));
-    findings.extend(doctor_catalogue(&catalogue_root, now_unix()));
-    findings.push(doctor_daemon(
-        "user",
-        &daemon_socket_path(None, DaemonRole::User),
-    ));
-    let system_socket = daemon_socket_path(None, DaemonRole::System);
-    if system_socket.exists() {
-        findings.push(doctor_daemon("system", &system_socket));
+    /// Probe the local service sockets. The daemon turns this off: a service
+    /// asking itself whether it is running proves nothing (and would have to
+    /// wait on its own socket).
+    probe_service: bool,
+    path_env: String,
+    home: Option<PathBuf>,
+    wait: std::time::Duration,
+}
+
+impl DoctorPlan {
+    fn new(store: Option<&Path>, user: bool, offline: bool, probe_service: bool) -> Self {
+        Self {
+            config_path: config_file_path(),
+            package_root: install_paths(store, user).0,
+            catalogue_root: store.map_or_else(default_store, Path::to_path_buf),
+            offline,
+            probe_service,
+            path_env: std::env::var("PATH").unwrap_or_default(),
+            home: dirs::home_dir(),
+            wait: std::time::Duration::from_secs(DOCTOR_NETWORK_SECS),
+        }
     }
-    findings.extend(doctor_tools(
-        &std::env::var("PATH").unwrap_or_default(),
-        dirs::home_dir().as_deref(),
-    ));
-    if offline {
+}
+
+/// The checks that only touch the local machine. Synchronous (it hashes
+/// installed archives), so callers on an async runtime run it on a blocking
+/// thread.
+fn doctor_local(plan: &DoctorPlan) -> (Vec<Finding>, Config) {
+    let (mut findings, config) = doctor_config(plan.config_path.as_deref());
+    findings.extend(doctor_store(&plan.package_root));
+    findings.extend(doctor_catalogue(&plan.catalogue_root, now_unix()));
+    if plan.probe_service {
+        findings.push(doctor_daemon(
+            "user",
+            &daemon_socket_path(None, DaemonRole::User),
+        ));
+        let system_socket = daemon_socket_path(None, DaemonRole::System);
+        if system_socket.exists() {
+            findings.push(doctor_daemon("system", &system_socket));
+        }
+    } else {
+        findings.push(Finding::new(
+            Level::Ok,
+            "Service",
+            "This service is running",
+        ));
+    }
+    findings.extend(doctor_tools(&plan.path_env, plan.home.as_deref()));
+    (findings, config)
+}
+
+/// Runs every check and returns the findings in report order.
+async fn doctor_findings(plan: DoctorPlan) -> Vec<Finding> {
+    let local_plan = plan.clone();
+    let (mut findings, config) = tokio::task::spawn_blocking(move || doctor_local(&local_plan))
+        .await
+        .unwrap_or_else(|error| {
+            (
+                vec![
+                    Finding::new(Level::Warn, "Config", "A local check stopped unexpectedly")
+                        .detail(error.to_string()),
+                ],
+                Config::default(),
+            )
+        });
+    if plan.offline {
         findings.push(Finding::new(
             Level::Info,
             "Network",
@@ -10021,20 +10083,82 @@ async fn doctor_command(
         ));
     } else {
         findings.extend(
-            doctor_network(
-                &config.network.relays,
-                &config.storage.blossom,
-                std::time::Duration::from_secs(DOCTOR_NETWORK_SECS),
-            )
-            .await,
+            doctor_network(&config.network.relays, &config.storage.blossom, plan.wait).await,
         );
     }
+    findings
+}
+
+/// `npack doctor`. Returns false if anything that stops npack working was found.
+async fn doctor_command(
+    store: Option<&Path>,
+    user: bool,
+    offline: bool,
+    json: bool,
+) -> Result<bool> {
+    let findings = doctor_findings(DoctorPlan::new(store, user, offline, true)).await;
     if json {
         println!("{}", serde_json::to_string_pretty(&findings)?);
     } else {
         print!("npack doctor\n{}", render_doctor_report(&findings));
     }
     Ok(!doctor_has_failures(&findings))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RunDoctorParams {
+    /// Skip the relay and download-server checks.
+    #[serde(default)]
+    offline: bool,
+    #[serde(default)]
+    user: bool,
+    #[serde(default)]
+    store: Option<PathBuf>,
+}
+
+/// How long a finished health check is reused. Only enough to absorb a burst of
+/// identical requests; a person pressing "Check again" a few seconds after
+/// fixing something gets fresh results.
+const DOCTOR_CACHE_SECS: u64 = 3;
+
+/// `RunDoctor`: the same checks as `npack doctor`, as structured findings.
+/// Read-only and open to any local user, so runs are serialised (one at a time)
+/// and a burst of identical requests shares one result.
+async fn daemon_run_doctor(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: RunDoctorParams =
+        serde_json::from_value(params).context("invalid RunDoctor params")?;
+    let config = state.config();
+    let user = params.user || config.install.user;
+    let key = (params.offline, user, params.store.clone());
+    let _one_at_a_time = state.doctor_gate.lock().await;
+    let reusable = state.doctor_cache.lock().ok().and_then(|cache| {
+        cache
+            .as_ref()
+            .filter(|(at, cached_key, _)| {
+                at.elapsed() < std::time::Duration::from_secs(DOCTOR_CACHE_SECS)
+                    && *cached_key == key
+            })
+            .map(|(_, _, findings)| findings.clone())
+    });
+    let findings = match reusable {
+        Some(findings) => findings,
+        None => {
+            let mut plan = DoctorPlan::new(params.store.as_deref(), user, params.offline, false);
+            plan.config_path = state.config_path.clone();
+            let findings = doctor_findings(plan).await;
+            if let Ok(mut cache) = state.doctor_cache.lock() {
+                *cache = Some((std::time::Instant::now(), key, findings.clone()));
+            }
+            findings
+        }
+    };
+    Ok(serde_json::json!({
+        "healthy": !doctor_has_failures(&findings),
+        "findings": findings,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -14593,5 +14717,171 @@ mod tests {
         assert_eq!(value[0]["fix"], "Check the network.");
         assert!(value[0].get("detail").is_none() && value[1].get("fix").is_none());
         assert_eq!(value[1]["level"], "ok");
+    }
+
+    fn offline_plan(dir: &Path) -> DoctorPlan {
+        DoctorPlan {
+            config_path: Some(dir.join("config/npack/config.toml")),
+            package_root: dir.join("store"),
+            catalogue_root: dir.join("store"),
+            offline: true,
+            probe_service: false,
+            path_env: String::new(),
+            home: Some(dir.to_path_buf()),
+            wait: std::time::Duration::from_secs(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn doctor_findings_cover_every_area_in_report_order() {
+        let dir = tempdir().unwrap();
+        let findings = doctor_findings(offline_plan(dir.path())).await;
+        let mut areas: Vec<&str> = Vec::new();
+        for finding in &findings {
+            if !areas.contains(&finding.area) {
+                areas.push(finding.area);
+            }
+        }
+        assert_eq!(
+            areas,
+            [
+                "Config",
+                "Trust",
+                "Store",
+                "Catalogue",
+                "Service",
+                "Tools",
+                "Network"
+            ]
+        );
+        assert!(!doctor_has_failures(&findings));
+        // A service never asks itself whether it is running.
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.title == "This service is running")
+        );
+        assert!(!findings.iter().any(|f| f.title.contains("isn't running")));
+    }
+
+    fn doctor_state(dir: &Path) -> Arc<DaemonState> {
+        Arc::new(DaemonState::with_config_path(
+            Config::default(),
+            DaemonRole::User,
+            Some(dir.join("config/npack/config.toml")),
+        ))
+    }
+
+    #[tokio::test]
+    async fn run_doctor_returns_structured_findings_and_a_healthy_flag() -> Result<()> {
+        let dir = tempdir()?;
+        let state = doctor_state(dir.path());
+        let params = serde_json::json!({"offline": true, "store": dir.path().join("store")});
+        let request = |params: serde_json::Value| DaemonRequest {
+            id: 1,
+            method: "RunDoctor".into(),
+            params,
+        };
+        let reply = dispatch_daemon_request(&state, request(params.clone()), None).await?;
+        assert_eq!(reply["healthy"], true);
+        let findings = reply["findings"].as_array().unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f["area"] == "Config" && f["level"] == "info")
+        );
+        assert!(findings.iter().all(|f| f["title"].is_string()));
+
+        // A broken config is reported as a failure, after the cache has lapsed.
+        *state.doctor_cache.lock().unwrap() = None;
+        let config_path = dir.path().join("config/npack/config.toml");
+        fs::create_dir_all(config_path.parent().unwrap())?;
+        fs::write(&config_path, "[trust\nbroken")?;
+        let reply = dispatch_daemon_request(&state, request(params), None).await?;
+        assert_eq!(reply["healthy"], false);
+        assert!(
+            reply["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["level"] == "fail")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_doctor_reuses_a_fresh_result_but_not_a_stale_one() -> Result<()> {
+        let dir = tempdir()?;
+        let state = doctor_state(dir.path());
+        let params = serde_json::json!({"offline": true, "store": dir.path().join("store")});
+        let key = (true, false, Some(dir.path().join("store")));
+        let planted = vec![Finding::new(Level::Warn, "Planted", "from the cache")];
+        let ask = || {
+            dispatch_daemon_request(
+                &state,
+                DaemonRequest {
+                    id: 1,
+                    method: "RunDoctor".into(),
+                    params: params.clone(),
+                },
+                None,
+            )
+        };
+
+        *state.doctor_cache.lock().unwrap() =
+            Some((std::time::Instant::now(), key.clone(), planted.clone()));
+        let reply = ask().await?;
+        assert_eq!(
+            reply["findings"][0]["title"], "from the cache",
+            "a burst shares one result"
+        );
+
+        let long_ago = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(DOCTOR_CACHE_SECS + 5))
+            .unwrap();
+        *state.doctor_cache.lock().unwrap() = Some((long_ago, key, planted.clone()));
+        let reply = ask().await?;
+        assert_ne!(
+            reply["findings"][0]["title"], "from the cache",
+            "an old result is not reused"
+        );
+
+        // A different request (here: not offline) never gets another's result.
+        let other = (false, false, None);
+        *state.doctor_cache.lock().unwrap() = Some((std::time::Instant::now(), other, planted));
+        let reply = ask().await?;
+        assert_ne!(reply["findings"][0]["title"], "from the cache");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_doctor_requests_are_serialised_and_agree() -> Result<()> {
+        let dir = tempdir()?;
+        let state = doctor_state(dir.path());
+        let params = serde_json::json!({"offline": true, "store": dir.path().join("store")});
+        let ask = || {
+            dispatch_daemon_request(
+                &state,
+                DaemonRequest {
+                    id: 1,
+                    method: "RunDoctor".into(),
+                    params: params.clone(),
+                },
+                None,
+            )
+        };
+        let (a, b, c) = tokio::join!(ask(), ask(), ask());
+        let (a, b, c) = (a?, b?, c?);
+        assert_eq!(a, b);
+        assert_eq!(b, c, "later callers get the first run's result");
+        Ok(())
+    }
+
+    #[test]
+    fn run_doctor_is_read_only_so_it_is_not_gated_on_the_system_daemon() {
+        assert_eq!(
+            required_authorization(DaemonRole::System, 1000, "RunDoctor"),
+            None
+        );
     }
 }

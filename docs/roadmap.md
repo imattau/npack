@@ -321,9 +321,10 @@ curated "featured" lists (there is no curation source yet), and screenshots
 `npack doctor` diagnoses a setup (config, store, interrupted installs, damaged
 packages, catalogue age, the local service, helper tools, and relay and download
 reachability) with a suggested fix for each finding, and works even when the
-config file is broken. Not yet done: running it from the GUI (it would need a
-daemon method; the findings are already structured for that) and checking
-installed packages for revocation, which `npack update --check` still does.
+config file is broken. The GUI has the same check as a Health tab (daemon method
+`RunDoctor`), run at start with a badge and a warning strip when something stops
+npack working. Not yet done: checking installed packages for revocation from
+doctor, which `npack update --check` still does.
 
 ## Phase 6: COSMIC Store integration
 
