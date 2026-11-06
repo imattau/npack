@@ -107,6 +107,38 @@ fn red(text: &str) -> String {
     paint("31", text)
 }
 
+#[derive(Subcommand)]
+enum TrustAction {
+    /// Trust a publisher (npub, hex key, or name@domain).
+    Add {
+        #[arg(help = "npub, 64-character hex key, or NIP-05 name such as alice@example.com")]
+        publisher: String,
+        #[arg(
+            short = 'y',
+            long,
+            help = "Trust without asking; required when stdin is not a terminal"
+        )]
+        yes: bool,
+        #[arg(long, help = "Relay to look up the publisher's profile on")]
+        relay: Vec<String>,
+    },
+    /// Stop trusting a publisher.
+    Remove {
+        #[arg(help = "npub, 64-character hex key, or NIP-05 name")]
+        publisher: String,
+    },
+    /// List trusted publishers.
+    List {
+        #[arg(
+            long,
+            help = "Look up verified names (contacts relays and each publisher's domain)"
+        )]
+        names: bool,
+        #[arg(long, help = "Relay to look up profiles on")]
+        relay: Vec<String>,
+    },
+}
+
 #[derive(Parser)]
 #[command(name = "npack", version, about = "A Nostr-native package manager")]
 struct Cli {
@@ -509,6 +541,15 @@ enum Command {
             help = "Record the release this package was forked from"
         )]
         fork_of: Option<String>,
+    },
+    /// Manage the publishers you trust (`[trust].publishers` in config.toml).
+    ///
+    /// Publishers can be given as an npub, a hex key, or a NIP-05 name such
+    /// as alice@example.com. A name only helps you find the key: npack shows
+    /// the resolved npub and stores that, never the name.
+    Trust {
+        #[command(subcommand)]
+        action: TrustAction,
     },
     /// Download, verify, and extract a published package into a directory,
     /// optionally scaffolding a fork of it under your own publisher key.
@@ -1310,6 +1351,7 @@ async fn main() -> Result<()> {
         Command::Inspect { artifact } => inspect_artifact(&artifact)?,
         Command::Manifest { artifact, output } => write_manifest(&artifact, &output)?,
         Command::Appstream { artifact, output } => appstream_command(&artifact, output.as_deref())?,
+        Command::Trust { action } => trust_command(action, &config).await?,
         Command::Daemon { socket, system } => {
             let role = if system {
                 if current_uid() != Some(0) {
@@ -4440,6 +4482,10 @@ struct DaemonState {
     /// without a daemon restart.
     config: std::sync::RwLock<Config>,
     config_path: Option<PathBuf>,
+    /// Modification time of `config_path` as last read or written by the
+    /// daemon, so edits made elsewhere (`npack trust`, a text editor) are
+    /// picked up on the next request instead of being missed or overwritten.
+    config_mtime: std::sync::Mutex<Option<std::time::SystemTime>>,
     /// Verified publisher names (NIP-05) looked up recently, so a GUI listing
     /// the same publishers repeatedly does not re-query relays and domains.
     identities: std::sync::Mutex<HashMap<String, (std::time::Instant, PublisherIdentity)>>,
@@ -4454,9 +4500,11 @@ impl DaemonState {
     }
 
     fn with_config_path(config: Config, role: DaemonRole, config_path: Option<PathBuf>) -> Self {
+        let config_mtime = std::sync::Mutex::new(config_modified(config_path.as_deref()));
         Self {
             config: std::sync::RwLock::new(config),
             config_path,
+            config_mtime,
             identities: std::sync::Mutex::new(HashMap::new()),
             role,
             transactions: std::sync::Mutex::new(HashMap::new()),
@@ -4464,9 +4512,39 @@ impl DaemonState {
         }
     }
 
+    /// Re-reads `config.toml` if something else changed it since the daemon
+    /// last looked. A file that no longer parses (mid-edit) keeps the
+    /// previous config rather than dropping the trust list.
+    fn reload_config_if_changed(&self) {
+        let Some(path) = &self.config_path else {
+            return;
+        };
+        let modified = config_modified(Some(path));
+        let (Ok(mut seen), Some(_)) = (self.config_mtime.lock(), modified) else {
+            return;
+        };
+        if *seen == modified {
+            return;
+        }
+        if let Ok(reloaded) = load_config_from(Some(path))
+            && let Ok(mut config) = self.config.write()
+        {
+            *config = reloaded;
+            *seen = modified;
+        }
+    }
+
+    /// Records that the daemon itself just wrote the config file.
+    fn note_config_written(&self) {
+        if let Ok(mut seen) = self.config_mtime.lock() {
+            *seen = config_modified(self.config_path.as_deref());
+        }
+    }
+
     /// A snapshot of the current config; handlers work on the snapshot so no
     /// lock is held across an await.
     fn config(&self) -> Config {
+        self.reload_config_if_changed();
         self.config
             .read()
             .map(|config| config.clone())
@@ -4693,24 +4771,18 @@ async fn daemon_add_trusted_publisher(
     let params: PublisherParams =
         serde_json::from_value(params).context("invalid AddTrustedPublisher params")?;
     let (hex, name) = resolve_publisher_input(&params.publisher).await?;
-    let npub = display_publisher(&hex);
     let path = config_write_path(state)?;
+    state.reload_config_if_changed();
     let mut config = state
         .config
         .write()
         .map_err(|_| anyhow!("config lock poisoned"))?;
-    let mut publishers = config.trust.publishers.clone();
-    if !publishers
-        .iter()
-        .any(|entry| normalize_publisher_reference(entry) == hex)
-    {
-        publishers.push(npub.clone());
+    if let Some(publishers) = trust_list_with(&config.trust.publishers, &hex) {
+        persist_trust_list(path, &publishers)?;
+        config.trust.publishers = publishers;
     }
-    update_config_file(path, |table| {
-        config_section(table, "trust").insert("publishers".into(), string_array(&publishers));
-    })?;
-    config.trust.publishers = publishers;
     config.first_run = false;
+    state.note_config_written();
     let mut value = publisher_json(&hex);
     if let (Some(name), Some(object)) = (name, value.as_object_mut()) {
         object.insert("nip05".into(), name.display().into());
@@ -4727,24 +4799,21 @@ fn daemon_remove_trusted_publisher(
         serde_json::from_value(params).context("invalid RemoveTrustedPublisher params")?;
     let hex = normalize_publisher_reference(params.publisher.trim());
     let path = config_write_path(state)?;
+    state.reload_config_if_changed();
     let mut config = state
         .config
         .write()
         .map_err(|_| anyhow!("config lock poisoned"))?;
-    let publishers: Vec<String> = config
-        .trust
-        .publishers
-        .iter()
-        .filter(|entry| normalize_publisher_reference(entry) != hex)
-        .cloned()
-        .collect();
-    let removed = publishers.len() != config.trust.publishers.len();
-    if removed {
-        update_config_file(path, |table| {
-            config_section(table, "trust").insert("publishers".into(), string_array(&publishers));
-        })?;
-        config.trust.publishers = publishers;
-    }
+    let removed = match trust_list_without(&config.trust.publishers, &hex) {
+        Some(publishers) => {
+            persist_trust_list(path, &publishers)?;
+            config.trust.publishers = publishers;
+            true
+        }
+        None => false,
+    };
+    drop(config);
+    state.note_config_written();
     Ok(serde_json::json!({ "removed": removed, "publisher": hex }))
 }
 
@@ -4787,6 +4856,7 @@ fn daemon_save_config(
     let params: SaveConfigParams =
         serde_json::from_value(params).context("invalid SaveConfig params")?;
     let path = config_write_path(state)?;
+    state.reload_config_if_changed();
     let mut config = state
         .config
         .write()
@@ -4822,7 +4892,186 @@ fn daemon_save_config(
     updated.apply_defaults();
     *config = updated;
     drop(config);
+    state.note_config_written();
     daemon_get_config(state)
+}
+
+// ---------------------------------------------------------------------------
+// Trust list editing, shared by `npack trust` and the daemon
+// ---------------------------------------------------------------------------
+
+/// `list` plus `hex` (stored as an npub, which is what people recognise), or
+/// `None` when that publisher is already in the list.
+fn trust_list_with(list: &[String], hex: &str) -> Option<Vec<String>> {
+    if list
+        .iter()
+        .any(|entry| normalize_publisher_reference(entry) == hex)
+    {
+        return None;
+    }
+    let mut updated = list.to_vec();
+    updated.push(display_publisher(hex));
+    Some(updated)
+}
+
+/// `list` without `hex`, or `None` when it was not in the list.
+fn trust_list_without(list: &[String], hex: &str) -> Option<Vec<String>> {
+    let updated: Vec<String> = list
+        .iter()
+        .filter(|entry| normalize_publisher_reference(entry) != hex)
+        .cloned()
+        .collect();
+    (updated.len() != list.len()).then_some(updated)
+}
+
+fn persist_trust_list(path: &Path, publishers: &[String]) -> Result<()> {
+    update_config_file(path, |table| {
+        config_section(table, "trust").insert("publishers".into(), string_array(publishers));
+    })
+}
+
+/// The trust list as stored on disk (an absent file means no one is trusted).
+fn trusted_publishers_at(path: &Path) -> Result<Vec<String>> {
+    Ok(load_config_from(Some(path))?.trust.publishers)
+}
+
+/// Whether to go ahead: `--yes` always does; otherwise the user must answer
+/// at a terminal. Piped or scripted input never counts as consent.
+fn confirmation_decision(
+    yes: bool,
+    interactive: bool,
+    answer: impl FnOnce() -> io::Result<String>,
+) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    if !interactive {
+        bail!("refusing to change the trust list without confirmation; pass --yes to confirm");
+    }
+    Ok(matches!(
+        answer()?.trim().to_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn ask_on_terminal(question: &str) -> io::Result<String> {
+    eprint!("{question} ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(answer)
+}
+
+fn print_identity(identity: &PublisherIdentity) {
+    println!("  key       {}", identity.npub);
+    if let Some(label) = &identity.label {
+        println!("  name      {label} ({})", green("verified by its domain"));
+    } else {
+        if let Some(nip05) = &identity.nip05 {
+            println!(
+                "  claims    {nip05} ({})",
+                yellow("unverified: its domain does not confirm this key")
+            );
+        }
+        if let Some(name) = &identity.claimed_name {
+            println!("  profile   \"{name}\" ({})", yellow("self-reported"));
+        }
+    }
+}
+
+async fn trust_command(action: TrustAction, config: &Config) -> Result<()> {
+    let path = config_file_path().context("no config directory available")?;
+    match action {
+        TrustAction::Add {
+            publisher,
+            yes,
+            relay,
+        } => {
+            let (hex, name) = resolve_publisher_input(&publisher).await?;
+            let mut identity = PublisherIdentity::bare(&hex);
+            if let Some(name) = &name {
+                // The domain vouched for this key just now.
+                identity.label = Some(name.display());
+                identity.nip05 = Some(name.display());
+                identity.nip05_verified = true;
+            } else {
+                let relays = normalize_relays(relay, config);
+                eprintln!("Looking up profile...");
+                if let Ok(found) = lookup_identities(&relays, &[PublicKey::from_hex(&hex)?]).await
+                    && let Some(found) = found.into_iter().next()
+                {
+                    identity = found;
+                }
+            }
+            if trusted_publishers_at(&path)?
+                .iter()
+                .any(|entry| normalize_publisher_reference(entry) == hex)
+            {
+                println!("Already trusted: {}", identity.npub);
+                return Ok(());
+            }
+            println!("Trust this publisher?");
+            print_identity(&identity);
+            if !confirmation_decision(yes, io::stdin().is_terminal(), || {
+                ask_on_terminal("Trust them? [y/N]")
+            })? {
+                println!("Not trusted.");
+                return Ok(());
+            }
+            if let Some(updated) = trust_list_with(&trusted_publishers_at(&path)?, &hex) {
+                persist_trust_list(&path, &updated)?;
+            }
+            println!("{} {}", green("trusted"), identity.npub);
+        }
+        TrustAction::Remove { publisher } => {
+            let (hex, _) = resolve_publisher_input(&publisher).await.map_err(|error| {
+                anyhow!("{error:#}\nuse `npack trust list` to find the publisher's npub")
+            })?;
+            let Some(updated) = trust_list_without(&trusted_publishers_at(&path)?, &hex) else {
+                bail!(
+                    "{} is not in the trusted publisher list",
+                    display_publisher(&hex)
+                );
+            };
+            persist_trust_list(&path, &updated)?;
+            println!(
+                "{} {}",
+                yellow("no longer trusted"),
+                display_publisher(&hex)
+            );
+        }
+        TrustAction::List { names, relay } => {
+            let publishers = trusted_publishers_at(&path)?;
+            if publishers.is_empty() {
+                println!("No trusted publishers. Any publisher is accepted until you add one.");
+                return Ok(());
+            }
+            let keys = publishers
+                .iter()
+                .map(|entry| {
+                    PublicKey::parse(entry)
+                        .with_context(|| format!("invalid trusted publisher key: {entry}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let identities = if names {
+                let relays = normalize_relays(relay, config);
+                eprintln!("Looking up names...");
+                lookup_identities(&relays, &keys).await?
+            } else {
+                keys.iter()
+                    .map(|key| PublisherIdentity::bare(&key.to_hex()))
+                    .collect()
+            };
+            for identity in identities {
+                match (&identity.label, names) {
+                    (Some(label), _) => println!("{}  {label}", identity.npub),
+                    (None, true) => println!("{}  (no verified name)", identity.npub),
+                    (None, false) => println!("{}", identity.npub),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -5093,6 +5342,41 @@ async fn build_identity(hex: &str, claims: Option<&serde_json::Value>) -> Publis
     identity
 }
 
+/// Looks up each key's identity: profile claims from `relays`, then each
+/// claimed NIP-05 name confirmed against its domain. Fails if no relay could
+/// be queried.
+async fn lookup_identities(
+    relays: &[String],
+    keys: &[PublicKey],
+) -> Result<Vec<PublisherIdentity>> {
+    let claims = fetch_profile_claims(relays, keys).await?;
+    Ok(build_identities(keys, &claims).await)
+}
+
+/// Like `lookup_identities`, but a relay failure yields bare identities and
+/// `reached == false` instead of an error.
+async fn lookup_identities_lenient(
+    relays: &[String],
+    keys: &[PublicKey],
+) -> (Vec<PublisherIdentity>, bool) {
+    let claims = fetch_profile_claims(relays, keys).await;
+    let reached = claims.is_ok();
+    let claims = claims.unwrap_or_default();
+    (build_identities(keys, &claims).await, reached)
+}
+
+async fn build_identities(
+    keys: &[PublicKey],
+    claims: &HashMap<String, serde_json::Value>,
+) -> Vec<PublisherIdentity> {
+    futures_util::future::join_all(keys.iter().map(|key| {
+        let hex = key.to_hex();
+        let claim = claims.get(&hex);
+        async move { build_identity(&hex, claim).await }
+    }))
+    .await
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct ProfilesParams {
     #[serde(default)]
@@ -5139,15 +5423,7 @@ async fn daemon_get_publisher_profiles(
     let mut fresh: HashMap<String, PublisherIdentity> = HashMap::new();
     if !missing.is_empty() {
         let relays = normalize_relays(params.relay, &config);
-        let claims = fetch_profile_claims(&relays, &missing).await;
-        let reached = claims.is_ok();
-        let claims = claims.unwrap_or_default();
-        let built = futures_util::future::join_all(missing.iter().map(|key| {
-            let hex = key.to_hex();
-            let claim = claims.get(&hex);
-            async move { build_identity(&hex, claim).await }
-        }))
-        .await;
+        let (built, reached) = lookup_identities_lenient(&relays, &missing).await;
         for identity in built {
             if reached && let Ok(mut cache) = state.identities.lock() {
                 cache.insert(
@@ -6646,6 +6922,10 @@ fn update_config_file(path: &Path, edit: impl FnOnce(&mut toml::Table)) -> Resul
     fs::write(&temporary, rendered).with_context(|| format!("writing {}", temporary.display()))?;
     fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
+}
+
+fn config_modified(path: Option<&Path>) -> Option<std::time::SystemTime> {
+    fs::metadata(path?).and_then(|meta| meta.modified()).ok()
 }
 
 fn config_section<'a>(table: &'a mut toml::Table, name: &str) -> &'a mut toml::Table {
@@ -10231,11 +10511,12 @@ mod tests {
 
         // A config file that does not parse is never overwritten.
         fs::write(&path, "this is = not [valid")?;
+        // A key that is not yet trusted forces a write attempt.
         assert!(
             call_daemon(
                 &state,
                 "AddTrustedPublisher",
-                serde_json::json!({ "publisher": TEST_PUBKEY_HEX }),
+                serde_json::json!({ "publisher": "ee".repeat(32) }),
             )
             .is_err()
         );
@@ -10457,5 +10738,122 @@ mod tests {
         let identity = build_identity(TEST_PUBKEY_HEX, Some(&claims)).await;
         assert_eq!(identity.claimed_name.as_deref(), Some("Linus"));
         assert!(identity.nip05.is_none() && identity.label.is_none());
+    }
+
+    #[test]
+    fn trust_list_helpers_add_and_remove_by_key_regardless_of_spelling() {
+        let npub = display_publisher(TEST_PUBKEY_HEX);
+        assert_eq!(
+            trust_list_with(&[], TEST_PUBKEY_HEX),
+            Some(vec![npub.clone()]),
+            "stored as an npub"
+        );
+        assert_eq!(
+            trust_list_with(std::slice::from_ref(&npub), TEST_PUBKEY_HEX),
+            None
+        );
+        assert_eq!(
+            trust_list_with(&[TEST_PUBKEY_HEX.to_owned()], TEST_PUBKEY_HEX),
+            None,
+            "hex and npub spellings are the same publisher"
+        );
+        assert_eq!(
+            trust_list_without(&[npub, "other".into()], TEST_PUBKEY_HEX),
+            Some(vec!["other".to_owned()])
+        );
+        assert_eq!(trust_list_without(&[], TEST_PUBKEY_HEX), None);
+    }
+
+    #[test]
+    fn trust_edits_on_disk_round_trip_and_keep_other_keys() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("npack/config.toml");
+        assert!(
+            trusted_publishers_at(&path)?.is_empty(),
+            "absent file = nobody"
+        );
+        persist_trust_list(&path, &[display_publisher(TEST_PUBKEY_HEX)])?;
+        assert_eq!(
+            configured_publishers(Vec::new(), &load_config_from(Some(&path))?)?,
+            [TEST_PUBKEY_HEX]
+        );
+        fs::write(
+            &path,
+            format!("[install]\nuser = true\n[trust]\npublishers = [\"{TEST_PUBKEY_HEX}\"]\n"),
+        )?;
+        persist_trust_list(&path, &[])?;
+        let reloaded = load_config_from(Some(&path))?;
+        assert!(reloaded.install.user && reloaded.trust.publishers.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn trust_changes_need_explicit_consent() -> Result<()> {
+        let never = || -> io::Result<String> { panic!("must not prompt") };
+        assert!(confirmation_decision(true, false, never)?, "--yes wins");
+        assert!(
+            confirmation_decision(false, false, never).is_err(),
+            "piped input is never consent"
+        );
+        assert!(confirmation_decision(false, true, || Ok("y\n".into()))?);
+        assert!(confirmation_decision(false, true, || Ok("YES".into()))?);
+        for no in ["", "n", "no", "yep", "sure"] {
+            assert!(
+                !confirmation_decision(false, true, || Ok(no.into()))?,
+                "{no:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_picks_up_trust_edits_made_outside_it_and_does_not_clobber_them() -> Result<()> {
+        let dir = tempdir()?;
+        let (state, path) = state_with_config_file(dir.path());
+        let other = "ee".repeat(32);
+        call_daemon(
+            &state,
+            "AddTrustedPublisher",
+            serde_json::json!({ "publisher": TEST_PUBKEY_HEX }),
+        )?;
+
+        // Simulate `npack trust add` run from a shell while the daemon is up.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut list = trusted_publishers_at(&path)?;
+        list.extend(trust_list_with(&list, &other).unwrap().pop());
+        persist_trust_list(&path, &list)?;
+
+        let seen = call_daemon(&state, "ListTrustedPublishers", serde_json::json!({}))?;
+        assert_eq!(
+            seen.as_array().unwrap().len(),
+            2,
+            "external edit is visible"
+        );
+
+        // A later daemon edit must keep the externally added publisher.
+        call_daemon(
+            &state,
+            "RemoveTrustedPublisher",
+            serde_json::json!({ "publisher": TEST_PUBKEY_HEX }),
+        )?;
+        let remaining = trusted_publishers_at(&path)?;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(normalize_publisher_reference(&remaining[0]), other);
+        Ok(())
+    }
+
+    #[test]
+    fn a_config_file_that_stops_parsing_keeps_the_previous_trust_list() -> Result<()> {
+        let dir = tempdir()?;
+        let (state, path) = state_with_config_file(dir.path());
+        call_daemon(
+            &state,
+            "AddTrustedPublisher",
+            serde_json::json!({ "publisher": TEST_PUBKEY_HEX }),
+        )?;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&path, "[trust\npublishers = broken")?;
+        assert_eq!(state.config().trust.publishers.len(), 1);
+        Ok(())
     }
 }

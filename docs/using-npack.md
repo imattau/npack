@@ -792,6 +792,36 @@ Publisher keys may be written as `npub` values. Internally, npack compares
 canonical hexadecimal public keys so equivalent representations cannot create
 separate identities.
 
+### Managing trusted publishers: `npack trust`
+
+You do not have to edit `config.toml` by hand:
+
+```bash
+npack trust add alice@example.com      # or an npub, or a 64-character hex key
+npack trust list [--names]
+npack trust remove npub1...
+```
+
+`add` shows the resolved key and asks before trusting it. A NIP-05 name such
+as `alice@example.com` only helps you find the key: the name is looked up
+through the domain, the resolved `npub` is displayed for you to check, and the
+`npub` is what is stored. For an `npub` or hex key, `add` also looks up the
+publisher's profile and labels any name it finds as verified (the domain
+confirms the key) or unverified (the profile merely claims it). It will not
+change the list without a confirmation: answer `y` at the prompt, or pass
+`--yes`. When stdin is not a terminal, `--yes` is required, so a script cannot
+trust someone by accident.
+
+`list` is offline by default and prints `npub`s; `--names` looks up each
+publisher's verified name (contacting relays and their domains). `remove`
+accepts a name, `npub` or hex key and fails if that publisher was not trusted.
+Only the `[trust].publishers` list is rewritten: other settings are kept, but
+comments in `config.toml` are not, and a config file that does not parse is
+left untouched.
+
+A running `npackd` notices changes to `config.toml` on its next request, so
+`npack trust` and the GUI's Settings tab stay in step without a restart.
+
 ## Trust and security
 
 Trust publishers explicitly when possible:
@@ -1027,6 +1057,9 @@ npack verify <file.npk-or-manifest.json>
 npack refresh [--relay <url>] [--pubkey <hex>] [--store <path>]
 npack search <query> [--refresh] [--no-cache] [--relay <url>] [--store <path>]
 npack info [<publisher>/]<name> [--trusted-publisher <hex>] [--store <path>]
+npack trust add <name@domain|npub|hex> [--yes] [--relay <url>]
+npack trust remove <name@domain|npub|hex>
+npack trust list [--names] [--relay <url>]
 npack install <publisher>/<name> [options]
 npack install-ref <publisher>/<name> [options]  # compatibility alias
 npack resolve <publisher>/<name> --relay <url> [options]
