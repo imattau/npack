@@ -420,6 +420,33 @@ enum Command {
             help = "Local catalogue directory; defaults to the npack state dir"
         )]
         store: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Only packages listing this category (case-insensitive); see `npack categories`"
+        )]
+        category: Option<String>,
+        #[arg(long, help = "Order results by: name or recent (newest first)")]
+        sort: Option<String>,
+        #[arg(long, help = "Show at most this many results")]
+        limit: Option<usize>,
+    },
+    /// List the software categories in the local catalogue, with how many
+    /// packages are in each.
+    Categories {
+        #[arg(long = "relay", help = "Relay URL to query with --refresh; repeatable")]
+        relays: Vec<String>,
+        #[arg(long, help = "Rebuild the local catalogue from relays now, then list")]
+        refresh: bool,
+        #[arg(
+            long,
+            help = "Include packages built for other operating systems or architectures"
+        )]
+        all_platforms: bool,
+        #[arg(
+            long,
+            help = "Local catalogue directory; defaults to the npack state dir"
+        )]
+        store: Option<PathBuf>,
     },
     /// Rebuild the local package catalogue from Nostr relays, so `search`
     /// and `info` can browse it without a relay round trip on every call.
@@ -1155,11 +1182,20 @@ async fn main() -> Result<()> {
             kind,
             no_cache,
             store,
+            category,
+            sort,
+            limit,
         } => {
             let relays = normalize_relays(relays, &config);
             let trusted_publishers = configured_publishers(trusted_publishers, &config)?;
             let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
             let root = store.unwrap_or_else(default_store);
+            let options = SearchOptions {
+                category,
+                sort: SearchSort::parse(sort.as_deref())?,
+                limit,
+                offset: 0,
+            };
             search_releases(
                 &query,
                 &relays,
@@ -1168,9 +1204,40 @@ async fn main() -> Result<()> {
                 refresh,
                 no_cache,
                 kind.as_deref(),
+                &options,
                 &root,
             )
             .await?
+        }
+        Command::Categories {
+            relays,
+            refresh,
+            all_platforms,
+            store,
+        } => {
+            let relays = normalize_relays(relays, &config);
+            let pubkey = config.identity.pubkey.clone();
+            let root = store.unwrap_or_else(default_store);
+            let mut results = search_matching_releases(
+                "",
+                &relays,
+                &[],
+                pubkey.as_deref(),
+                refresh,
+                false,
+                &root,
+            )
+            .await?;
+            if !all_platforms {
+                results.retain(|result| result.compatible);
+            }
+            let counts = category_counts(&results);
+            if counts.is_empty() {
+                println!("No categories listed in the catalogue.");
+            }
+            for (category, count) in counts {
+                println!("{category} ({count})");
+            }
         }
         Command::Refresh {
             relays,
@@ -4395,6 +4462,12 @@ struct SearchResult {
     /// sanitised; absent when the release published none.
     #[serde(skip_serializing_if = "Option::is_none")]
     app: Option<AppListing>,
+    /// When the release event was published (Unix seconds), for "recently
+    /// updated" views. Publisher-set, so ordering by it is a convenience, not
+    /// a guarantee.
+    published_at: u64,
+    /// Whether this release's os/arch tags fit the machine npack runs on.
+    compatible: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4406,9 +4479,10 @@ async fn search_releases(
     refresh: bool,
     no_cache: bool,
     kind: Option<&str>,
+    options: &SearchOptions,
     root: &Path,
 ) -> Result<()> {
-    for result in search_matching_releases(
+    let matched: Vec<SearchResult> = search_matching_releases(
         query,
         relays,
         trusted_publishers,
@@ -4420,7 +4494,8 @@ async fn search_releases(
     .await?
     .into_iter()
     .filter(|result| kind.is_none_or(|kind| result.kind.as_deref().unwrap_or("package") == kind))
-    {
+    .collect();
+    for result in apply_search_options(matched, options) {
         let mut line = format!(
             "{} {} {}",
             result.release_event_id,
@@ -4555,6 +4630,8 @@ async fn search_matching_releases(
                 fork_of: parse_fork_of(&event).ok().flatten(),
                 app: Some(AppListing::from_app(&app_metadata_from_event(&event)))
                     .filter(|listing| !listing.is_empty()),
+                published_at: event.created_at.as_secs(),
+                compatible: release_matches_target(&event, OS, ARCH),
             });
         }
     }
@@ -4629,6 +4706,10 @@ fn daemon_error_code(message: &str) -> &'static str {
         "download_failed"
     } else if has("installation cancelled") || has("update cancelled") {
         "cancelled"
+    } else if has("no local catalogue found") {
+        "no_catalogue"
+    } else if has("invalid sort") {
+        "invalid_input"
     } else if has("is recorded to roll back to") {
         "no_rollback"
     } else if has("cannot roll back")
@@ -5046,6 +5127,7 @@ async fn dispatch_daemon_request(
         "GetConfig" => daemon_get_config(state),
         "ListTrustedPublishers" => daemon_list_trusted_publishers(state),
         "GetIcon" => daemon_get_icon(request.params).await,
+        "ListCategories" => daemon_list_categories(&state.config(), request.params).await,
         "GetHistory" => daemon_get_history(&state.config(), request.params),
         "ListRollbacks" => daemon_list_rollbacks(&state.config(), request.params),
         "Rollback" => daemon_rollback(&state.config(), request.params),
@@ -6044,8 +6126,111 @@ fn daemon_rollback(config: &Config, params: serde_json::Value) -> Result<serde_j
     }))
 }
 
+/// How to order browse/search results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SearchSort {
+    /// The catalogue's own order (the historical behaviour).
+    #[default]
+    Catalogue,
+    Name,
+    /// Most recently published first.
+    Recent,
+}
+
+impl SearchSort {
+    fn parse(value: Option<&str>) -> Result<Self> {
+        match value {
+            None | Some("") | Some("catalogue") => Ok(Self::Catalogue),
+            Some("name") => Ok(Self::Name),
+            Some("recent") => Ok(Self::Recent),
+            Some(other) => bail!("invalid sort {other}: expected name or recent"),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SearchOptions {
+    /// Case-insensitive; matches any of a release's listed categories.
+    category: Option<String>,
+    sort: SearchSort,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+/// Narrows, orders and pages already-matched results. Pure, so the CLI and
+/// the daemon share one behaviour.
+fn apply_search_options(
+    mut results: Vec<SearchResult>,
+    options: &SearchOptions,
+) -> Vec<SearchResult> {
+    if let Some(wanted) = options.category.as_deref().map(str::to_lowercase) {
+        results.retain(|result| {
+            result.app.as_ref().is_some_and(|app| {
+                app.categories
+                    .iter()
+                    .any(|category| category.to_lowercase() == wanted)
+            })
+        });
+    }
+    match options.sort {
+        SearchSort::Catalogue => {}
+        SearchSort::Name => results.sort_by_key(|r| (r.name.to_lowercase(), r.publisher.clone())),
+        SearchSort::Recent => results.sort_by(|a, b| {
+            b.published_at
+                .cmp(&a.published_at)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        }),
+    }
+    results
+        .into_iter()
+        .skip(options.offset)
+        .take(options.limit.unwrap_or(usize::MAX))
+        .collect()
+}
+
+/// Every listed category with how many distinct packages carry it, most
+/// populous first. Spelling variants ("Utility", "utility") are one category,
+/// shown in its most common spelling (ties go to the capitalised one, since
+/// uppercase sorts first), so the label does not depend on catalogue order.
+fn category_counts(results: &[SearchResult]) -> Vec<(String, usize)> {
+    #[derive(Default)]
+    struct Entry {
+        spellings: HashMap<String, usize>,
+        packages: HashSet<(String, String)>,
+    }
+    let mut seen: HashMap<String, Entry> = HashMap::new();
+    for result in results {
+        for category in result.app.iter().flat_map(|app| &app.categories) {
+            let entry = seen.entry(category.to_lowercase()).or_default();
+            *entry.spellings.entry(category.clone()).or_default() += 1;
+            entry
+                .packages
+                .insert((result.publisher.clone(), result.name.clone()));
+        }
+    }
+    let mut counts: Vec<(String, usize)> = seen
+        .into_values()
+        .filter_map(|entry| {
+            let display = entry
+                .spellings
+                .into_iter()
+                .min_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)))?
+                .0;
+            Some((display, entry.packages.len()))
+        })
+        .collect();
+    counts.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+    });
+    counts
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct SearchParams {
+    /// Empty (or omitted) matches everything, which is how a browse view
+    /// lists the whole catalogue.
+    #[serde(default)]
     query: String,
     #[serde(default)]
     relay: Vec<String>,
@@ -6064,19 +6249,44 @@ struct SearchParams {
     /// it the configured list filters results exactly as the CLI does.
     #[serde(default)]
     include_untrusted: bool,
+    /// Only packages listing this category (case-insensitive).
+    #[serde(default)]
+    category: Option<String>,
+    /// `name` or `recent`; omitted keeps the catalogue order.
+    #[serde(default)]
+    sort: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: usize,
+    /// Only publishers in the daemon's trust list (an empty list trusts no
+    /// one here, matching the `trust` field).
+    #[serde(default)]
+    only_trusted: bool,
+    /// Only releases whose os/arch fit this machine.
+    #[serde(default)]
+    host_only: bool,
 }
 
-async fn daemon_search(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
-    let params: SearchParams = serde_json::from_value(params).context("invalid Search params")?;
-    let relays = normalize_relays(params.relay, config);
+/// Runs the catalogue search and the trust/host filters. Category, order and
+/// paging are applied afterwards by the caller, so a category list can be built
+/// from the same set the browse view draws from.
+async fn daemon_search_results(
+    config: &Config,
+    params: &SearchParams,
+) -> Result<Vec<SearchResult>> {
+    let relays = normalize_relays(params.relay.clone(), config);
     let trusted_publishers = if params.include_untrusted {
         Vec::new()
     } else {
-        configured_publishers(params.trusted_publisher, config)?
+        configured_publishers(params.trusted_publisher.clone(), config)?
     };
-    let pubkey = params.pubkey.or_else(|| config.identity.pubkey.clone());
-    let root = params.store.unwrap_or_else(default_store);
-    let results = search_matching_releases(
+    let pubkey = params
+        .pubkey
+        .clone()
+        .or_else(|| config.identity.pubkey.clone());
+    let root = params.store.clone().unwrap_or_else(default_store);
+    let mut results = search_matching_releases(
         &params.query,
         &relays,
         &trusted_publishers,
@@ -6086,6 +6296,24 @@ async fn daemon_search(config: &Config, params: serde_json::Value) -> Result<ser
         &root,
     )
     .await?;
+    if params.only_trusted {
+        results.retain(|result| trust_status(config, &result.publisher) == "trusted");
+    }
+    if params.host_only {
+        results.retain(|result| result.compatible);
+    }
+    Ok(results)
+}
+
+async fn daemon_search(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
+    let params: SearchParams = serde_json::from_value(params).context("invalid Search params")?;
+    let options = SearchOptions {
+        category: params.category.clone(),
+        sort: SearchSort::parse(params.sort.as_deref())?,
+        limit: params.limit,
+        offset: params.offset,
+    };
+    let results = apply_search_options(daemon_search_results(config, &params).await?, &options);
     let mut value = serde_json::to_value(results)?;
     for item in value.as_array_mut().into_iter().flatten() {
         let status = item
@@ -6104,6 +6332,24 @@ async fn daemon_search(config: &Config, params: serde_json::Value) -> Result<ser
         }
     }
     Ok(value)
+}
+
+/// `ListCategories`: the categories present in the catalogue, with how many
+/// packages carry each. Takes the same filters as `Search` (trust, host,
+/// refresh), so counts match what a browse view would then show.
+async fn daemon_list_categories(
+    config: &Config,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: SearchParams =
+        serde_json::from_value(params).context("invalid ListCategories params")?;
+    let results = daemon_search_results(config, &params).await?;
+    Ok(serde_json::Value::Array(
+        category_counts(&results)
+            .into_iter()
+            .map(|(category, count)| serde_json::json!({ "category": category, "count": count }))
+            .collect(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -13065,5 +13311,232 @@ mod tests {
         assert_eq!(format_utc(1_700_000_000), "2023-11-14 22:13");
         assert_eq!(format_utc(951_782_400), "2000-02-29 00:00");
         Ok(())
+    }
+
+    fn browse_release(
+        keys: &Keys,
+        name: &str,
+        categories: &[&str],
+        created_at: u64,
+        os: &str,
+    ) -> Result<Event> {
+        let mut manifest = sample_manifest_with_app(AppMetadata {
+            summary: Some(format!("{name} summary")),
+            categories: categories.iter().map(|c| (*c).to_owned()).collect(),
+            ..AppMetadata::default()
+        });
+        manifest.publisher = keys.public_key().to_hex();
+        manifest.name = name.into();
+        manifest.sha256 = "ab".repeat(32);
+        manifest.artifact_event = Some("11".repeat(32));
+        manifest.os = os.into();
+        sign_release_event(&manifest, &keys.secret_key().to_secret_hex(), created_at)
+    }
+
+    fn browse_catalogue(dir: &Path) -> Result<(Keys, Keys)> {
+        let (alice, bob) = (Keys::generate(), Keys::generate());
+        let releases = vec![
+            browse_release(&alice, "zebra", &["Utility", "Games"], 300, "any")?,
+            browse_release(&alice, "apple", &["utility"], 100, "any")?,
+            browse_release(&bob, "mango", &["Games"], 200, "any")?,
+            browse_release(&bob, "winonly", &["Utility"], 400, "plan9")?,
+            browse_release(&bob, "nolisting", &[], 500, "any")?,
+        ];
+        save_catalogue(
+            dir,
+            &Catalogue {
+                created_at: 1,
+                releases,
+                revocations: vec![],
+            },
+        )?;
+        Ok((alice, bob))
+    }
+
+    fn names(value: &serde_json::Value) -> Vec<String> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["name"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn browse_filters_by_category_case_insensitively_orders_and_pages() -> Result<()> {
+        let dir = tempdir()?;
+        browse_catalogue(dir.path())?;
+        let state = Arc::new(DaemonState::with_config_path(
+            Config::default(),
+            DaemonRole::User,
+            None,
+        ));
+        let search = |extra: serde_json::Value| -> Result<serde_json::Value> {
+            let mut params = serde_json::json!({
+                "query": "", "store": dir.path(), "include_untrusted": true, "host_only": true
+            });
+            params
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            call_daemon(&state, "Search", params)
+        };
+
+        // An empty query lists everything installable on this host.
+        let mut all = names(&search(serde_json::json!({}))?);
+        all.sort();
+        assert_eq!(
+            all,
+            ["apple", "mango", "nolisting", "zebra"],
+            "winonly is for another OS"
+        );
+
+        let utility = search(serde_json::json!({"category": "UTILITY", "sort": "name"}))?;
+        assert_eq!(
+            names(&utility),
+            ["apple", "zebra"],
+            "spelling variants are one category"
+        );
+        assert_eq!(utility[0]["app"]["summary"], "apple summary");
+
+        let recent = search(serde_json::json!({"sort": "recent"}))?;
+        assert_eq!(names(&recent), ["nolisting", "zebra", "mango", "apple"]);
+
+        let page = search(serde_json::json!({"sort": "recent", "limit": 2, "offset": 1}))?;
+        assert_eq!(names(&page), ["zebra", "mango"]);
+        assert!(names(&search(serde_json::json!({"category": "nothing"}))?).is_empty());
+
+        // Not filtering by host shows the other-OS release, flagged as such.
+        let everything = search(serde_json::json!({"host_only": false, "sort": "name"}))?;
+        let winonly = everything
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "winonly")
+            .unwrap();
+        assert_eq!(winonly["compatible"], false);
+        assert!(winonly["published_at"].as_u64().unwrap() == 400);
+
+        let error = search(serde_json::json!({"sort": "sideways"})).unwrap_err();
+        assert_eq!(daemon_error_code(&error.to_string()), "invalid_input");
+        Ok(())
+    }
+
+    #[test]
+    fn only_trusted_uses_the_daemons_trust_list() -> Result<()> {
+        let dir = tempdir()?;
+        let (alice, _) = browse_catalogue(dir.path())?;
+        let mut config = Config::default();
+        config.trust.publishers = vec![alice.public_key().to_hex()];
+        let state = Arc::new(DaemonState::with_config_path(
+            config,
+            DaemonRole::User,
+            None,
+        ));
+        let mut trusted = names(&call_daemon(
+            &state,
+            "Search",
+            serde_json::json!({"store": dir.path(), "include_untrusted": true, "only_trusted": true}),
+        )?);
+        trusted.sort();
+        assert_eq!(trusted, ["apple", "zebra"]);
+
+        // With nobody trusted yet, "only trusted" shows nothing rather than everything.
+        let empty = Arc::new(DaemonState::with_config_path(
+            Config::default(),
+            DaemonRole::User,
+            None,
+        ));
+        assert!(names(&call_daemon(
+            &empty,
+            "Search",
+            serde_json::json!({"store": dir.path(), "include_untrusted": true, "only_trusted": true}),
+        )?)
+        .is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn list_categories_counts_distinct_packages_most_populous_first() -> Result<()> {
+        let dir = tempdir()?;
+        browse_catalogue(dir.path())?;
+        let state = Arc::new(DaemonState::with_config_path(
+            Config::default(),
+            DaemonRole::User,
+            None,
+        ));
+        let categories = call_daemon(
+            &state,
+            "ListCategories",
+            serde_json::json!({"store": dir.path(), "include_untrusted": true, "host_only": true}),
+        )?;
+        let pairs: Vec<(String, u64)> = categories
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["category"].as_str().unwrap().to_owned(),
+                    c["count"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        // Utility: zebra + apple (winonly is another OS). Games: zebra + mango.
+        assert_eq!(pairs, [("Games".to_owned(), 2), ("Utility".to_owned(), 2)]);
+        Ok(())
+    }
+
+    #[test]
+    fn browsing_without_a_catalogue_has_its_own_error_code() {
+        let dir = tempdir().unwrap();
+        let state = Arc::new(DaemonState::with_config_path(
+            Config::default(),
+            DaemonRole::User,
+            None,
+        ));
+        for method in ["Search", "ListCategories"] {
+            let error =
+                call_daemon(&state, method, serde_json::json!({"store": dir.path()})).unwrap_err();
+            assert_eq!(
+                daemon_error_code(&error.to_string()),
+                "no_catalogue",
+                "{method}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn category_counts_ignore_releases_without_a_listing() {
+        let result = |name: &str, categories: &[&str]| SearchResult {
+            release_event_id: String::new(),
+            publisher: "p".into(),
+            name: name.into(),
+            version: "1.0.0".into(),
+            content: String::new(),
+            kind: None,
+            fork_of: None,
+            app: (!categories.is_empty()).then(|| AppListing {
+                categories: categories.iter().map(|c| (*c).to_owned()).collect(),
+                ..AppListing::default()
+            }),
+            published_at: 0,
+            compatible: true,
+        };
+        let counts = category_counts(&[
+            result("a", &["Tools"]),
+            result("a", &["Tools"]),
+            result("b", &[]),
+            result("c", &["tools", "Web"]),
+        ]);
+        assert_eq!(
+            counts,
+            [("Tools".to_owned(), 2), ("Web".to_owned(), 1)],
+            "same package twice counts once"
+        );
+        // A tie between spellings is broken the same way whatever the order.
+        let tie_a = category_counts(&[result("a", &["utility"]), result("b", &["Utility"])]);
+        let tie_b = category_counts(&[result("b", &["Utility"]), result("a", &["utility"])]);
+        assert_eq!(tie_a, [("Utility".to_owned(), 2)]);
+        assert_eq!(tie_a, tie_b);
     }
 }

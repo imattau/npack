@@ -312,9 +312,11 @@ when an installed package has been revoked; the GUI checks at start, with update
 buttons and a revocation warning. `npack history` and `npack rollback` (also in the
 daemon and GUI) record every change and let a package be switched back to the
 version it replaced, offline, after re-verifying the stored archive and the
-cached signed metadata. Still to do: category filters and
-browse/"recently updated" views, and screenshots (which need a
-privacy-preserving way to fetch them).
+cached signed metadata. The GUI now has a Browse tab with category filters,
+a "recently updated" view, a trusted-publishers-only filter and paging, and the
+CLI has `npack categories` and `search --category/--sort/--limit`. Still to do:
+curated "featured" lists (there is no curation source yet), and screenshots
+(which need a privacy-preserving way to fetch them).
 
 ## Phase 6: COSMIC Store integration
 

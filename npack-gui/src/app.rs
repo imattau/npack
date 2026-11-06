@@ -15,9 +15,61 @@ use crate::{client::DaemonClient, friendly::UiError};
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Installed,
-    Search,
+    Browse,
     Updates,
     Settings,
+}
+
+const BROWSE_PAGE: usize = 48;
+
+/// Everything that shapes one browse request.
+struct BrowseQuery {
+    query: String,
+    relays: Vec<String>,
+    category: Option<String>,
+    sort: &'static str,
+    limit: usize,
+    only_trusted: bool,
+    refresh: bool,
+}
+
+/// The `Search` params and the filter-only params for `ListCategories` (the
+/// category list must not shrink to the selected category, or the sidebar
+/// would collapse to one entry).
+fn browse_requests(browse: &BrowseQuery) -> (Value, Value) {
+    // Show publishers outside the trust list too (marked "unknown") so
+    // installing from one can ask first; only releases that fit this machine
+    // are worth listing.
+    let filters = serde_json::json!({
+        "relay": browse.relays,
+        "include_untrusted": true,
+        "only_trusted": browse.only_trusted,
+        "host_only": true,
+    });
+    let mut search = filters.clone();
+    search["query"] = browse.query.clone().into();
+    search["refresh"] = browse.refresh.into();
+    search["sort"] = browse.sort.into();
+    search["limit"] = browse.limit.into();
+    if let Some(category) = &browse.category {
+        search["category"] = category.clone().into();
+    }
+    (search, filters)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrowseSort {
+    Recent,
+    Name,
+}
+
+impl BrowseSort {
+    fn as_param(self) -> &'static str {
+        match self {
+            Self::Recent => "recent",
+            Self::Name => "name",
+        }
+    }
 }
 
 /// One background result delivered back into the UI thread. Every network
@@ -33,6 +85,8 @@ enum Event {
     Config(Result<Value, UiError>),
     /// Extra package details for the "unknown publisher" dialog.
     InstallPreview(Result<Value, UiError>),
+    /// `ListCategories`: [{category, count}] for the sidebar.
+    Categories(Result<Vec<Value>, UiError>),
     /// `ListRollbacks`: packages that can be switched back, and to what.
     Rollbacks(Result<Vec<Value>, UiError>),
     /// `GetHistory`: recent changes to installed packages, newest first.
@@ -85,8 +139,18 @@ pub struct NpackGuiApp {
     installed: Vec<Value>,
     search_query: String,
     search_relays: String,
-    search_rebuild_catalogue: bool,
     search_results: Vec<Value>,
+    /// Categories present in the catalogue, most populous first.
+    categories: Vec<(String, u64)>,
+    selected_category: Option<String>,
+    browse_sort: BrowseSort,
+    only_trusted: bool,
+    /// How many results to ask for; "Show more" raises it.
+    browse_limit: usize,
+    /// The catalogue was fetched automatically after finding none, or the
+    /// first browse was started; each happens at most once.
+    auto_refreshed: bool,
+    auto_browsed: bool,
     updates: Vec<Value>,
 
     details: Option<Value>,
@@ -130,8 +194,14 @@ impl NpackGuiApp {
             installed: Vec::new(),
             search_query: String::new(),
             search_relays: String::new(),
-            search_rebuild_catalogue: false,
             search_results: Vec::new(),
+            categories: Vec::new(),
+            selected_category: None,
+            browse_sort: BrowseSort::Recent,
+            only_trusted: false,
+            browse_limit: BROWSE_PAGE,
+            auto_refreshed: false,
+            auto_browsed: false,
             updates: Vec::new(),
             details: None,
             status: "Not connected yet -- pick a tab to load data.".to_owned(),
@@ -362,8 +432,14 @@ impl NpackGuiApp {
         });
     }
 
-    fn run_search(&self) {
-        let query = self.search_query.clone();
+    /// Lists the catalogue with the current query, category, sort and filters
+    /// (an empty query browses everything), then refreshes the category list.
+    /// With `refresh`, the catalogue is rebuilt from the relays first.
+    fn browse(&mut self, refresh: bool) {
+        if refresh {
+            self.status = "Fetching the software catalogue...".to_owned();
+        }
+        let query = self.search_query.trim().to_owned();
         let relays: Vec<String> = self
             .search_relays
             .split(',')
@@ -371,21 +447,36 @@ impl NpackGuiApp {
             .filter(|relay| !relay.is_empty())
             .map(str::to_owned)
             .collect();
-        let rebuild = self.search_rebuild_catalogue;
-        self.spawn(move |client| {
-            let params = serde_json::json!({
-                "query": query,
-                "relay": relays,
-                "refresh": rebuild,
-                // Show publishers outside the trust list too (marked
-                // "unknown") so installing from one can ask first.
-                "include_untrusted": true,
+        let category = self.selected_category.clone();
+        let sort = self.browse_sort.as_param();
+        let limit = self.browse_limit;
+        let only_trusted = self.only_trusted;
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let (search, filters) = browse_requests(&BrowseQuery {
+                query,
+                relays,
+                category,
+                sort,
+                limit,
+                only_trusted,
+                refresh,
             });
             let result = client
-                .call("Search", params)
+                .call("Search", search)
                 .map(|value| value.as_array().cloned().unwrap_or_default())
                 .map_err(|error| UiError::from_anyhow(&error));
-            Event::Search(result)
+            let succeeded = result.is_ok();
+            let _ = tx.send(Event::Search(result));
+            if succeeded {
+                let _ = tx.send(Event::Categories(
+                    client
+                        .call("ListCategories", filters)
+                        .map(|value| value.as_array().cloned().unwrap_or_default())
+                        .map_err(|error| UiError::from_anyhow(&error)),
+                ));
+            }
         });
     }
 
@@ -614,7 +705,30 @@ impl NpackGuiApp {
                     self.search_results = items;
                     self.request_profiles(publishers);
                 }
-                Event::Search(Err(error)) => self.fail("Search", error),
+                Event::Search(Err(error)) => {
+                    if error.code.as_deref() == Some("no_catalogue") && !self.auto_refreshed {
+                        // First time here: there is nothing to browse until
+                        // the catalogue has been downloaded, so do that now
+                        // instead of showing an error.
+                        self.auto_refreshed = true;
+                        self.browse(true);
+                    } else {
+                        self.fail("Browsing", error);
+                    }
+                }
+                Event::Categories(Ok(items)) => {
+                    self.categories = items
+                        .iter()
+                        .map(|item| {
+                            (
+                                value_str(item, "category"),
+                                item.get("count").and_then(Value::as_u64).unwrap_or(0),
+                            )
+                        })
+                        .collect();
+                }
+                // The sidebar is a convenience; results still show without it.
+                Event::Categories(Err(_)) => {}
                 Event::Updates(Ok(items)) => {
                     self.status = format!("Checked {} installed package(s).", items.len());
                     self.updates = items;
@@ -658,6 +772,10 @@ impl NpackGuiApp {
                     if !first_run && !self.auto_checked {
                         self.auto_checked = true;
                         self.refresh_updates();
+                    }
+                    if !first_run && !self.auto_browsed {
+                        self.auto_browsed = true;
+                        self.browse(false);
                     }
                 }
                 Event::Config(Err(error)) => self.fail("Updating settings", error),
@@ -1004,7 +1122,7 @@ impl eframe::App for NpackGuiApp {
             }
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Installed, "Installed");
-                ui.selectable_value(&mut self.tab, Tab::Search, "Search");
+                ui.selectable_value(&mut self.tab, Tab::Browse, "Browse");
                 let updates_label = match update_counts(&self.updates).0 {
                     0 => "Updates".to_owned(),
                     count => format!("Updates ({count})"),
@@ -1016,7 +1134,7 @@ impl eframe::App for NpackGuiApp {
 
             match self.tab {
                 Tab::Installed => self.show_installed_tab(ui),
-                Tab::Search => self.show_search_tab(ui),
+                Tab::Browse => self.show_browse_tab(ui),
                 Tab::Updates => self.show_updates_tab(ui),
                 Tab::Settings => self.show_settings_tab(ui),
             }
@@ -1337,62 +1455,165 @@ impl NpackGuiApp {
         }
     }
 
-    fn show_search_tab(&mut self, ui: &mut egui::Ui) {
+    fn show_browse_tab(&mut self, ui: &mut egui::Ui) {
+        let mut rerun = false;
+        let mut refresh = false;
         ui.horizontal(|ui| {
-            ui.label("Query:");
-            ui.text_edit_singleline(&mut self.search_query);
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.search_query)
+                    .hint_text("Search by name, summary or category"),
+            );
+            let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui.button("Search").clicked() || enter {
+                self.browse_limit = BROWSE_PAGE;
+                rerun = true;
+            }
+            if ui
+                .button("Refresh catalogue")
+                .on_hover_text("Download the latest list of software from the relays")
+                .clicked()
+            {
+                refresh = true;
+            }
         });
         ui.horizontal(|ui| {
-            ui.label("Relays (comma-separated):");
-            ui.text_edit_singleline(&mut self.search_relays);
+            ui.label("Sort:");
+            let before = (self.browse_sort, self.only_trusted);
+            ui.selectable_value(
+                &mut self.browse_sort,
+                BrowseSort::Recent,
+                "Recently updated",
+            );
+            ui.selectable_value(&mut self.browse_sort, BrowseSort::Name, "Name");
+            ui.separator();
+            ui.checkbox(&mut self.only_trusted, "Only publishers I trust");
+            if before != (self.browse_sort, self.only_trusted) {
+                self.browse_limit = BROWSE_PAGE;
+                rerun = true;
+            }
         });
-        ui.checkbox(
-            &mut self.search_rebuild_catalogue,
-            "Rebuild local catalogue from relays first (npack refresh)",
-        );
-        if ui.button("Search").clicked() {
-            self.run_search();
-        }
+        ui.collapsing("Relays", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Comma-separated; blank uses your settings:");
+                ui.text_edit_singleline(&mut self.search_relays);
+            });
+        });
         ui.separator();
+
+        let mut picked_category: Option<Option<String>> = None;
         let mut to_install = None;
         let mut to_show = None;
-        for item in &self.search_results {
-            let reference = package_reference(item);
-            ui.horizontal(|ui| {
-                match self.icon_image(item) {
-                    Some(icon) => {
-                        ui.add(icon);
-                    }
-                    None => {
-                        ui.allocate_space(egui::vec2(ICON_SIZE, ICON_SIZE));
-                    }
-                }
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.strong(value_str(item, "name"));
-                        ui.label(value_str(item, "version"));
-                        trust_badge(ui, item.get("trust").and_then(Value::as_str));
-                        ui.weak(self.publisher_text(
-                            &value_str(item, "publisher"),
-                            &display_publisher(item),
-                        ));
-                        if ui.button("Details").clicked() {
-                            to_show = Some(reference.clone());
+        let mut show_more = false;
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(180.0, ui.available_height()),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.strong("Categories");
+                    egui::ScrollArea::vertical()
+                        .id_salt("categories")
+                        .show(ui, |ui| {
+                            if ui
+                                .selectable_label(self.selected_category.is_none(), "All")
+                                .clicked()
+                            {
+                                picked_category = Some(None);
+                            }
+                            for (category, count) in &self.categories {
+                                let selected = self
+                                    .selected_category
+                                    .as_deref()
+                                    .is_some_and(|chosen| chosen.eq_ignore_ascii_case(category));
+                                if ui
+                                    .selectable_label(selected, format!("{category} ({count})"))
+                                    .clicked()
+                                {
+                                    picked_category = Some(Some(category.clone()));
+                                }
+                            }
+                            if self.categories.is_empty() {
+                                ui.weak("None yet");
+                            }
+                        });
+                },
+            );
+            ui.separator();
+            ui.vertical(|ui| {
+                let heading = match (&self.selected_category, self.search_query.trim()) {
+                    (Some(category), "") => category.to_string(),
+                    (Some(category), query) => format!("{category}: “{query}”"),
+                    (None, "") => "All software".to_owned(),
+                    (None, query) => format!("Results for “{query}”"),
+                };
+                ui.heading(heading);
+                ui.weak(format!("{} shown", self.search_results.len()));
+                egui::ScrollArea::vertical()
+                    .id_salt("results")
+                    .show(ui, |ui| {
+                        if self.search_results.is_empty() {
+                            ui.weak("Nothing to show. Try another search, or Refresh catalogue.");
                         }
-                        if ui.button("Install").clicked() {
-                            to_install = Some(item.clone());
+                        for item in &self.search_results {
+                            let reference = package_reference(item);
+                            ui.horizontal(|ui| {
+                                match self.icon_image(item) {
+                                    Some(icon) => {
+                                        ui.add(icon);
+                                    }
+                                    None => {
+                                        ui.allocate_space(egui::vec2(ICON_SIZE, ICON_SIZE));
+                                    }
+                                }
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.strong(value_str(item, "name"));
+                                        ui.label(value_str(item, "version"));
+                                        trust_badge(ui, item.get("trust").and_then(Value::as_str));
+                                        ui.weak(self.publisher_text(
+                                            &value_str(item, "publisher"),
+                                            &display_publisher(item),
+                                        ));
+                                        if ui.button("Details").clicked() {
+                                            to_show = Some(reference.clone());
+                                        }
+                                        if ui.button("Install").clicked() {
+                                            to_install = Some(item.clone());
+                                        }
+                                    });
+                                    if let Some(summary) = app_text(item, "summary") {
+                                        ui.label(summary);
+                                    }
+                                    let categories = app_categories(item);
+                                    if !categories.is_empty() {
+                                        ui.weak(categories.join(" · "));
+                                    }
+                                });
+                            });
+                            ui.add_space(4.0);
+                        }
+                        if self.search_results.len() >= self.browse_limit
+                            && ui.button("Show more").clicked()
+                        {
+                            show_more = true;
                         }
                     });
-                    if let Some(summary) = app_text(item, "summary") {
-                        ui.label(summary);
-                    }
-                    let categories = app_categories(item);
-                    if !categories.is_empty() {
-                        ui.weak(categories.join(" · "));
-                    }
-                });
             });
-            ui.add_space(4.0);
+        });
+
+        if let Some(choice) = picked_category {
+            self.selected_category = choice;
+            self.browse_limit = BROWSE_PAGE;
+            rerun = true;
+        }
+        if show_more {
+            self.browse_limit += BROWSE_PAGE;
+            rerun = true;
+        }
+        if refresh {
+            self.auto_refreshed = true;
+            self.browse(true);
+        } else if rerun {
+            self.browse(false);
         }
         if let Some(reference) = to_show {
             self.show_details(&reference);
@@ -1580,6 +1801,50 @@ mod tests {
         );
         let removal = serde_json::json!({"at": 0, "action": "remove", "reference": "npub1x/app", "from": {"version": "1.0.0"}});
         assert!(history_line(&removal, 0).ends_with("removed npub1x/app 1.0.0"));
+    }
+
+    #[test]
+    fn browse_requests_filter_results_but_not_the_category_list() {
+        let (search, categories) = browse_requests(&BrowseQuery {
+            query: "edit".into(),
+            relays: vec!["wss://r.example".into()],
+            category: Some("Utility".into()),
+            sort: BrowseSort::Recent.as_param(),
+            limit: 48,
+            only_trusted: true,
+            refresh: false,
+        });
+        assert_eq!(search["query"], "edit");
+        assert_eq!(search["category"], "Utility");
+        assert_eq!(search["sort"], "recent");
+        assert_eq!(search["limit"], 48);
+        assert_eq!(search["host_only"], true);
+        assert_eq!(search["include_untrusted"], true);
+        assert_eq!(search["only_trusted"], true);
+        assert_eq!(search["refresh"], false);
+        // Counts cover the whole catalogue, under the same trust/host filters.
+        assert!(categories.get("category").is_none() && categories.get("limit").is_none());
+        assert_eq!(categories["only_trusted"], true);
+        assert_eq!(categories["host_only"], true);
+
+        let (everything, _) = browse_requests(&BrowseQuery {
+            query: String::new(),
+            relays: vec![],
+            category: None,
+            sort: BrowseSort::Name.as_param(),
+            limit: 48,
+            only_trusted: false,
+            refresh: true,
+        });
+        assert!(everything.get("category").is_none());
+        assert_eq!(
+            (
+                everything["query"].as_str(),
+                everything["refresh"].as_bool()
+            ),
+            (Some(""), Some(true))
+        );
+        assert_eq!(everything["sort"], "name");
     }
 
     #[test]

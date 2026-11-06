@@ -85,6 +85,9 @@ impl UiError {
             Some("unknown_method") => {
                 "This app is newer than the npack background service. Update npack and restart the service."
             }
+            Some("no_catalogue") => {
+                "The software catalogue hasn't been downloaded yet. Press “Refresh catalogue” to fetch it."
+            }
             Some("no_rollback") => "There's no earlier version of this package to switch back to.",
             Some("rollback_blocked") => {
                 "Couldn't switch back safely. The saved copy is missing or has changed, or something installed needs the newer version. Nothing was changed."
@@ -134,6 +137,15 @@ mod tests {
         assert_eq!(error.code.as_deref(), Some("daemon_unreachable"));
         assert!(error.headline().contains("isn't running"));
         assert!(!error.suggests_settings());
+    }
+
+    #[test]
+    fn a_missing_catalogue_points_at_refreshing_it() {
+        let error = UiError {
+            code: Some("no_catalogue".into()),
+            detail: "no local catalogue found".into(),
+        };
+        assert!(error.headline().contains("Refresh catalogue"));
     }
 
     #[test]

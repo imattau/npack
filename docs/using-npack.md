@@ -336,6 +336,25 @@ npack search myapp --relay wss://relay.example --no-cache  # query relays live f
 If no catalogue exists yet, plain `npack search` fails with a message
 pointing at `npack refresh` rather than silently querying relays.
 
+#### Browsing by category
+
+Releases that publish a store listing can be browsed by category:
+
+```bash
+npack categories                                  # "Utility (12)", most populous first
+npack search "" --category utility --sort name    # an empty query matches everything
+npack search "" --sort recent --limit 20          # newest releases first
+```
+
+`npack categories` lists the categories in the catalogue with the number of
+packages in each, counting only releases that fit this machine (add
+`--all-platforms` to include the rest). Category names are matched without
+regard to case, and spelling variants are one category, shown in their most
+common spelling. `--sort recent` orders by when the release event was
+published, which the publisher sets, so treat it as a convenience rather than
+a guarantee. Search also matches a query against each package's summary and
+categories, not just its name.
+
 Install a publisher-qualified package:
 
 ```bash
@@ -643,7 +662,8 @@ Supported methods, mirroring the CLI operations above:
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `Search` | `query`, `relay[]`, `trusted_publisher[]`, `pubkey`, `refresh`, `no_cache`, `include_untrusted` | Array of matching releases, each with `trust` (`"trusted"` or `"unknown"`) and `npub`. With `include_untrusted` the trust list does not filter results. |
+| `Search` | `query` (empty matches everything), `relay[]`, `trusted_publisher[]`, `pubkey`, `refresh`, `no_cache`, `include_untrusted`, `category`, `sort` (`name` or `recent`), `limit`, `offset`, `only_trusted`, `host_only` | Array of matching releases, each with `trust` (`"trusted"` or `"unknown"`), `npub`, `published_at` and `compatible` (whether its os/arch fit this machine). With `include_untrusted` the trust list does not filter results. `only_trusted` keeps only publishers in the daemon's trust list (an empty list trusts no one); `host_only` keeps only compatible releases; `category` is case-insensitive. Filters apply before `sort`, `offset` and `limit`. |
+| `ListCategories` | the same filters as `Search` (`category`, `sort`, `limit` and `offset` are ignored) | Array of `{category, count}`, most populous first, over the same set a browse view draws from. |
 | `GetPackage` | `package`, `relay[]`, `requirement`, `os`, `arch`, `trusted_publisher[]`, `store`, `user`, `include_untrusted` | The same resolved-metadata object as `npack resolve`, plus `trust` and `npub`; `verification.publisher_trusted` reflects the trust list even when it is empty. |
 | `ListInstalled` | `user`, `store` | Array of installed packages. |
 | `Install` | `package`, `requirement`, `relay[]`, `server[]`, `user`, `store`, `allow_capability[]`, `trust_once[]`, `install_values{}`, `async` | The installed package's record, or `{"transaction_id": N}` if `async` is true. `install_values` is a per-install object keyed by descriptor id. |
@@ -680,7 +700,7 @@ category a frontend can map to its own wording: `unknown_method`,
 `invalid_params`, `invalid_request`, `invalid_input` (a value such as a
 publisher key or relay URL was rejected), `nip05_failed`, `not_authorized`, `no_relays`,
 `no_blossom_servers`, `relay_unreachable`, `store_busy`, `publisher_untrusted`,
-`download_failed`, `cancelled`, `not_found`, `no_icon`, `no_rollback`, `rollback_blocked`, and `internal` for anything else.
+`download_failed`, `cancelled`, `no_catalogue` (nothing to browse until the catalogue has been fetched: call `Search` with `refresh`), `not_found`, `no_icon`, `no_rollback`, `rollback_blocked`, and `internal` for anything else.
 A `failed` `GetTransaction` status carries `error_code` the same way. The
 field is additive; older daemons omit it.
 
@@ -1142,7 +1162,8 @@ npack manifest <file.npk> --output <manifest.json>
 npack install <file.npk> [--user|--system|--store <path>]
 npack verify <file.npk-or-manifest.json>
 npack refresh [--relay <url>] [--pubkey <hex>] [--store <path>]
-npack search <query> [--refresh] [--no-cache] [--relay <url>] [--store <path>]
+npack search <query> [--refresh] [--no-cache] [--relay <url>] [--category <name>] [--sort name|recent] [--limit <n>] [--store <path>]
+npack categories [--refresh] [--all-platforms] [--relay <url>] [--store <path>]
 npack info [<publisher>/]<name> [--trusted-publisher <hex>] [--store <path>]
 npack trust add <name@domain|npub|hex> [--yes] [--relay <url>]
 npack trust remove <name@domain|npub|hex>
