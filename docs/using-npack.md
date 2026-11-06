@@ -428,9 +428,9 @@ myapp
     1.1.0 linux/x86_64 895abc98... [REVOKED]
 ```
 
-AppStream-style fields (summary, description, homepage, ...) are not shown:
-release events don't currently carry Phase 1's `app` manifest metadata onto
-Nostr tags, so there is nothing for the catalogue to have captured yet.
+`npack info` does not print store-listing fields. They are published as release
+tags (see [the protocol](package-protocol-v1.md)) and returned by the daemon's
+`Search` and `GetPackage`; `npack search` also matches them.
 
 ## Resolving release metadata for other package managers
 
@@ -623,6 +623,13 @@ Supported methods, mirroring the CLI operations above:
 | `GetPublisherProfiles` | `publishers[]` (hex or npub), `relay[]`, `refresh` | One identity per input, in order. Best effort: unreachable relays or domains give a bare identity, not an error. Cached for an hour (successful lookups only). |
 | `RemoveTrustedPublisher` | `publisher` | `{removed, publisher}`. |
 | `SaveConfig` | `relays[]`, `blossom[]` (both optional) | The new `GetConfig` result. Omitted fields keep their effective value (so `{}` saves the built-in defaults and ends first run); an empty list reverts that setting to the built-in defaults. Relays must be `ws://`/`wss://`, servers `http://`/`https://`. |
+
+`Search` results and `GetPackage` include an `app` object when the release
+published a store listing: `summary`, `description`, `homepage`, `license`,
+`categories[]`, `screenshots[]`, `release_date`, and `icon {url, sha256}`. It has
+been cleaned and bounded by npack, but it is still publisher-supplied text:
+show it as text, and do not fetch `screenshots` or `homepage` without a user
+action. `Search` also matches a query against the summary and categories.
 
 An unknown method or a request that fails to deserialize its params returns
 `{"id": ..., "error": "...", "error_code": "..."}` instead of `result`. Each

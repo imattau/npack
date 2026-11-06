@@ -830,6 +830,11 @@ struct AppMetadata {
     screenshots: Vec<String>,
     #[serde(default)]
     desktop_file: Option<PathBuf>,
+    /// Where the icon was published as a stand-alone Blossom blob, so a store
+    /// can show it before the package is downloaded. Set by `npack publish`
+    /// (and read back from the release event); never written by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    icon_blob: Option<IconBlob>,
     /// RFC 3339 date this version was released, e.g. "2026-01-15". Optional
     /// because a bare .npk built with `pack` has no release timestamp of its
     /// own; set by publishers who want a `<releases>` entry in the generated
@@ -884,6 +889,9 @@ struct ResolvedRelease {
     install_inputs: Vec<InstallInput>,
     release_event_id: String,
     artifact_event_id: String,
+    /// Store-listing metadata published with the release, already sanitised.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app: Option<AppListing>,
     verification: VerificationResult,
 }
 
@@ -3023,6 +3031,7 @@ async fn finish_resolved_release(
         || trusted_publishers
             .iter()
             .any(|trusted| trusted == &release.pubkey.to_hex());
+    let app = Some(AppListing::from_app(&manifest.app)).filter(|listing| !listing.is_empty());
     Ok(ResolvedRelease {
         publisher: manifest.publisher,
         name: manifest.name,
@@ -3041,6 +3050,7 @@ async fn finish_resolved_release(
         install_inputs: manifest.app.install_inputs,
         release_event_id: release.id.to_hex(),
         artifact_event_id: artifact_event.id.to_hex(),
+        app,
         verification: VerificationResult {
             release_signature_valid: true,
             artifact_event_signature_valid: true,
@@ -3681,8 +3691,24 @@ fn parse_fork_reference(reference: &str) -> Result<ForkOf> {
 
 fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result<Manifest> {
     for kind in [
-        "d", "name", "version", "os", "arch", "format", "x", "artifact", "repo", "commit", "kind",
+        "d",
+        "name",
+        "version",
+        "os",
+        "arch",
+        "format",
+        "x",
+        "artifact",
+        "repo",
+        "commit",
+        "kind",
         "fork-of",
+        "summary",
+        "description",
+        "homepage",
+        "license",
+        "release-date",
+        "icon",
     ] {
         let count = event.tags.iter().filter(|tag| tag.kind() == kind).count();
         if count > 1 {
@@ -3800,7 +3826,7 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
     Ok(Manifest {
         app: AppMetadata {
             install_inputs,
-            ..AppMetadata::default()
+            ..app_metadata_from_event(event)
         },
         publisher: event.pubkey.to_hex(),
         name: tag_value(event, "name")
@@ -4070,6 +4096,10 @@ struct SearchResult {
     content: String,
     kind: Option<String>,
     fork_of: Option<ForkOf>,
+    /// Store-listing metadata (summary, categories, icon, ...), already
+    /// sanitised; absent when the release published none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app: Option<AppListing>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4178,7 +4208,18 @@ async fn search_matching_releases(
                     .content()
                     .map(|name| name.to_ascii_lowercase().contains(&query))
                     .unwrap_or(false)
-        });
+        }) || {
+            // Also match what the store listing says, so searching "editor"
+            // or "photo" finds apps by what they do, not just their name.
+            let app = app_metadata_from_event(&event);
+            app.summary
+                .as_deref()
+                .is_some_and(|summary| summary.to_ascii_lowercase().contains(&query))
+                || app
+                    .categories
+                    .iter()
+                    .any(|category| category.to_ascii_lowercase().contains(&query))
+        };
         if !name_matches || event.verify().is_err() || !release_event_is_v1(&event) {
             continue;
         }
@@ -4217,6 +4258,8 @@ async fn search_matching_releases(
                 content: event.content.clone(),
                 kind: tag_value(&event, "kind").map(str::to_owned),
                 fork_of: parse_fork_of(&event).ok().flatten(),
+                app: Some(AppListing::from_app(&app_metadata_from_event(&event)))
+                    .filter(|listing| !listing.is_empty()),
             });
         }
     }
@@ -6093,6 +6136,13 @@ fn verify_release_event(event: &Event, manifest: &Manifest) -> Result<()> {
     {
         bail!("release event metadata does not match the package manifest");
     }
+    // Events published before store-listing tags existed carry none; only an
+    // event that does carry them must agree with the manifest.
+    if event_has_app_tags(event)
+        && AppListing::from_app(&event_manifest.app) != AppListing::from_app(&manifest.app)
+    {
+        bail!("release event app listing does not match the package manifest");
+    }
     Ok(())
 }
 
@@ -6101,8 +6151,25 @@ fn release_event_is_v1(event: &Event) -> bool {
         return false;
     }
     if [
-        "d", "v", "name", "version", "os", "arch", "format", "x", "artifact", "repo", "commit",
-        "kind", "fork-of",
+        "d",
+        "v",
+        "name",
+        "version",
+        "os",
+        "arch",
+        "format",
+        "x",
+        "artifact",
+        "repo",
+        "commit",
+        "kind",
+        "fork-of",
+        "summary",
+        "description",
+        "homepage",
+        "license",
+        "release-date",
+        "icon",
     ]
     .iter()
     .any(|kind| event.tags.iter().filter(|tag| tag.kind() == *kind).count() > 1)
@@ -6249,6 +6316,7 @@ fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) ->
     for input in &manifest.app.install_inputs {
         tags.push(vec!["install-input".into(), serde_json::to_string(input)?]);
     }
+    tags.extend(AppListing::from_app(&manifest.app).tags());
     let content = format!(
         "npack release {}/{} {}",
         manifest.publisher, manifest.name, manifest.version
@@ -6262,6 +6330,85 @@ fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) ->
         .custom_created_at(Timestamp::from(created_at))
         .finalize(&keys)
         .map_err(Into::into)
+}
+
+/// Uploads `bytes` to the first Blossom server that accepts them and returns
+/// the blob's URL and SHA-256, insisting the server reports the hash we expect.
+async fn upload_to_blossom(
+    servers: &[String],
+    bytes: &[u8],
+    mime: &str,
+    keys: &Keys,
+    what: &str,
+) -> Result<(String, String)> {
+    let expected = Sha256Hash::hash(bytes);
+    let mut failures = Vec::new();
+    for server in servers {
+        let upload = tokio::time::timeout(
+            std::time::Duration::from_secs(NETWORK_TIMEOUT_SECS),
+            BlossomClient::new(Url::parse(server)?).upload_blob(
+                bytes.to_vec(),
+                Some(mime.into()),
+                None,
+                Some(keys),
+            ),
+        )
+        .await;
+        match upload {
+            Ok(Ok(candidate)) if candidate.sha256 == expected => {
+                return Ok((candidate.url.to_string(), expected.to_string()));
+            }
+            Ok(Ok(candidate)) => failures.push(format!(
+                "{server}: returned hash {} instead of {}",
+                candidate.sha256, expected
+            )),
+            Ok(Err(error)) => failures.push(format!("{server}: {error}")),
+            Err(_) => failures.push(format!("{server}: timed out")),
+        }
+    }
+    bail!(
+        "no Blossom server accepted {what}; attempts: {}",
+        failures.join("; ")
+    )
+}
+
+/// Reads one regular file out of an `.npk`, refusing anything over `max_bytes`.
+fn read_npk_file(archive_path: &Path, wanted: &Path, max_bytes: usize) -> Result<Vec<u8>> {
+    let decoder = zstd::Decoder::new(fs::File::open(archive_path)?)?;
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        if path.components().ne(wanted.components()) {
+            continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            bail!("{} is not a regular file in the package", wanted.display());
+        }
+        if entry.size() > max_bytes as u64 {
+            bail!(
+                "{} is {} bytes; the limit is {max_bytes}",
+                wanted.display(),
+                entry.size()
+            );
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes)?;
+        return Ok(bytes);
+    }
+    bail!("{} not found in the package", wanted.display())
+}
+
+async fn publish_icon(
+    archive_path: &Path,
+    icon_path: &Path,
+    servers: &[String],
+    keys: &Keys,
+) -> Result<IconBlob> {
+    let bytes = read_npk_file(archive_path, icon_path, MAX_ICON_BYTES)?;
+    let mime = icon_media_type(&bytes)?;
+    let (url, sha256) = upload_to_blossom(servers, &bytes, mime, keys, "the icon").await?;
+    Ok(IconBlob { url, sha256 })
 }
 
 async fn publish_release(
@@ -6279,44 +6426,22 @@ async fn publish_release(
     if keys.public_key() != publisher {
         bail!("publish signer does not match manifest publisher");
     }
-    let bytes = fs::read(artifact_path(&manifest, manifest_path))?;
-    let expected = Sha256Hash::hash(&bytes);
-    let mut descriptor = None;
-    let mut failures = Vec::new();
-    for server in servers {
-        let upload = tokio::time::timeout(
-            std::time::Duration::from_secs(NETWORK_TIMEOUT_SECS),
-            BlossomClient::new(Url::parse(server)?).upload_blob(
-                bytes.clone(),
-                Some("application/zstd".into()),
-                None,
-                Some(&keys),
-            ),
-        )
-        .await;
-        match upload {
-            Ok(Ok(candidate)) if candidate.sha256 == expected => {
-                descriptor = Some(candidate);
-                break;
-            }
-            Ok(Ok(candidate)) => failures.push(format!(
-                "{server}: returned hash {} instead of {}",
-                candidate.sha256, expected
-            )),
-            Ok(Err(error)) => failures.push(format!("{server}: {error}")),
-            Err(_) => failures.push(format!("{server}: timed out")),
-        }
-    }
-    let descriptor = descriptor.with_context(|| {
-        format!(
-            "no Blossom server accepted the artifact upload; attempts: {}",
-            failures.join("; ")
-        )
-    })?;
-    let artifact_event =
-        sign_artifact_event(&manifest, descriptor.url.as_ref(), bytes.len(), &keys)?;
+    let artifact_path = artifact_path(&manifest, manifest_path);
+    let bytes = fs::read(&artifact_path)?;
+    let (artifact_url, _) =
+        upload_to_blossom(servers, &bytes, "application/zstd", &keys, "the artifact").await?;
+    let artifact_event = sign_artifact_event(&manifest, &artifact_url, bytes.len(), &keys)?;
     let mut release_manifest = manifest.clone();
     release_manifest.artifact_event = Some(artifact_event.id.to_hex());
+    if let Some(icon_path) = &manifest.app.icon {
+        // The icon is also published on its own so a store can show it before
+        // the package is downloaded. A failure here costs the listing its
+        // icon, not the release, so it warns instead of aborting.
+        match publish_icon(&artifact_path, icon_path, servers, &keys).await {
+            Ok(icon) => release_manifest.app.icon_blob = Some(icon),
+            Err(error) => eprintln!("warning: release published without a store icon: {error:#}"),
+        }
+    }
     let created_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let release_event = sign_release_event(&release_manifest, secret_hex, created_at)?;
 
@@ -6567,6 +6692,238 @@ fn is_safe_relative_path(path: &Path) -> bool {
             .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
+const MAX_SUMMARY_CHARS: usize = 140;
+const MAX_DESCRIPTION_CHARS: usize = 4000;
+const MAX_LICENSE_CHARS: usize = 128;
+const MAX_CATEGORIES: usize = 8;
+const MAX_CATEGORY_CHARS: usize = 32;
+const MAX_SCREENSHOTS: usize = 6;
+const MAX_URL_CHARS: usize = 2048;
+/// Largest icon `npack publish` will upload and `GetIcon` will fetch.
+const MAX_ICON_BYTES: usize = 256 * 1024;
+
+/// An icon published as its own Blossom blob. The hash is signed with the
+/// release, so whoever fetches `url` can check the bytes before trusting them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct IconBlob {
+    url: String,
+    sha256: String,
+}
+
+fn is_http_url(value: &str) -> bool {
+    value.len() <= MAX_URL_CHARS
+        && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+        && Url::parse(value)
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+}
+
+fn is_valid_release_date(value: &str) -> bool {
+    value.len() == 10
+        && value.as_bytes()[4] == b'-'
+        && value.as_bytes()[7] == b'-'
+        && value
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| matches!(i, 4 | 7) || b.is_ascii_digit())
+}
+
+/// Cleans text a publisher (a stranger) controls before it is shown: drops
+/// control and bidirectional-override characters (newlines are kept only when
+/// `multiline`), collapses nothing else, trims, and caps the length.
+fn clean_listing_text(text: &str, max_chars: usize, multiline: bool) -> Option<String> {
+    let cleaned: String = text
+        .chars()
+        .filter(|c| {
+            (!c.is_control() || (multiline && *c == '\n'))
+                && !matches!(*c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .take(max_chars)
+        .collect();
+    let cleaned = cleaned.trim().to_owned();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// The store-listing part of a release: what a software centre shows before
+/// anything is installed. Always built through `from_app`, so every value has
+/// been cleaned and bounded no matter where it came from.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+struct AppListing {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    homepage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    license: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    categories: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    screenshots: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon: Option<IconBlob>,
+}
+
+impl AppListing {
+    fn from_app(app: &AppMetadata) -> Self {
+        Self {
+            summary: app
+                .summary
+                .as_deref()
+                .and_then(|text| clean_listing_text(text, MAX_SUMMARY_CHARS, false)),
+            description: app
+                .description
+                .as_deref()
+                .and_then(|text| clean_listing_text(text, MAX_DESCRIPTION_CHARS, true)),
+            homepage: app.homepage.clone().filter(|url| is_http_url(url)),
+            license: app
+                .license
+                .as_deref()
+                .and_then(|text| clean_listing_text(text, MAX_LICENSE_CHARS, false)),
+            categories: app
+                .categories
+                .iter()
+                .filter_map(|category| clean_listing_text(category, MAX_CATEGORY_CHARS, false))
+                .filter(|category| !category.chars().any(char::is_whitespace))
+                .take(MAX_CATEGORIES)
+                .collect(),
+            screenshots: app
+                .screenshots
+                .iter()
+                .filter(|url| is_http_url(url))
+                .take(MAX_SCREENSHOTS)
+                .cloned()
+                .collect(),
+            release_date: app
+                .release_date
+                .clone()
+                .filter(|date| is_valid_release_date(date)),
+            icon: app
+                .icon_blob
+                .clone()
+                .filter(|icon| is_http_url(&icon.url) && is_sha256_hex(&icon.sha256)),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The release-event tags carrying this listing.
+    fn tags(&self) -> Vec<Vec<String>> {
+        let mut tags = Vec::new();
+        for (name, value) in [
+            ("summary", &self.summary),
+            ("description", &self.description),
+            ("homepage", &self.homepage),
+            ("license", &self.license),
+            ("release-date", &self.release_date),
+        ] {
+            if let Some(value) = value {
+                tags.push(vec![name.to_owned(), value.clone()]);
+            }
+        }
+        for category in &self.categories {
+            tags.push(vec!["category".into(), category.clone()]);
+        }
+        for screenshot in &self.screenshots {
+            tags.push(vec!["screenshot".into(), screenshot.clone()]);
+        }
+        if let Some(icon) = &self.icon {
+            tags.push(vec!["icon".into(), icon.url.clone(), icon.sha256.clone()]);
+        }
+        tags
+    }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+const APP_LISTING_TAGS: [&str; 8] = [
+    "summary",
+    "description",
+    "homepage",
+    "license",
+    "release-date",
+    "category",
+    "screenshot",
+    "icon",
+];
+
+fn event_has_app_tags(event: &Event) -> bool {
+    event
+        .tags
+        .iter()
+        .any(|tag| APP_LISTING_TAGS.contains(&tag.kind().to_string().as_str()))
+}
+
+/// Reads the store-listing tags of a release event. Lenient by design: a
+/// malformed or oversized listing tag in someone else's event is cleaned or
+/// dropped, never an error, so it cannot make a release uninstallable.
+fn app_metadata_from_event(event: &Event) -> AppMetadata {
+    let values = |kind: &str| -> Vec<String> {
+        event
+            .tags
+            .iter()
+            .filter(|tag| tag.kind() == kind)
+            .filter_map(Tag::content)
+            .map(str::to_owned)
+            .collect()
+    };
+    let icon_blob = event
+        .tags
+        .iter()
+        .find(|tag| tag.kind() == "icon")
+        .map(|tag| tag.clone().to_vec())
+        .filter(|parts| parts.len() == 3)
+        .map(|parts| IconBlob {
+            url: parts[1].clone(),
+            sha256: parts[2].to_ascii_lowercase(),
+        });
+    let raw = AppMetadata {
+        summary: tag_value(event, "summary").map(str::to_owned),
+        description: tag_value(event, "description").map(str::to_owned),
+        homepage: tag_value(event, "homepage").map(str::to_owned),
+        license: tag_value(event, "license").map(str::to_owned),
+        categories: values("category"),
+        screenshots: values("screenshot"),
+        release_date: tag_value(event, "release-date").map(str::to_owned),
+        icon_blob,
+        ..AppMetadata::default()
+    };
+    let listing = AppListing::from_app(&raw);
+    AppMetadata {
+        summary: listing.summary,
+        description: listing.description,
+        homepage: listing.homepage,
+        license: listing.license,
+        categories: listing.categories,
+        screenshots: listing.screenshots,
+        release_date: listing.release_date,
+        icon_blob: listing.icon,
+        ..AppMetadata::default()
+    }
+}
+
+/// Identifies an icon's media type from its bytes (never from its name or a
+/// server's say-so). Only PNG and SVG are accepted.
+fn icon_media_type(bytes: &[u8]) -> Result<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Ok("image/png");
+    }
+    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(2048)]);
+    let head = text.trim_start_matches('\u{feff}').trim_start();
+    if (head.starts_with("<?xml") || head.starts_with("<svg") || head.starts_with("<!--"))
+        && text.contains("<svg")
+    {
+        return Ok("image/svg+xml");
+    }
+    bail!("icon must be a PNG or SVG image")
+}
+
 fn validate_app_metadata(app: &AppMetadata) -> Result<()> {
     validate_install_inputs(&app.install_inputs)?;
     if let Some(icon) = &app.icon
@@ -6582,32 +6939,58 @@ fn validate_app_metadata(app: &AppMetadata) -> Result<()> {
             bail!("manifest app.desktop_file must have a .desktop extension");
         }
     }
+    if let Some(summary) = &app.summary
+        && (summary.chars().count() > MAX_SUMMARY_CHARS || summary.chars().any(char::is_control))
+    {
+        bail!("manifest app.summary must be one line of at most {MAX_SUMMARY_CHARS} characters");
+    }
+    if let Some(description) = &app.description
+        && description.chars().count() > MAX_DESCRIPTION_CHARS
+    {
+        bail!("manifest app.description must be at most {MAX_DESCRIPTION_CHARS} characters");
+    }
+    if let Some(license) = &app.license
+        && (license.chars().count() > MAX_LICENSE_CHARS || license.chars().any(char::is_control))
+    {
+        bail!("manifest app.license must be one line of at most {MAX_LICENSE_CHARS} characters");
+    }
+    if app.categories.len() > MAX_CATEGORIES {
+        bail!("manifest app.categories may list at most {MAX_CATEGORIES} entries");
+    }
     for category in &app.categories {
-        if category.is_empty() || category.chars().any(char::is_whitespace) {
-            bail!("manifest app.categories entries must be non-empty and whitespace-free");
+        if category.is_empty()
+            || category
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+            || category.chars().count() > MAX_CATEGORY_CHARS
+        {
+            bail!(
+                "manifest app.categories entries must be non-empty, whitespace-free and at most {MAX_CATEGORY_CHARS} characters"
+            );
         }
     }
+    if app.screenshots.len() > MAX_SCREENSHOTS {
+        bail!("manifest app.screenshots may list at most {MAX_SCREENSHOTS} entries");
+    }
     for screenshot in &app.screenshots {
-        if Url::parse(screenshot).is_err() {
-            bail!("manifest app.screenshots entries must be valid URLs");
+        if !is_http_url(screenshot) {
+            bail!("manifest app.screenshots entries must be http(s) URLs");
         }
     }
     if let Some(homepage) = &app.homepage
-        && Url::parse(homepage).is_err()
+        && !is_http_url(homepage)
     {
-        bail!("manifest app.homepage must be a valid URL");
+        bail!("manifest app.homepage must be an http(s) URL");
     }
-    if let Some(release_date) = &app.release_date {
-        let valid = release_date.len() == 10
-            && release_date.as_bytes()[4] == b'-'
-            && release_date.as_bytes()[7] == b'-'
-            && release_date
-                .bytes()
-                .enumerate()
-                .all(|(i, b)| matches!(i, 4 | 7) || b.is_ascii_digit());
-        if !valid {
-            bail!("manifest app.release_date must be a YYYY-MM-DD date");
-        }
+    if let Some(icon) = &app.icon_blob
+        && (!is_http_url(&icon.url) || !is_sha256_hex(&icon.sha256))
+    {
+        bail!("manifest app.icon_blob must have an http(s) URL and a SHA-256");
+    }
+    if let Some(release_date) = &app.release_date
+        && !is_valid_release_date(release_date)
+    {
+        bail!("manifest app.release_date must be a YYYY-MM-DD date");
     }
     Ok(())
 }
@@ -9041,6 +9424,7 @@ mod tests {
             install_inputs: vec![],
             release_event_id: "release-id".into(),
             artifact_event_id: "artifact-id".into(),
+            app: None,
             verification: VerificationResult {
                 release_signature_valid: true,
                 artifact_event_signature_valid: true,
@@ -9077,6 +9461,7 @@ mod tests {
             install_inputs: vec![],
             release_event_id: "release-id".into(),
             artifact_event_id: "artifact-id".into(),
+            app: None,
             verification: VerificationResult {
                 release_signature_valid: true,
                 artifact_event_signature_valid: true,
@@ -9547,6 +9932,7 @@ mod tests {
             screenshots: vec!["https://example.com/hello/screenshot.png".into()],
             desktop_file: Some("hello.desktop".into()),
             release_date: Some("2026-01-15".into()),
+            icon_blob: None,
             install_inputs: vec![],
         });
         fs::write(
@@ -10854,6 +11240,249 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         fs::write(&path, "[trust\npublishers = broken")?;
         assert_eq!(state.config().trust.publishers.len(), 1);
+        Ok(())
+    }
+
+    fn listed_app() -> AppMetadata {
+        AppMetadata {
+            summary: Some("A friendly greeting".into()),
+            description: Some("Prints a greeting.\nTwo lines.".into()),
+            homepage: Some("https://example.com/hello".into()),
+            license: Some("MIT OR Apache-2.0".into()),
+            categories: vec!["Utility".into(), "Education".into()],
+            screenshots: vec!["https://example.com/shot.png".into()],
+            release_date: Some("2026-01-15".into()),
+            icon_blob: Some(IconBlob {
+                url: "https://cdn.example.com/abc".into(),
+                sha256: "ab".repeat(32),
+            }),
+            ..AppMetadata::default()
+        }
+    }
+
+    fn signed_release_with_app(app: AppMetadata) -> Result<(Event, Manifest)> {
+        let keys = Keys::generate();
+        let mut manifest = sample_manifest_with_app(app);
+        manifest.publisher = keys.public_key().to_hex();
+        manifest.sha256 = "ab".repeat(32);
+        manifest.artifact_event = Some("11".repeat(32));
+        let event =
+            sign_release_event(&manifest, &keys.secret_key().to_secret_hex(), 1_700_000_000)?;
+        Ok((event, manifest))
+    }
+
+    #[test]
+    fn app_listing_round_trips_through_a_signed_release_event() -> Result<()> {
+        let (event, manifest) = signed_release_with_app(listed_app())?;
+        assert!(release_event_is_v1(&event));
+        verify_release_event(&event, &manifest)?;
+        let app = app_metadata_from_event(&event);
+        assert_eq!(app.summary.as_deref(), Some("A friendly greeting"));
+        assert_eq!(
+            app.description.as_deref(),
+            Some("Prints a greeting.\nTwo lines.")
+        );
+        assert_eq!(app.categories, ["Utility", "Education"]);
+        assert_eq!(app.icon_blob, listed_app().icon_blob);
+        assert_eq!(
+            AppListing::from_app(
+                &manifest_from_release(&event, Path::new("a.npk"), &manifest.sha256)?.app
+            ),
+            AppListing::from_app(&listed_app())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_manifest_without_a_listing_publishes_no_listing_tags() -> Result<()> {
+        let (event, _) = signed_release_with_app(AppMetadata::default())?;
+        assert!(!event_has_app_tags(&event));
+        assert!(AppListing::from_app(&app_metadata_from_event(&event)).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn old_events_without_listing_tags_still_verify_against_a_newer_manifest() -> Result<()> {
+        let (event, mut manifest) = signed_release_with_app(AppMetadata::default())?;
+        manifest.app = listed_app();
+        verify_release_event(&event, &manifest)?;
+        // But an event that does carry a listing must agree with the manifest.
+        let (event, mut manifest) = signed_release_with_app(listed_app())?;
+        manifest.app.summary = Some("Something else".into());
+        assert!(verify_release_event(&event, &manifest).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn hostile_listing_tags_are_cleaned_or_dropped_never_fatal() -> Result<()> {
+        let keys = Keys::generate();
+        let tag =
+            |parts: &[&str]| Tag::parse(parts.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+        let event = EventBuilder::new(Kind::Custom(RELEASE_KIND), "x")
+            .tags([
+                tag(&["d", "hello/1.0.0/any"])?,
+                tag(&["v", PROTOCOL_VERSION])?,
+                tag(&["name", "hello"])?,
+                tag(&["version", "1.0.0"])?,
+                tag(&["os", "any"])?,
+                tag(&["arch", "any"])?,
+                tag(&["format", "npk"])?,
+                tag(&["x", &"cd".repeat(32)])?,
+                tag(&["artifact", &"11".repeat(32)])?,
+                tag(&["summary", "Totally\u{202e}safe\u{0}\u{1b}[31m app"])?,
+                tag(&["description", &"d".repeat(MAX_DESCRIPTION_CHARS * 2)])?,
+                tag(&["homepage", "javascript:alert(1)"])?,
+                tag(&["screenshot", "file:///etc/passwd"])?,
+                tag(&["screenshot", "https://ok.example/x.png"])?,
+                tag(&["category", "has space"])?,
+                tag(&["category", "Fine"])?,
+                tag(&["release-date", "yesterday"])?,
+                tag(&["icon", "http://x/y", "nothex"])?,
+            ])
+            .finalize(&keys)?;
+        assert!(release_event_is_v1(&event));
+        let app = app_metadata_from_event(&event);
+        assert_eq!(app.summary.as_deref(), Some("Totallysafe[31m app"));
+        assert_eq!(
+            app.description.unwrap().chars().count(),
+            MAX_DESCRIPTION_CHARS
+        );
+        assert_eq!(app.homepage, None, "non-http URLs are dropped");
+        assert_eq!(app.screenshots, ["https://ok.example/x.png"]);
+        assert_eq!(app.categories, ["Fine"]);
+        assert_eq!(app.release_date, None);
+        assert_eq!(app.icon_blob, None, "an icon with a bad hash is dropped");
+        // The release is still perfectly installable metadata.
+        manifest_from_release(&event, Path::new("a.npk"), &"cd".repeat(32))?;
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_singleton_listing_tags_make_a_release_invalid() -> Result<()> {
+        let keys = Keys::generate();
+        let (event, _) = signed_release_with_app(listed_app())?;
+        let mut tags: Vec<Tag> = event.tags.iter().cloned().collect();
+        tags.push(Tag::parse(["summary", "second summary"])?);
+        let doubled = EventBuilder::new(Kind::Custom(RELEASE_KIND), "x")
+            .tags(tags)
+            .finalize(&keys)?;
+        assert!(!release_event_is_v1(&doubled));
+        assert!(manifest_from_release(&doubled, Path::new("a.npk"), &"ab".repeat(32)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn publishing_rejects_unsafe_or_oversized_listings() {
+        let bad = |edit: fn(&mut AppMetadata)| {
+            let mut app = listed_app();
+            edit(&mut app);
+            validate_app_metadata(&app).is_err()
+        };
+        assert!(!bad(|_| {}));
+        assert!(bad(|a| a.homepage = Some("javascript:alert(1)".into())));
+        assert!(bad(|a| a.screenshots = vec!["file:///etc/passwd".into()]));
+        assert!(bad(|a| a.summary = Some("two\nlines".into())));
+        assert!(bad(|a| a.summary = Some("x".repeat(MAX_SUMMARY_CHARS + 1))));
+        assert!(bad(
+            |a| a.description = Some("x".repeat(MAX_DESCRIPTION_CHARS + 1))
+        ));
+        assert!(bad(|a| a.categories = vec!["c".into(); MAX_CATEGORIES + 1]));
+        assert!(bad(
+            |a| a.categories = vec!["a".repeat(MAX_CATEGORY_CHARS + 1)]
+        ));
+        assert!(bad(
+            |a| a.screenshots = vec!["https://e.com/s.png".into(); MAX_SCREENSHOTS + 1]
+        ));
+        assert!(bad(|a| a.icon_blob = Some(IconBlob {
+            url: "https://e.com/i".into(),
+            sha256: "zz".into()
+        })));
+    }
+
+    #[test]
+    fn icons_are_identified_by_their_bytes() {
+        assert_eq!(
+            icon_media_type(b"\x89PNG\r\n\x1a\nrest").unwrap(),
+            "image/png"
+        );
+        assert_eq!(
+            icon_media_type(b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"/>")
+                .unwrap(),
+            "image/svg+xml"
+        );
+        assert_eq!(icon_media_type(b"  <svg/>").unwrap(), "image/svg+xml");
+        for bad in [&b"GIF89a"[..], b"<html><svg>", b"#!/bin/sh", b""] {
+            assert!(icon_media_type(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_icon_can_be_read_out_of_a_packed_npk_within_the_size_limit() -> Result<()> {
+        let dir = tempdir()?;
+        let source = dir.path().join("src");
+        fs::create_dir_all(source.join("share/icons"))?;
+        fs::write(source.join("share/icons/hello.png"), b"\x89PNG\r\n\x1a\nxx")?;
+        fs::write(source.join("big.png"), vec![0u8; 4096])?;
+        let npk = dir.path().join("hello.npk");
+        pack_npk(&source, &npk)?;
+        assert_eq!(
+            read_npk_file(&npk, Path::new("share/icons/hello.png"), MAX_ICON_BYTES)?,
+            b"\x89PNG\r\n\x1a\nxx"
+        );
+        assert!(
+            read_npk_file(&npk, Path::new("big.png"), 100)
+                .unwrap_err()
+                .to_string()
+                .contains("limit")
+        );
+        assert!(read_npk_file(&npk, Path::new("missing.png"), 100).is_err());
+        assert!(
+            read_npk_file(&npk, Path::new("share"), 100).is_err(),
+            "directories are refused"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn search_finds_apps_by_summary_and_category_and_returns_the_listing() -> Result<()> {
+        let dir = tempdir()?;
+        let (event, _) = signed_release_with_app(listed_app())?;
+        save_catalogue(
+            dir.path(),
+            &Catalogue {
+                created_at: 1,
+                releases: vec![event],
+                revocations: vec![],
+            },
+        )?;
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        let search = |query: &str| {
+            runtime.block_on(search_matching_releases(
+                query,
+                &[],
+                &[],
+                None,
+                false,
+                false,
+                dir.path(),
+            ))
+        };
+        for query in ["hello", "greeting", "educat"] {
+            let results = search(query)?;
+            assert_eq!(results.len(), 1, "{query}");
+            let listing = results[0].app.as_ref().unwrap();
+            assert_eq!(listing.summary.as_deref(), Some("A friendly greeting"));
+            assert_eq!(
+                listing.icon.as_ref().unwrap().url,
+                "https://cdn.example.com/abc"
+            );
+        }
+        assert!(search("nomatch")?.is_empty());
+        let json = serde_json::to_value(&search("hello")?)?;
+        assert_eq!(
+            json[0]["app"]["categories"],
+            serde_json::json!(["Utility", "Education"])
+        );
         Ok(())
     }
 }

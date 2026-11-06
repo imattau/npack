@@ -63,6 +63,25 @@ The optional singleton `fork-of` tag, `["fork-of", "<publisher-hex>", "<name>",
 provenance only: clients may display it but must not treat it as trust, and
 the referenced release need not be available.
 
+Store-listing tags let a software centre describe a release before anything is
+downloaded. They are optional, additive (older clients ignore them) and do not
+change the protocol version. Singleton tags: `summary` (one line, at most 140
+characters), `description` (at most 4000 characters, newlines allowed),
+`homepage` (an http(s) URL), `license` (an SPDX-style expression, at most 128
+characters), `release-date` (`YYYY-MM-DD`), and `["icon", "<url>", "<sha256>"]`,
+a PNG or SVG of at most 256 KiB published as its own Blossom blob, with the
+SHA-256 of its bytes. Repeatable tags: `category` (a whitespace-free word of at
+most 32 characters; at most 8) and `screenshot` (an http(s) URL; at most 6).
+
+Publishers must stay within these limits, and `npack publish` enforces them.
+Clients must treat every listing value as untrusted text from a stranger: read
+leniently (clean control and bidirectional-override characters, cap length, and
+drop a value that does not validate rather than rejecting the release), never
+fetch or render a URL without the user's action, and verify an icon's SHA-256
+before using it. A release whose listing tags are all dropped is still valid.
+Duplicated singleton listing tags make the release invalid, like any other
+singleton.
+
 Repeatable tags:
 
 | Tag | Values |
@@ -73,6 +92,8 @@ Repeatable tags:
 | provides | Runtime capability supplied by the package |
 | post-install | action, relative-path |
 | install-input | JSON-encoded install-input descriptor |
+| category | Store-listing category (see above) |
+| screenshot | Store-listing screenshot URL (see above) |
 
 Unknown tags are ignored for forward compatibility. Required singleton tags
 must not be duplicated. Malformed dependency or post-install tags invalidate

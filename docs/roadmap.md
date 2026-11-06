@@ -234,8 +234,8 @@ metadata (summary, description, icon, ...) is used locally by `npack
 appstream`, but publishing it into Nostr release-event tags was never
 built, so there is currently nothing for a relay-sourced catalogue to
 carry. `npack info` reflects this honestly by not fabricating AppStream
-fields; publishing `app` metadata to Nostr is unstarted future work, likely
-alongside Phase 5's reference GUI once there is a consumer that wants it.
+fields. (Since closed: `app` listing metadata is now published as release
+tags and returned by `Search`/`GetPackage`; see the first-run slice below.)
 
 ## Phase 5: Reference GUI (done)
 
@@ -297,9 +297,14 @@ confirmation, and a running daemon reloads `config.toml` when it changes.
 Publisher names follow: NIP-05 names can be typed to find a publisher,
 and verified names (confirmed by the publisher's domain) are shown instead of
 npubs, with self-reported names marked unverified. Not yet done: `name@domain`
-in package references, publishing `app`
-metadata to Nostr, curated starter trust sets, and verifying the default
+in package references, curated starter trust sets, and verifying the default
 endpoints against live infrastructure.
+
+Store-listing metadata (summary, description, homepage, license, categories,
+screenshots, release date and an icon blob) is now published as additive
+release tags by `npack publish`, validated strictly on the way out and read
+leniently and sanitised on the way in. Still to do: the daemon fetching icons
+and the GUI showing the listing (this is what makes the GUI look like a store).
 
 ## Phase 6: COSMIC Store integration
 
