@@ -303,8 +303,10 @@ endpoints against live infrastructure.
 Store-listing metadata (summary, description, homepage, license, categories,
 screenshots, release date and an icon blob) is now published as additive
 release tags by `npack publish`, validated strictly on the way out and read
-leniently and sanitised on the way in. Still to do: the daemon fetching icons
-and the GUI showing the listing (this is what makes the GUI look like a store).
+leniently and sanitised on the way in. The daemon fetches and verifies icons (`GetIcon`) and `npack-gui` shows
+icons, summaries, categories and a structured details pane. Still to do:
+category filters and browse/"recently updated" views, and screenshots (which
+need a privacy-preserving way to fetch them).
 
 ## Phase 6: COSMIC Store integration
 

@@ -4334,6 +4334,8 @@ fn daemon_error_code(message: &str) -> &'static str {
         "download_failed"
     } else if has("installation cancelled") || has("update cancelled") {
         "cancelled"
+    } else if has("has no store icon") {
+        "no_icon"
     } else if has("is not installed") || has("no release named") || has("no verified release") {
         "not_found"
     } else {
@@ -4738,6 +4740,7 @@ async fn dispatch_daemon_request(
         "CheckUpdates" => daemon_check_updates(&state.config(), request.params).await,
         "GetConfig" => daemon_get_config(state),
         "ListTrustedPublishers" => daemon_list_trusted_publishers(state),
+        "GetIcon" => daemon_get_icon(request.params).await,
         "ResolvePublisher" => daemon_resolve_publisher(state, request.params).await,
         "GetPublisherProfiles" => daemon_get_publisher_profiles(state, request.params).await,
         "AddTrustedPublisher" => daemon_add_trusted_publisher(state, request.params).await,
@@ -5115,6 +5118,124 @@ async fn trust_command(action: TrustAction, config: &Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Store icons
+//
+// A release's icon is a stand-alone Blossom blob whose SHA-256 the publisher
+// signed. The daemon fetches it on behalf of a GUI, but only the URL from a
+// release already in its own catalogue, never one a caller supplies, so it is
+// not a general "fetch this URL" service. Fetches are HTTPS to a public domain
+// name, follow no redirects, are size-capped, must match the signed hash and
+// must look like a PNG or SVG. Verified icons are cached by hash.
+// ---------------------------------------------------------------------------
+
+/// Downloads and checks an icon. `secure` is the production setting (https to
+/// a public DNS name); tests turn it off to talk to a loopback server.
+async fn fetch_icon_bytes(icon: &IconBlob, secure: bool) -> Result<Vec<u8>> {
+    let url = Url::parse(&icon.url).context("icon URL is not valid")?;
+    if secure {
+        let public_domain = match url.host() {
+            Some(url::Host::Domain(domain)) => is_public_dns_name(&domain.to_lowercase()),
+            _ => false,
+        };
+        if url.scheme() != "https" || !public_domain || url.port().is_some() {
+            bail!("icon URL must be https to a public domain name");
+        }
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(NETWORK_TIMEOUT_SECS))
+        .https_only(secure)
+        .build()?;
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .context("could not reach the icon server")?;
+    if !response.status().is_success() {
+        bail!(
+            "the icon server answered HTTP {}",
+            response.status().as_u16()
+        );
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("reading the icon")? {
+        if bytes.len() + chunk.len() > MAX_ICON_BYTES {
+            bail!("the icon is larger than {MAX_ICON_BYTES} bytes");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    verify_icon_bytes(&bytes, &icon.sha256)?;
+    Ok(bytes)
+}
+
+/// The signed hash must match and the bytes must really be a PNG or SVG.
+fn verify_icon_bytes(bytes: &[u8], sha256: &str) -> Result<&'static str> {
+    if hex::encode(Sha256::digest(bytes)) != sha256.to_ascii_lowercase() {
+        bail!("icon does not match its signed SHA-256");
+    }
+    icon_media_type(bytes)
+}
+
+#[derive(Debug, Deserialize)]
+struct GetIconParams {
+    release_event_id: String,
+    #[serde(default)]
+    store: Option<PathBuf>,
+}
+
+async fn daemon_get_icon(params: serde_json::Value) -> Result<serde_json::Value> {
+    let params: GetIconParams = serde_json::from_value(params).context("invalid GetIcon params")?;
+    let root = params.store.unwrap_or_else(default_store);
+    get_icon_at(&root, &params.release_event_id, true).await
+}
+
+async fn get_icon_at(
+    root: &Path,
+    release_event_id: &str,
+    secure: bool,
+) -> Result<serde_json::Value> {
+    use base64::Engine;
+    let catalogue =
+        load_catalogue(root)?.context("no local catalogue found; run `npack refresh` first")?;
+    let event = catalogue
+        .releases
+        .iter()
+        .find(|event| event.id.to_hex() == release_event_id)
+        .filter(|event| event.verify().is_ok() && release_event_is_v1(event))
+        .with_context(|| {
+            format!("no release named {release_event_id} found in the local catalogue; try `npack refresh`")
+        })?;
+    let icon = app_metadata_from_event(event)
+        .icon_blob
+        .context("this release has no store icon")?;
+    let sha256 = icon.sha256.to_ascii_lowercase();
+    let cached = root.join("icons").join(&sha256);
+    // A cached file is trusted only after its hash is checked again.
+    let cached_bytes = fs::read(&cached)
+        .ok()
+        .filter(|bytes| verify_icon_bytes(bytes, &sha256).is_ok());
+    let bytes = match cached_bytes {
+        Some(bytes) => bytes,
+        None => {
+            let bytes = fetch_icon_bytes(&icon, secure).await?;
+            if let Some(parent) = cached.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let temporary = cached.with_extension("tmp");
+            fs::write(&temporary, &bytes)?;
+            fs::rename(&temporary, &cached)?;
+            bytes
+        }
+    };
+    let media_type = icon_media_type(&bytes)?;
+    Ok(serde_json::json!({
+        "sha256": sha256,
+        "media_type": media_type,
+        "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -11483,6 +11604,152 @@ mod tests {
             json[0]["app"]["categories"],
             serde_json::json!(["Utility", "Education"])
         );
+        Ok(())
+    }
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nFAKEICON";
+
+    fn http_bytes(body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn icon_for(base: &str, bytes: &[u8]) -> IconBlob {
+        IconBlob {
+            url: format!("{base}/blob"),
+            sha256: hex::encode(Sha256::digest(bytes)),
+        }
+    }
+
+    #[tokio::test]
+    async fn icon_fetch_accepts_only_bytes_matching_the_signed_hash() -> Result<()> {
+        let base = serve_http_once(http_bytes(PNG)).await;
+        assert_eq!(fetch_icon_bytes(&icon_for(&base, PNG), false).await?, PNG);
+
+        let base = serve_http_once(http_bytes(PNG)).await;
+        let mut wrong = icon_for(&base, PNG);
+        wrong.sha256 = "00".repeat(32);
+        let error = fetch_icon_bytes(&wrong, false).await.unwrap_err();
+        assert!(error.to_string().contains("signed SHA-256"), "{error}");
+
+        // Right hash but not an image: still refused.
+        let html = b"<html><script>alert(1)</script></html>";
+        let base = serve_http_once(http_bytes(html)).await;
+        assert!(
+            fetch_icon_bytes(&icon_for(&base, html), false)
+                .await
+                .is_err()
+        );
+
+        let big = vec![b'a'; MAX_ICON_BYTES + 1];
+        let base = serve_http_once(http_bytes(&big)).await;
+        let error = fetch_icon_bytes(&icon_for(&base, &big), false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("larger than"));
+
+        let base = serve_http_once(
+            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        )
+        .await;
+        let error = fetch_icon_bytes(&icon_for(&base, PNG), false)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("302"),
+            "redirects are not followed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn secure_icon_fetch_refuses_non_public_or_non_https_urls() {
+        let icon = |url: &str| IconBlob {
+            url: url.into(),
+            sha256: "ab".repeat(32),
+        };
+        for url in [
+            "http://cdn.example.com/blob",
+            "https://127.0.0.1/blob",
+            "https://[::1]/blob",
+            "https://localhost/blob",
+            "https://printer.local/blob",
+            "https://cdn.example.com:8443/blob",
+            "https://169.254.169.254/latest/meta-data",
+        ] {
+            let error = fetch_icon_bytes(&icon(url), true).await.unwrap_err();
+            assert!(
+                error.to_string().contains("public domain"),
+                "{url}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_icon_serves_a_verified_cache_entry_and_ignores_a_tampered_one() -> Result<()> {
+        use base64::Engine;
+        let dir = tempdir()?;
+        let mut app = listed_app();
+        app.icon_blob = Some(IconBlob {
+            url: "https://cdn.example.com/blob".into(),
+            sha256: hex::encode(Sha256::digest(PNG)),
+        });
+        let (event, _) = signed_release_with_app(app)?;
+        let id = event.id.to_hex();
+        save_catalogue(
+            dir.path(),
+            &Catalogue {
+                created_at: 1,
+                releases: vec![event],
+                revocations: vec![],
+            },
+        )?;
+        let cache = dir
+            .path()
+            .join("icons")
+            .join(hex::encode(Sha256::digest(PNG)));
+        fs::create_dir_all(cache.parent().unwrap())?;
+        fs::write(&cache, PNG)?;
+
+        let reply = get_icon_at(dir.path(), &id, true).await?;
+        assert_eq!(reply["media_type"], "image/png");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.decode(reply["data"].as_str().unwrap())?,
+            PNG
+        );
+
+        // A corrupted cache file is not served; with no network it just fails.
+        fs::write(&cache, b"\x89PNG\r\n\x1a\nTAMPERED")?;
+        assert!(get_icon_at(dir.path(), &id, true).await.is_err());
+
+        let error = get_icon_at(dir.path(), &"00".repeat(32), true)
+            .await
+            .unwrap_err();
+        assert_eq!(daemon_error_code(&error.to_string()), "not_found");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_icon_reports_a_release_without_an_icon() -> Result<()> {
+        let dir = tempdir()?;
+        let (event, _) = signed_release_with_app(AppMetadata::default())?;
+        let id = event.id.to_hex();
+        save_catalogue(
+            dir.path(),
+            &Catalogue {
+                created_at: 1,
+                releases: vec![event],
+                revocations: vec![],
+            },
+        )?;
+        let error = get_icon_at(dir.path(), &id, true).await.unwrap_err();
+        assert_eq!(daemon_error_code(&error.to_string()), "no_icon");
         Ok(())
     }
 }

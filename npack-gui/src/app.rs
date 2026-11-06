@@ -32,6 +32,12 @@ enum Event {
     Config(Result<Value, UiError>),
     /// Extra package details for the "unknown publisher" dialog.
     InstallPreview(Result<Value, UiError>),
+    /// A verified icon fetched by npackd (`GetIcon`), keyed by its SHA-256.
+    Icon {
+        sha256: String,
+        media_type: String,
+        bytes: Vec<u8>,
+    },
     /// Readable identities (verified NIP-05 names) from `GetPublisherProfiles`.
     Profiles(Result<Vec<Value>, UiError>),
     /// `ResolvePublisher`: who the typed npub / hex key / name@domain is.
@@ -93,6 +99,9 @@ pub struct NpackGuiApp {
     /// Publisher hex -> identity (names are display aids, never the identity).
     identities: HashMap<String, Value>,
     profiles_requested: HashSet<String>,
+    /// SHA-256 -> (bytes, file extension) for icons npackd has verified.
+    icons: HashMap<String, (Arc<[u8]>, &'static str)>,
+    icons_requested: HashSet<String>,
     relays_text: String,
     blossom_text: String,
 
@@ -126,6 +135,8 @@ impl NpackGuiApp {
             trust_preview: None,
             identities: HashMap::new(),
             profiles_requested: HashSet::new(),
+            icons: HashMap::new(),
+            icons_requested: HashSet::new(),
             relays_text: String::new(),
             blossom_text: String::new(),
             tx,
@@ -225,6 +236,64 @@ impl NpackGuiApp {
                     .map_err(|e| UiError::from_anyhow(&e)),
             )
         });
+    }
+
+    /// Fetches icons for results that have one, one at a time in the
+    /// background (at most 24 per call). npackd checks each against the hash
+    /// the publisher signed; anything that fails simply shows no icon.
+    fn request_icons(&mut self, items: &[Value]) {
+        let wanted: Vec<(String, String)> = items
+            .iter()
+            .filter_map(|item| {
+                Some((
+                    value_str(item, "release_event_id"),
+                    icon_sha(item)?.to_owned(),
+                ))
+            })
+            .filter(|(_, sha)| self.icons_requested.insert(sha.clone()))
+            .take(24)
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            use base64::Engine;
+            for (release_event_id, sha256) in wanted {
+                let Ok(reply) = client.call(
+                    "GetIcon",
+                    serde_json::json!({ "release_event_id": release_event_id }),
+                ) else {
+                    continue;
+                };
+                let Some(bytes) = reply
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok())
+                else {
+                    continue;
+                };
+                let _ = tx.send(Event::Icon {
+                    sha256,
+                    media_type: value_str(&reply, "media_type"),
+                    bytes,
+                });
+            }
+        });
+    }
+
+    /// The icon for a listing, if npackd has delivered it.
+    fn icon_image(&self, item: &Value) -> Option<egui::Image<'static>> {
+        let sha = icon_sha(item)?;
+        let (bytes, extension) = self.icons.get(sha)?;
+        Some(
+            egui::Image::from_bytes(
+                format!("bytes://{sha}.{extension}"),
+                egui::load::Bytes::Shared(bytes.clone()),
+            )
+            .fit_to_exact_size(egui::vec2(ICON_SIZE, ICON_SIZE)),
+        )
     }
 
     fn resolve_publisher(&self, query: String) {
@@ -450,6 +519,7 @@ impl NpackGuiApp {
                         .iter()
                         .map(|item| value_str(item, "publisher"))
                         .collect();
+                    self.request_icons(&items);
                     self.search_results = items;
                     self.request_profiles(publishers);
                 }
@@ -459,7 +529,22 @@ impl NpackGuiApp {
                     self.updates = items;
                 }
                 Event::Updates(Err(error)) => self.fail("Checking for updates", error),
-                Event::Details(Ok(value)) => self.details = Some(value),
+                Event::Details(Ok(value)) => {
+                    self.request_icons(std::slice::from_ref(&value));
+                    self.details = Some(value);
+                }
+                Event::Icon {
+                    sha256,
+                    media_type,
+                    bytes,
+                } => {
+                    let extension = if media_type == "image/svg+xml" {
+                        "svg"
+                    } else {
+                        "png"
+                    };
+                    self.icons.insert(sha256, (bytes.into(), extension));
+                }
                 Event::Details(Err(error)) => self.fail("Loading details", error),
                 Event::Config(Ok(value)) => {
                     self.relays_text = string_lines(&value, "relays");
@@ -595,6 +680,90 @@ fn short_npub(npub: &str) -> String {
     format!("{head}…{tail}")
 }
 
+const ICON_SIZE: f32 = 40.0;
+
+/// A listing field the publisher wrote (already cleaned by npackd). Shown as
+/// plain text only: never interpreted, never fetched.
+fn app_text<'a>(item: &'a Value, field: &str) -> Option<&'a str> {
+    item.get("app")?
+        .get(field)?
+        .as_str()
+        .filter(|text| !text.is_empty())
+}
+
+fn app_categories(item: &Value) -> Vec<&str> {
+    item.get("app")
+        .and_then(|app| app.get("categories"))
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// The SHA-256 of the listing's icon, which identifies it in the icon cache.
+fn icon_sha(item: &Value) -> Option<&str> {
+    item.get("app")?.get("icon")?.get("sha256")?.as_str()
+}
+
+/// The right-hand details pane: the listing first (what a person wants to
+/// know), then the technical facts, with the raw data tucked away.
+fn details_view(
+    ui: &mut egui::Ui,
+    value: &Value,
+    publisher: &str,
+    icon: Option<egui::Image<'static>>,
+) {
+    ui.horizontal(|ui| {
+        if let Some(icon) = icon {
+            ui.add(icon);
+        }
+        ui.vertical(|ui| {
+            ui.heading(value_str(value, "name"));
+            ui.label(value_str(value, "version"));
+        });
+    });
+    if let Some(summary) = app_text(value, "summary") {
+        ui.strong(summary);
+    }
+    ui.horizontal(|ui| {
+        trust_badge(ui, value.get("trust").and_then(Value::as_str));
+        ui.weak(publisher);
+    });
+    if let Some(description) = app_text(value, "description") {
+        ui.add_space(6.0);
+        ui.label(description);
+    }
+    ui.add_space(6.0);
+    if let Some(license) = app_text(value, "license") {
+        ui.label(format!("License: {license}"));
+    }
+    let categories = app_categories(value);
+    if !categories.is_empty() {
+        ui.label(format!("Categories: {}", categories.join(", ")));
+    }
+    if let Some(date) = app_text(value, "release_date") {
+        ui.label(format!("Released: {date}"));
+    }
+    if let Some(homepage) = app_text(value, "homepage")
+        && (homepage.starts_with("https://") || homepage.starts_with("http://"))
+    {
+        // The full address is the link text, so it can't pose as something
+        // else; nothing is opened until the person clicks.
+        ui.hyperlink_to(homepage, homepage);
+    }
+    let dependencies: Vec<String> = value
+        .get("dependencies")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().map(|d| value_str(d, "name")).collect())
+        .unwrap_or_default();
+    if !dependencies.is_empty() {
+        ui.label(format!("Also installs: {}", dependencies.join(", ")));
+    }
+    ui.add_space(6.0);
+    ui.collapsing("Technical details", |ui| {
+        ui.label(serde_json::to_string_pretty(value).unwrap_or_default());
+    });
+}
+
 /// A verified NIP-05 name, a clearly marked self-reported claim, or just the
 /// shortened npub. Only the first is ever shown without a caveat: a profile
 /// can claim any name, so claims are labelled "(unverified)".
@@ -674,7 +843,9 @@ impl eframe::App for NpackGuiApp {
             ui.heading("Details");
             match &self.details {
                 Some(value) => {
-                    ui.label(serde_json::to_string_pretty(value).unwrap_or_default());
+                    let publisher = self
+                        .publisher_text(&value_str(value, "publisher"), &display_publisher(value));
+                    details_view(ui, value, &publisher, self.icon_image(value));
                 }
                 None => {
                     ui.label("Select a package and click Details.");
@@ -1013,22 +1184,40 @@ impl NpackGuiApp {
         for item in &self.search_results {
             let reference = package_reference(item);
             ui.horizontal(|ui| {
-                ui.label(format!(
-                    "{} {}",
-                    value_str(item, "name"),
-                    value_str(item, "version")
-                ));
-                trust_badge(ui, item.get("trust").and_then(Value::as_str));
-                ui.weak(
-                    self.publisher_text(&value_str(item, "publisher"), &display_publisher(item)),
-                );
-                if ui.button("Details").clicked() {
-                    to_show = Some(reference.clone());
+                match self.icon_image(item) {
+                    Some(icon) => {
+                        ui.add(icon);
+                    }
+                    None => {
+                        ui.allocate_space(egui::vec2(ICON_SIZE, ICON_SIZE));
+                    }
                 }
-                if ui.button("Install").clicked() {
-                    to_install = Some(item.clone());
-                }
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(value_str(item, "name"));
+                        ui.label(value_str(item, "version"));
+                        trust_badge(ui, item.get("trust").and_then(Value::as_str));
+                        ui.weak(self.publisher_text(
+                            &value_str(item, "publisher"),
+                            &display_publisher(item),
+                        ));
+                        if ui.button("Details").clicked() {
+                            to_show = Some(reference.clone());
+                        }
+                        if ui.button("Install").clicked() {
+                            to_install = Some(item.clone());
+                        }
+                    });
+                    if let Some(summary) = app_text(item, "summary") {
+                        ui.label(summary);
+                    }
+                    let categories = app_categories(item);
+                    if !categories.is_empty() {
+                        ui.weak(categories.join(" · "));
+                    }
+                });
             });
+            ui.add_space(4.0);
         }
         if let Some(reference) = to_show {
             self.show_details(&reference);
@@ -1088,6 +1277,31 @@ mod tests {
         // An unverified record must never earn the tick, even with a label.
         let forged = serde_json::json!({"nip05_verified": false, "label": "x@y.com"});
         assert!(!describe_publisher(Some(&forged), NPUB).contains('✓'));
+    }
+
+    #[test]
+    fn listing_helpers_read_the_app_object_and_tolerate_its_absence() {
+        let item = serde_json::json!({
+            "name": "hello",
+            "app": {
+                "summary": "A friendly greeting",
+                "categories": ["Utility", "Education"],
+                "icon": {"url": "https://x/y", "sha256": "ab"}
+            }
+        });
+        assert_eq!(app_text(&item, "summary"), Some("A friendly greeting"));
+        assert_eq!(app_text(&item, "description"), None);
+        assert_eq!(app_categories(&item), ["Utility", "Education"]);
+        assert_eq!(icon_sha(&item), Some("ab"));
+
+        let bare = serde_json::json!({"name": "hello"});
+        assert_eq!(app_text(&bare, "summary"), None);
+        assert!(app_categories(&bare).is_empty());
+        assert_eq!(icon_sha(&bare), None);
+        assert_eq!(
+            app_text(&serde_json::json!({"app": {"summary": ""}}), "summary"),
+            None
+        );
     }
 
     #[test]

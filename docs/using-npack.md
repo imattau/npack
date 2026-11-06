@@ -619,6 +619,7 @@ Supported methods, mirroring the CLI operations above:
 | `GetConfig` | none | `{first_run, config_path, relays[], blossom[], relays_defaulted, blossom_defaulted, trusted_publishers[{publisher, npub}]}`. `first_run` is true when no `config.toml` exists yet. |
 | `ListTrustedPublishers` | none | Array of `{publisher, npub}`. |
 | `AddTrustedPublisher` | `publisher` (npub, hex, or a NIP-05 `name@domain`) | `{publisher, npub}` (plus `nip05`/`label` when a name was given); the resolved key is written to `[trust].publishers` in `config.toml`. |
+| `GetIcon` | `release_event_id`, `store` | `{sha256, media_type, data}` where `data` is the base64 icon (PNG or SVG, at most 256 KiB) of a release in the local catalogue. See "Store icons" below. |
 | `ResolvePublisher` | `query` (npub, hex, or `name@domain`), `relay[]` | A publisher identity (below). Use it to show who a typed value is before trusting them. |
 | `GetPublisherProfiles` | `publishers[]` (hex or npub), `relay[]`, `refresh` | One identity per input, in order. Best effort: unreachable relays or domains give a bare identity, not an error. Cached for an hour (successful lookups only). |
 | `RemoveTrustedPublisher` | `publisher` | `{removed, publisher}`. |
@@ -640,9 +641,19 @@ category a frontend can map to its own wording: `unknown_method`,
 `invalid_params`, `invalid_request`, `invalid_input` (a value such as a
 publisher key or relay URL was rejected), `nip05_failed`, `not_authorized`, `no_relays`,
 `no_blossom_servers`, `relay_unreachable`, `store_busy`, `publisher_untrusted`,
-`download_failed`, `cancelled`, `not_found`, and `internal` for anything else.
+`download_failed`, `cancelled`, `not_found`, `no_icon`, and `internal` for anything else.
 A `failed` `GetTransaction` status carries `error_code` the same way. The
 field is additive; older daemons omit it.
+
+**Store icons.** `GetIcon` fetches the icon named by a release already in the
+daemon's local catalogue; a caller cannot supply a URL, so it is not a general
+fetch service. The fetch must be `https` to a public domain name (no IP
+literals, ports or local names), follows no redirects, is capped at 256 KiB,
+must match the SHA-256 the publisher signed, and must be a PNG or SVG by its
+bytes. Verified icons are cached under `<store>/icons/<sha256>` and re-checked
+against their hash each time they are served. Releases published to a local
+`http://` Blossom server (for example `nak serve`) therefore show no icon in a
+GUI; that is deliberate. Error code `no_icon` means the release has none.
 
 **Publisher names (NIP-05).** A publisher is a key; a name like
 `alice@example.com` is only a readable pointer to one, so the key is always what

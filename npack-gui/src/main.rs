@@ -13,6 +13,10 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "npack-gui",
         options,
-        Box::new(|_cc| Ok(Box::new(app::NpackGuiApp::new()))),
+        Box::new(|cc| {
+            // PNG and SVG decoding for the store icons npackd delivers.
+            egui_extras::install_image_loaders(&cc.egui_ctx);
+            Ok(Box::new(app::NpackGuiApp::new()))
+        }),
     )
 }
