@@ -651,6 +651,12 @@ enum Command {
         allowed_capabilities: Vec<String>,
         #[arg(long, help = "Report available updates without installing them")]
         check: bool,
+        #[arg(
+            long,
+            requires = "check",
+            help = "With --check, send a desktop notification when new updates or revoked packages are found (for a timer)"
+        )]
+        notify: bool,
     },
     /// Resolve and verify a package's release metadata without installing it.
     ///
@@ -1269,8 +1275,11 @@ async fn main() -> Result<()> {
             offline,
             allowed_capabilities,
             check,
+            notify,
         } => {
-            if check {
+            if check && notify {
+                notify_updates_command(package, relays, store, user, system, &config).await?
+            } else if check {
                 check_updates_command(
                     package,
                     relays,
@@ -1515,6 +1524,7 @@ async fn check_updates_command(
     let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
     let use_user = user || (!system && config.install.user);
     let root = install_paths(store.as_deref(), use_user).0;
+    let package_filter = package.clone();
     let client = Client::default();
     for relay in &relays {
         client.add_relay(relay).await?;
@@ -1582,12 +1592,216 @@ async fn check_updates_command(
             outcome.map(|()| available)
         }
     };
+    let mut installed = installed_packages(Some(&root)).unwrap_or_default();
+    if let Some(package) = &package_filter {
+        let (publisher, name) = package
+            .split_once('/')
+            .map_or((None, package.as_str()), |(publisher, name)| {
+                (Some(normalize_publisher_reference(publisher)), name)
+            });
+        installed.retain(|candidate| {
+            candidate.name == name
+                && publisher
+                    .as_deref()
+                    .is_none_or(|publisher| candidate.publisher == publisher)
+        });
+    }
+    let revocations = fetch_revocation_events(&client, &installed).await;
     client.disconnect().await;
     let available = result?;
+    for package in &installed {
+        if let Some(reason) = installed_revocation_reason(package, &revocations) {
+            println!(
+                "{} {} {}: {reason}",
+                red("[REVOKED]"),
+                installed_package_reference(package),
+                package.version
+            );
+        }
+    }
     if available > 0 {
         println!("{available} update(s) {}.", yellow("available"));
     } else {
         println!("Everything is {}.", green("up to date"));
+    }
+    Ok(())
+}
+
+/// A desktop notification about updates or revocations.
+#[derive(Debug, PartialEq, Eq)]
+struct UpdateNotice {
+    title: String,
+    body: String,
+    urgent: bool,
+}
+
+/// One line per thing worth telling the user about, e.g. `update hello 1.0.0 -> 1.1.0`.
+fn update_items(statuses: &[UpdateStatus]) -> Vec<String> {
+    let mut items = Vec::new();
+    for status in statuses {
+        if status.revoked.is_some() {
+            items.push(format!(
+                "revoked {} {}",
+                status.reference, status.current_version
+            ));
+        }
+        if let Some(available) = &status.available_version {
+            items.push(format!(
+                "update {} {} -> {available}",
+                status.reference, status.current_version
+            ));
+        }
+    }
+    items.sort();
+    items
+}
+
+/// What to tell the user, given what was already announced last time. Only
+/// something not announced before triggers a notification, so a daily timer
+/// does not repeat itself until the situation changes. Returns the notice (if
+/// any) and the record of what is now outstanding.
+fn update_notice(
+    statuses: &[UpdateStatus],
+    previously_announced: &str,
+) -> (Option<UpdateNotice>, String) {
+    let items = update_items(statuses);
+    let record = items.join("\n");
+    let seen: HashSet<&str> = previously_announced.lines().collect();
+    if items.iter().all(|item| seen.contains(item.as_str())) {
+        return (None, record);
+    }
+    let revoked: Vec<&UpdateStatus> = statuses.iter().filter(|s| s.revoked.is_some()).collect();
+    let updates: Vec<&UpdateStatus> = statuses
+        .iter()
+        .filter(|s| s.available_version.is_some())
+        .collect();
+    let name = |reference: &str| reference.rsplit('/').next().unwrap_or(reference).to_owned();
+    let mut lines = Vec::new();
+    for status in &revoked {
+        lines.push(format!(
+            "{} {} was revoked by its publisher: {}",
+            name(&status.reference),
+            status.current_version,
+            status.revoked.as_deref().unwrap_or("revoked")
+        ));
+    }
+    for status in &updates {
+        lines.push(format!(
+            "{} {} -> {}",
+            name(&status.reference),
+            status.current_version,
+            status.available_version.as_deref().unwrap_or("?")
+        ));
+    }
+    let extra = lines.len().saturating_sub(8);
+    lines.truncate(8);
+    if extra > 0 {
+        lines.push(format!("and {extra} more"));
+    }
+    let title = if revoked.is_empty() {
+        format!("{} software update(s) available", updates.len())
+    } else {
+        format!(
+            "{} installed package(s) revoked by their publisher",
+            revoked.len()
+        )
+    };
+    (
+        Some(UpdateNotice {
+            title,
+            body: lines.join("\n"),
+            urgent: !revoked.is_empty(),
+        }),
+        record,
+    )
+}
+
+/// Escapes the markup notification daemons interpret in message bodies.
+fn escape_notification_markup(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn send_desktop_notification(notice: &UpdateNotice) -> Result<()> {
+    let status = std::process::Command::new("notify-send")
+        .arg("--app-name=npack")
+        .arg("--icon=system-software-update")
+        .arg(if notice.urgent {
+            "--urgency=critical"
+        } else {
+            "--urgency=normal"
+        })
+        .arg("--")
+        .arg(escape_notification_markup(&notice.title))
+        .arg(escape_notification_markup(&notice.body))
+        .status()
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                anyhow!("notify-send not found; install libnotify (libnotify-bin) for desktop notifications")
+            } else {
+                anyhow!("running notify-send: {error}")
+            }
+        })?;
+    if !status.success() {
+        bail!("notify-send exited with {status}");
+    }
+    Ok(())
+}
+
+/// `npack update --check --notify`: check for updates and revocations and, if
+/// there is something not already announced, send a desktop notification.
+/// Meant to be run by a timer (see `packaging/npack-update-check.timer`).
+async fn notify_updates_command(
+    package: Option<String>,
+    relays: Vec<String>,
+    store: Option<PathBuf>,
+    user: bool,
+    system: bool,
+    config: &Config,
+) -> Result<()> {
+    let store = store.or_else(|| system.then(default_system_store));
+    let use_user = user || (!system && config.install.user);
+    let root = install_paths(store.as_deref(), use_user).0;
+    let statuses = check_updates_core(
+        config,
+        CheckUpdatesParams {
+            package,
+            relay: relays,
+            user: use_user,
+            store,
+            ..CheckUpdatesParams::default()
+        },
+    )
+    .await?;
+    for status in &statuses {
+        if let Some(reason) = &status.revoked {
+            println!(
+                "{} {} {}: {reason}",
+                red("[REVOKED]"),
+                status.reference,
+                status.current_version
+            );
+        }
+        if let Some(available) = &status.available_version {
+            println!(
+                "{} {} -> {available} {}",
+                status.reference,
+                status.current_version,
+                yellow("available")
+            );
+        }
+    }
+    let record_path = root.join("update-notified.txt");
+    let previous = fs::read_to_string(&record_path).unwrap_or_default();
+    let (notice, record) = update_notice(&statuses, &previous);
+    if let Some(notice) = notice {
+        send_desktop_notification(&notice)?;
+    }
+    // Only recorded once the notification went out, so a failure retries.
+    if record != previous {
+        fs::create_dir_all(&root)?;
+        fs::write(&record_path, record)?;
     }
     Ok(())
 }
@@ -6113,6 +6327,10 @@ struct UpdateStatus {
     reference: String,
     current_version: String,
     available_version: Option<String>,
+    /// Set when the installed release has been revoked by its publisher; the
+    /// text is the publisher's stated reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revoked: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -6135,6 +6353,18 @@ async fn daemon_check_updates(
 ) -> Result<serde_json::Value> {
     let params: CheckUpdatesParams =
         serde_json::from_value(params).context("invalid CheckUpdates params")?;
+    Ok(serde_json::to_value(
+        check_updates_core(config, params).await?,
+    )?)
+}
+
+/// Looks up the newest release of each installed package (or one package) and
+/// whether the installed release has been revoked. Silent: callers decide how
+/// to present it.
+async fn check_updates_core(
+    config: &Config,
+    params: CheckUpdatesParams,
+) -> Result<Vec<UpdateStatus>> {
     let relays = configured_relays(params.relay, config)?;
     let trusted_publishers = configured_publishers(params.trusted_publisher, config)?;
     let use_user = params.user || config.install.user;
@@ -6193,10 +6423,62 @@ async fn daemon_check_updates(
             reference: installed_package_reference(package),
             current_version: package.version.clone(),
             available_version: available,
+            revoked: None,
         });
     }
+    // Best effort: failing to read revocations must not hide the update list.
+    let revocations = fetch_revocation_events(&client, &installed).await;
     client.disconnect().await;
-    Ok(serde_json::to_value(statuses)?)
+    for (status, package) in statuses.iter_mut().zip(&installed) {
+        status.revoked = installed_revocation_reason(package, &revocations);
+    }
+    Ok(statuses)
+}
+
+/// The revocation events (kind 9901) published by the authors of the
+/// installed packages. Returns nothing rather than failing when relays can't
+/// be queried.
+async fn fetch_revocation_events(client: &Client, installed: &[InstalledPackage]) -> Vec<Event> {
+    let authors: Vec<PublicKey> = installed
+        .iter()
+        .filter_map(|package| PublicKey::parse(&package.publisher).ok())
+        .collect();
+    if authors.is_empty() {
+        return Vec::new();
+    }
+    client
+        .fetch_events(
+            Filter::new()
+                .kind(Kind::Custom(REVOCATION_KIND))
+                .authors(authors)
+                .limit(500),
+        )
+        .timeout(std::time::Duration::from_secs(10))
+        .await
+        .map(|events| events.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Why the installed release was revoked, if its publisher revoked it. A
+/// revocation counts only when it is a valid signed v1 event from the
+/// package's own publisher naming this exact name, version and artifact hash.
+fn installed_revocation_reason(
+    package: &InstalledPackage,
+    revocations: &[Event],
+) -> Option<String> {
+    revocations
+        .iter()
+        .filter(|event| {
+            event.pubkey.to_hex() == package.publisher
+                && revocation_event_is_v1(event)
+                && event.verify().is_ok()
+                && tag_value(event, "name") == Some(package.name.as_str())
+                && tag_value(event, "version") == Some(package.version.as_str())
+                && tag_value(event, "x")
+                    .is_some_and(|hash| hash.eq_ignore_ascii_case(&package.sha256))
+        })
+        .find_map(|event| tag_value(event, "reason"))
+        .map(|reason| clean_listing_text(reason, 200, false).unwrap_or_else(|| "revoked".into()))
 }
 
 fn verify_release_event(event: &Event, manifest: &Manifest) -> Result<()> {
@@ -11750,6 +12032,143 @@ mod tests {
         )?;
         let error = get_icon_at(dir.path(), &id, true).await.unwrap_err();
         assert_eq!(daemon_error_code(&error.to_string()), "no_icon");
+        Ok(())
+    }
+
+    fn status(
+        reference: &str,
+        current: &str,
+        available: Option<&str>,
+        revoked: Option<&str>,
+    ) -> UpdateStatus {
+        UpdateStatus {
+            reference: reference.into(),
+            current_version: current.into(),
+            available_version: available.map(str::to_owned),
+            revoked: revoked.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn nothing_to_report_means_no_notification_and_a_cleared_record() {
+        let (notice, record) = update_notice(
+            &[status("npub1x/hello", "1.0.0", None, None)],
+            "update old 1 -> 2",
+        );
+        assert_eq!(notice, None);
+        assert_eq!(
+            record, "",
+            "the record is cleared so a later update announces again"
+        );
+    }
+
+    #[test]
+    fn a_new_update_is_announced_once_until_something_changes() {
+        let updates = [status("npub1x/hello", "1.0.0", Some("1.1.0"), None)];
+        let (notice, record) = update_notice(&updates, "");
+        let notice = notice.expect("first sighting notifies");
+        assert_eq!(notice.title, "1 software update(s) available");
+        assert_eq!(notice.body, "hello 1.0.0 -> 1.1.0");
+        assert!(!notice.urgent);
+
+        let (again, same) = update_notice(&updates, &record);
+        assert_eq!(again, None, "the timer must not repeat itself");
+        assert_eq!(same, record);
+
+        // One of two updates gets installed: nothing new, so stay quiet.
+        let two = [
+            status("npub1x/hello", "1.0.0", Some("1.1.0"), None),
+            status("npub1x/world", "2.0.0", Some("2.1.0"), None),
+        ];
+        let (_, two_record) = update_notice(&two, "");
+        assert_eq!(update_notice(&updates, &two_record).0, None);
+        // A further update appears: announce again.
+        assert!(update_notice(&two, &record).0.is_some());
+    }
+
+    #[test]
+    fn a_revoked_install_is_urgent_and_explains_why() {
+        let statuses = [
+            status(
+                "npub1x/hello",
+                "1.0.0",
+                Some("1.0.1"),
+                Some("signing key leaked"),
+            ),
+            status("npub1x/world", "2.0.0", Some("2.1.0"), None),
+        ];
+        let notice = update_notice(&statuses, "").0.unwrap();
+        assert!(notice.urgent);
+        assert_eq!(
+            notice.title,
+            "1 installed package(s) revoked by their publisher"
+        );
+        assert!(
+            notice
+                .body
+                .contains("hello 1.0.0 was revoked by its publisher: signing key leaked")
+        );
+        assert!(notice.body.contains("world 2.0.0 -> 2.1.0"));
+    }
+
+    #[test]
+    fn long_notifications_are_truncated_and_markup_is_escaped() {
+        let many: Vec<UpdateStatus> = (0..12)
+            .map(|i| status(&format!("npub1x/pkg{i}"), "1.0.0", Some("2.0.0"), None))
+            .collect();
+        let notice = update_notice(&many, "").0.unwrap();
+        assert_eq!(notice.body.lines().count(), 9);
+        assert!(notice.body.ends_with("and 4 more"));
+        assert_eq!(
+            escape_notification_markup("<b>x</b> & y"),
+            "&lt;b&gt;x&lt;/b&gt; &amp; y"
+        );
+    }
+
+    #[test]
+    fn only_the_publishers_own_exact_revocation_marks_an_install_revoked() -> Result<()> {
+        let keys = Keys::generate();
+        let secret = keys.secret_key().to_secret_hex();
+        let mut manifest = sample_manifest_with_app(AppMetadata::default());
+        manifest.publisher = keys.public_key().to_hex();
+        manifest.sha256 = "ab".repeat(32);
+        manifest.artifact_event = Some("11".repeat(32));
+        let release = sign_release_event(&manifest, &secret, 1_700_000_000)?;
+        let revocation = sign_revocation_event(&release, &secret, "security issue", 1_700_000_001)?;
+        let installed = InstalledPackage {
+            publisher: manifest.publisher.clone(),
+            name: manifest.name.clone(),
+            version: manifest.version.clone(),
+            sha256: manifest.sha256.clone(),
+            artifact: "a.npk".into(),
+            dependencies: vec![],
+            conflicts: vec![],
+            files: vec![],
+            runtime_requires: vec![],
+            provides: vec![],
+        };
+        assert_eq!(
+            installed_revocation_reason(&installed, std::slice::from_ref(&revocation)).as_deref(),
+            Some("security issue")
+        );
+        // A different version, artifact hash or package is not revoked.
+        for edit in [
+            (|p: &mut InstalledPackage| p.version = "9.9.9".into()) as fn(&mut InstalledPackage),
+            |p| p.sha256 = "cd".repeat(32),
+            |p| p.name = "other".into(),
+        ] {
+            let mut other = installed.clone();
+            edit(&mut other);
+            assert_eq!(
+                installed_revocation_reason(&other, std::slice::from_ref(&revocation)),
+                None
+            );
+        }
+        // A revocation signed by someone else never counts.
+        let stranger = Keys::generate();
+        let mut impostor = installed.clone();
+        impostor.publisher = stranger.public_key().to_hex();
+        assert_eq!(installed_revocation_reason(&impostor, &[revocation]), None);
         Ok(())
     }
 }

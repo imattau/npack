@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily check for npack software updates
+Documentation=https://github.com/imattau/npack
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=2h
+# Run a missed check soon after the machine next wakes or boots.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

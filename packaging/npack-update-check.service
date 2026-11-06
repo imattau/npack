@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for npack software updates and revoked packages
+Documentation=https://github.com/imattau/npack
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Sends a desktop notification (via notify-send) only when something new has
+# appeared since the last run. Install as a *user* unit so the notification
+# reaches the logged-in desktop session.
+ExecStart=/usr/bin/npack update --check --notify --user

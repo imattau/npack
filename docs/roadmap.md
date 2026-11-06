@@ -304,9 +304,14 @@ Store-listing metadata (summary, description, homepage, license, categories,
 screenshots, release date and an icon blob) is now published as additive
 release tags by `npack publish`, validated strictly on the way out and read
 leniently and sanitised on the way in. The daemon fetches and verifies icons (`GetIcon`) and `npack-gui` shows
-icons, summaries, categories and a structured details pane. Still to do:
-category filters and browse/"recently updated" views, and screenshots (which
-need a privacy-preserving way to fetch them).
+icons, summaries, categories and a structured details pane.
+
+Update checks now run in the background: `npack update --check --notify` with a
+systemd user timer sends one desktop notification per new update and escalates
+when an installed package has been revoked; the GUI checks at start, with update
+buttons and a revocation warning. Still to do: category filters and
+browse/"recently updated" views, and screenshots (which need a
+privacy-preserving way to fetch them).
 
 ## Phase 6: COSMIC Store integration
 

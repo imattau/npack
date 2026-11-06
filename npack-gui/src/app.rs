@@ -102,6 +102,8 @@ pub struct NpackGuiApp {
     /// SHA-256 -> (bytes, file extension) for icons npackd has verified.
     icons: HashMap<String, (Arc<[u8]>, &'static str)>,
     icons_requested: HashSet<String>,
+    /// The first automatic update check has been started.
+    auto_checked: bool,
     relays_text: String,
     blossom_text: String,
 
@@ -137,6 +139,7 @@ impl NpackGuiApp {
             profiles_requested: HashSet::new(),
             icons: HashMap::new(),
             icons_requested: HashSet::new(),
+            auto_checked: false,
             relays_text: String::new(),
             blossom_text: String::new(),
             tx,
@@ -455,6 +458,37 @@ impl NpackGuiApp {
         });
     }
 
+    /// Updates one package, or everything installed, as a background
+    /// transaction (same progress flow as an install).
+    fn update(&mut self, package: Option<String>) {
+        self.status = match &package {
+            Some(package) => format!("Starting update of {package}..."),
+            None => "Starting update of all packages...".to_owned(),
+        };
+        self.spawn(move |client| {
+            let mut params = serde_json::json!({ "async": true });
+            if let Some(package) = package {
+                params["package"] = package.into();
+            }
+            match client.call("Update", params) {
+                Ok(value) => match value.get("transaction_id").and_then(Value::as_u64) {
+                    Some(id) => Event::TransactionStarted {
+                        action: "update",
+                        id,
+                    },
+                    None => Event::ActionFinished {
+                        action: "update",
+                        result: Ok(value),
+                    },
+                },
+                Err(error) => Event::ActionFinished {
+                    action: "update",
+                    result: Err(UiError::from_anyhow(&error)),
+                },
+            }
+        });
+    }
+
     fn remove(&mut self, package: &str) {
         let package = package.to_owned();
         self.status = format!("Removing {package}...");
@@ -559,8 +593,15 @@ impl NpackGuiApp {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let first_run = value.get("first_run").and_then(Value::as_bool) == Some(true);
                     self.config = Some(value);
                     self.request_profiles(trusted);
+                    // Look for updates (and revoked packages) once at start,
+                    // as soon as the app is actually set up.
+                    if !first_run && !self.auto_checked {
+                        self.auto_checked = true;
+                        self.refresh_updates();
+                    }
                 }
                 Event::Config(Err(error)) => self.fail("Updating settings", error),
                 Event::InstallPreview(Ok(value)) => {
@@ -617,6 +658,7 @@ impl NpackGuiApp {
                                 self.error = None;
                                 self.refresh_installed();
                                 self.refresh_config();
+                                self.refresh_updates();
                             }
                         },
                         Err(error) => self.fail(action, error),
@@ -855,6 +897,7 @@ impl eframe::App for NpackGuiApp {
 
         egui::CentralPanel::default().show(ui, |ui| {
             self.show_error_banner(ui);
+            self.show_revoked_warning(ui);
             if self.is_first_run() {
                 self.show_welcome(ui);
                 return;
@@ -862,7 +905,11 @@ impl eframe::App for NpackGuiApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Installed, "Installed");
                 ui.selectable_value(&mut self.tab, Tab::Search, "Search");
-                ui.selectable_value(&mut self.tab, Tab::Updates, "Updates");
+                let updates_label = match update_counts(&self.updates).0 {
+                    0 => "Updates".to_owned(),
+                    count => format!("Updates ({count})"),
+                };
+                ui.selectable_value(&mut self.tab, Tab::Updates, updates_label);
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
             });
             ui.separator();
@@ -1228,10 +1275,24 @@ impl NpackGuiApp {
     }
 
     fn show_updates_tab(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Check for updates").clicked() {
-            self.refresh_updates();
-        }
+        let (available, _) = update_counts(&self.updates);
+        let mut to_update = None;
+        let mut update_all = false;
+        ui.horizontal(|ui| {
+            if ui.button("Check for updates").clicked() {
+                self.refresh_updates();
+            }
+            if available > 0
+                && self.active_transaction.is_none()
+                && ui.button(format!("Update all ({available})")).clicked()
+            {
+                update_all = true;
+            }
+        });
         ui.separator();
+        if self.updates.is_empty() {
+            ui.weak("Nothing checked yet, or nothing installed.");
+        }
         for item in &self.updates {
             let reference = value_str(item, "reference");
             let current = value_str(item, "current_version");
@@ -1239,16 +1300,75 @@ impl NpackGuiApp {
                 .get("available_version")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            match available {
-                Some(available) => {
-                    ui.label(format!("{reference}: {current} -> {available} available"));
+            ui.horizontal(|ui| {
+                if let Some(reason) = item.get("revoked").and_then(Value::as_str) {
+                    ui.colored_label(egui::Color32::from_rgb(200, 50, 40), "⚠ Revoked");
+                    ui.label(format!("{reference} {current}"));
+                    ui.weak(format!("The publisher withdrew this version: {reason}"));
+                } else {
+                    ui.label(format!("{reference} {current}"));
                 }
-                None => {
-                    ui.label(format!("{reference}: {current} up to date"));
+                match &available {
+                    Some(available) => {
+                        ui.label(format!("→ {available}"));
+                        if self.active_transaction.is_none() && ui.button("Update").clicked() {
+                            to_update = Some(reference.clone());
+                        }
+                    }
+                    None => {
+                        ui.weak("up to date");
+                    }
                 }
-            }
+            });
+        }
+        if update_all {
+            self.update(None);
+        } else if let Some(reference) = to_update {
+            self.update(Some(reference));
         }
     }
+
+    /// A persistent warning, on every tab, while an installed package has
+    /// been revoked by its publisher.
+    fn show_revoked_warning(&mut self, ui: &mut egui::Ui) {
+        let (_, revoked) = update_counts(&self.updates);
+        if revoked == 0 {
+            return;
+        }
+        let mut open_updates = false;
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgba_unmultiplied(220, 60, 40, 50))
+            .inner_margin(egui::Margin::same(8))
+            .corner_radius(4)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "⚠ {revoked} installed package(s) were revoked by their publisher. \
+                         Update or remove them."
+                    ));
+                    if ui.button("Review").clicked() {
+                        open_updates = true;
+                    }
+                });
+            });
+        ui.add_space(6.0);
+        if open_updates {
+            self.tab = Tab::Updates;
+        }
+    }
+}
+
+/// (packages with an update available, installed packages that were revoked).
+fn update_counts(updates: &[Value]) -> (usize, usize) {
+    let available = updates
+        .iter()
+        .filter(|item| item.get("available_version").is_some_and(|v| v.is_string()))
+        .count();
+    let revoked = updates
+        .iter()
+        .filter(|item| item.get("revoked").is_some_and(|v| v.is_string()))
+        .count();
+    (available, revoked)
 }
 
 #[cfg(test)]
@@ -1302,6 +1422,18 @@ mod tests {
             app_text(&serde_json::json!({"app": {"summary": ""}}), "summary"),
             None
         );
+    }
+
+    #[test]
+    fn update_counts_separate_available_updates_from_revoked_installs() {
+        let updates = vec![
+            serde_json::json!({"reference": "a/x", "available_version": "2.0.0"}),
+            serde_json::json!({"reference": "a/y", "available_version": null}),
+            serde_json::json!({"reference": "a/z", "available_version": "1.1.0", "revoked": "leaked key"}),
+            serde_json::json!({"reference": "a/w"}),
+        ];
+        assert_eq!(update_counts(&updates), (2, 1));
+        assert_eq!(update_counts(&[]), (0, 0));
     }
 
     #[test]

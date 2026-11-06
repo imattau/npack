@@ -401,6 +401,42 @@ npub1.../otherapp 2.3.0 up to date
 1 update(s) available.
 ```
 
+`--check` also reports installed packages whose release has been **revoked** by
+their publisher, with the publisher's reason:
+
+```text
+[REVOKED] npub1.../myapp 1.0.0: signing key leaked
+```
+
+A revocation counts only when it is a valid signed event from the package's own
+publisher naming that exact name, version and artifact hash. It is a signal to
+update or remove the package, not something npack acts on by itself.
+
+#### Automatic checks and desktop notifications
+
+`npack update --check --notify` does the same check and then sends a desktop
+notification through `notify-send` (install `libnotify`/`libnotify-bin`) when
+something has appeared that it has not already told you about: a new update, or
+a revoked install (which is sent as critical urgency). It remembers what it
+announced in `update-notified.txt` in the store, so running it from a timer does
+not repeat itself until the situation changes. If `notify-send` is missing the
+command fails rather than staying silent.
+
+To check daily, install the systemd user units from `packaging/` and enable the
+timer:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp packaging/npack-update-check.service packaging/npack-update-check.timer ~/.config/systemd/user/
+systemctl --user enable --now npack-update-check.timer
+```
+
+The service runs `/usr/bin/npack update --check --notify --user`; edit the path or
+flags in the copied unit if npack is installed elsewhere or you use a system
+store. The check is randomised by up to two hours and a missed run happens soon
+after the machine next starts. The GUI also checks once when it opens, and warns
+on every tab while an installed package is revoked.
+
 Search results are reduced to the newest valid SemVer release for each
 publisher/package pair, while retaining all platform artifacts belonging to
 that release; a `--trusted-publisher` filter and NIP-65 identity narrow which
@@ -613,7 +649,7 @@ Supported methods, mirroring the CLI operations above:
 | `Install` | `package`, `requirement`, `relay[]`, `server[]`, `user`, `store`, `allow_capability[]`, `trust_once[]`, `install_values{}`, `async` | The installed package's record, or `{"transaction_id": N}` if `async` is true. `install_values` is a per-install object keyed by descriptor id. |
 | `Remove` | `package`, `user`, `store` | `{"removed": "<package>"}`. |
 | `Update` | `package` (omit for all), `relay[]`, `server[]`, `user`, `store`, `allow_capability[]`, `async` | Array of per-package update outcomes, or `{"transaction_id": N}` if `async` is true. |
-| `CheckUpdates` | `package` (omit for all), `relay[]`, `trusted_publisher[]`, `user`, `store` | Array of `{reference, current_version, available_version}`. |
+| `CheckUpdates` | `package` (omit for all), `relay[]`, `trusted_publisher[]`, `user`, `store` | Array of `{reference, current_version, available_version}`, plus `revoked` (the publisher's reason) when the installed release has been revoked. |
 | `GetTransaction` | `transaction_id` | `{"status": "running", "progress": {...}}`, `{"status": "succeeded", "result": ...}`, `{"status": "failed", "error": "..."}`, or `{"status": "cancelled"}`. |
 | `CancelTransaction` | `transaction_id` | `{"cancel_requested": true}`. |
 | `GetConfig` | none | `{first_run, config_path, relays[], blossom[], relays_defaulted, blossom_defaulted, trusted_publishers[{publisher, npub}]}`. `first_run` is true when no `config.toml` exists yet. |
