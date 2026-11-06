@@ -309,7 +309,10 @@ icons, summaries, categories and a structured details pane.
 Update checks now run in the background: `npack update --check --notify` with a
 systemd user timer sends one desktop notification per new update and escalates
 when an installed package has been revoked; the GUI checks at start, with update
-buttons and a revocation warning. Still to do: category filters and
+buttons and a revocation warning. `npack history` and `npack rollback` (also in the
+daemon and GUI) record every change and let a package be switched back to the
+version it replaced, offline, after re-verifying the stored archive and the
+cached signed metadata. Still to do: category filters and
 browse/"recently updated" views, and screenshots (which need a
 privacy-preserving way to fetch them).
 

@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, mpsc},
     thread,
     time::Duration,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use eframe::egui;
@@ -32,6 +33,10 @@ enum Event {
     Config(Result<Value, UiError>),
     /// Extra package details for the "unknown publisher" dialog.
     InstallPreview(Result<Value, UiError>),
+    /// `ListRollbacks`: packages that can be switched back, and to what.
+    Rollbacks(Result<Vec<Value>, UiError>),
+    /// `GetHistory`: recent changes to installed packages, newest first.
+    History(Result<Vec<Value>, UiError>),
     /// A verified icon fetched by npackd (`GetIcon`), keyed by its SHA-256.
     Icon {
         sha256: String,
@@ -104,6 +109,9 @@ pub struct NpackGuiApp {
     icons_requested: HashSet<String>,
     /// The first automatic update check has been started.
     auto_checked: bool,
+    /// reference -> version it can be switched back to.
+    rollbacks: HashMap<String, String>,
+    history: Vec<Value>,
     relays_text: String,
     blossom_text: String,
 
@@ -140,6 +148,8 @@ impl NpackGuiApp {
             icons: HashMap::new(),
             icons_requested: HashSet::new(),
             auto_checked: false,
+            rollbacks: HashMap::new(),
+            history: Vec::new(),
             relays_text: String::new(),
             blossom_text: String::new(),
             tx,
@@ -489,6 +499,37 @@ impl NpackGuiApp {
         });
     }
 
+    fn refresh_rollbacks_and_history(&self) {
+        self.spawn(|client| {
+            Event::Rollbacks(
+                client
+                    .call("ListRollbacks", serde_json::json!({}))
+                    .map(|value| value.as_array().cloned().unwrap_or_default())
+                    .map_err(|error| UiError::from_anyhow(&error)),
+            )
+        });
+        self.spawn(|client| {
+            Event::History(
+                client
+                    .call("GetHistory", serde_json::json!({ "limit": 20 }))
+                    .map(|value| value.as_array().cloned().unwrap_or_default())
+                    .map_err(|error| UiError::from_anyhow(&error)),
+            )
+        });
+    }
+
+    /// Switches a package back to the version it replaced (works offline).
+    fn rollback(&mut self, package: &str) {
+        let package = package.to_owned();
+        self.status = format!("Switching {package} back...");
+        self.spawn(move |client| Event::ActionFinished {
+            action: "rollback",
+            result: client
+                .call("Rollback", serde_json::json!({ "package": package }))
+                .map_err(|error| UiError::from_anyhow(&error)),
+        });
+    }
+
     fn remove(&mut self, package: &str) {
         let package = package.to_owned();
         self.status = format!("Removing {package}...");
@@ -545,7 +586,23 @@ impl NpackGuiApp {
                 Event::Installed(Ok(items)) => {
                     self.status = format!("{} package(s) installed.", items.len());
                     self.installed = items;
+                    self.refresh_rollbacks_and_history();
                 }
+                Event::Rollbacks(Ok(items)) => {
+                    self.rollbacks = items
+                        .iter()
+                        .map(|item| {
+                            (
+                                value_str(item, "reference"),
+                                value_str(item, "previous_version"),
+                            )
+                        })
+                        .collect();
+                }
+                Event::History(Ok(items)) => self.history = items,
+                // Rollback and history are extras; failing to load them must
+                // not raise an error banner over the installed list.
+                Event::Rollbacks(Err(_)) | Event::History(Err(_)) => {}
                 Event::Installed(Err(error)) => self.fail("Loading installed packages", error),
                 Event::Search(Ok(items)) => {
                     self.status = format!("{} result(s).", items.len());
@@ -723,6 +780,49 @@ fn short_npub(npub: &str) -> String {
 }
 
 const ICON_SIZE: f32 = 40.0;
+
+/// "5 minutes ago", "3 days ago".
+fn describe_age(now: u64, then: u64) -> String {
+    let seconds = now.saturating_sub(then);
+    let (count, unit) = match seconds {
+        0..=59 => return "just now".to_owned(),
+        60..=3599 => (seconds / 60, "minute"),
+        3600..=86_399 => (seconds / 3600, "hour"),
+        _ => (seconds / 86_400, "day"),
+    };
+    format!("{count} {unit}{} ago", if count == 1 { "" } else { "s" })
+}
+
+/// One line of the history list, e.g. "2 hours ago: upgraded x/app 1.0.0 → 1.1.0".
+fn history_line(entry: &Value, now: u64) -> String {
+    let version = |field: &str| {
+        entry
+            .get(field)
+            .and_then(|v| v.get("version"))
+            .and_then(Value::as_str)
+    };
+    let verb = match entry
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("changed")
+    {
+        "install" => "installed",
+        "upgrade" => "upgraded",
+        "downgrade" => "downgraded",
+        "reinstall" => "reinstalled",
+        "rollback" => "switched back",
+        "remove" => "removed",
+        other => other,
+    };
+    let change = match (version("from"), version("to")) {
+        (Some(from), Some(to)) => format!("{from} → {to}"),
+        (None, Some(to)) => to.to_owned(),
+        (Some(from), None) => from.to_owned(),
+        (None, None) => String::new(),
+    };
+    let age = describe_age(now, entry.get("at").and_then(Value::as_u64).unwrap_or(now));
+    format!("{age}: {verb} {} {change}", value_str(entry, "reference"))
+}
 
 /// A listing field the publisher wrote (already cleaned by npackd). Shown as
 /// plain text only: never interpreted, never fetched.
@@ -1189,6 +1289,7 @@ impl NpackGuiApp {
         ui.separator();
         let mut to_remove = None;
         let mut to_show = None;
+        let mut to_rollback = None;
         for item in &self.installed {
             let reference = package_reference(item);
             ui.horizontal(|ui| {
@@ -1196,13 +1297,40 @@ impl NpackGuiApp {
                 if ui.button("Details").clicked() {
                     to_show = Some(reference.clone());
                 }
+                if let Some(previous) = self.rollbacks.get(&reference)
+                    && self.active_transaction.is_none()
+                    && ui
+                        .button(format!("Switch back to {previous}"))
+                        .on_hover_text(
+                            "Reinstalls the version this one replaced, from the copy npack kept. \
+                             No download needed.",
+                        )
+                        .clicked()
+                {
+                    to_rollback = Some(reference.clone());
+                }
                 if ui.button("Remove").clicked() {
                     to_remove = Some(reference.clone());
                 }
             });
         }
+        if !self.history.is_empty() {
+            ui.add_space(8.0);
+            ui.collapsing("History", |ui| {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs())
+                    .unwrap_or_default();
+                for entry in &self.history {
+                    ui.label(history_line(entry, now));
+                }
+            });
+        }
         if let Some(reference) = to_show {
             self.show_details(&reference);
+        }
+        if let Some(reference) = to_rollback {
+            self.rollback(&reference);
         }
         if let Some(reference) = to_remove {
             self.remove(&reference);
@@ -1434,6 +1562,24 @@ mod tests {
         ];
         assert_eq!(update_counts(&updates), (2, 1));
         assert_eq!(update_counts(&[]), (0, 0));
+    }
+
+    #[test]
+    fn history_is_described_in_plain_words() {
+        assert_eq!(describe_age(1000, 1000), "just now");
+        assert_eq!(describe_age(1000 + 60, 1000), "1 minute ago");
+        assert_eq!(describe_age(1000 + 7200, 1000), "2 hours ago");
+        assert_eq!(describe_age(1000 + 3 * 86_400, 1000), "3 days ago");
+        let entry = serde_json::json!({
+            "at": 1000, "action": "rollback", "reference": "npub1x/app",
+            "from": {"version": "2.0.0"}, "to": {"version": "1.0.0"}
+        });
+        assert_eq!(
+            history_line(&entry, 1000 + 120),
+            "2 minutes ago: switched back npub1x/app 2.0.0 → 1.0.0"
+        );
+        let removal = serde_json::json!({"at": 0, "action": "remove", "reference": "npub1x/app", "from": {"version": "1.0.0"}});
+        assert!(history_line(&removal, 0).ends_with("removed npub1x/app 1.0.0"));
     }
 
     #[test]

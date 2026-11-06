@@ -710,6 +710,51 @@ enum Command {
         #[arg(long, help = "Path to write the .npk archive to")]
         output: PathBuf,
     },
+    /// Show what npack installed, upgraded, rolled back or removed.
+    History {
+        #[arg(help = "Only show this package: <publisher>/<name>")]
+        package: Option<String>,
+        #[arg(
+            long,
+            default_value_t = 20,
+            help = "Show at most this many entries (newest first)"
+        )]
+        limit: usize,
+        #[arg(
+            long,
+            help = "Package store root; defaults to /var/lib/npack, or ~/.local with --user"
+        )]
+        store: Option<PathBuf>,
+        #[arg(long, conflicts_with = "system", help = "Use the user's prefix")]
+        user: bool,
+        #[arg(long, conflicts_with = "user", help = "Use the system prefix")]
+        system: bool,
+    },
+    /// Switch an installed package back to the version it replaced.
+    ///
+    /// Works offline: it reinstalls the previous version's stored archive after
+    /// re-checking it against its recorded SHA-256 and the signed release
+    /// metadata npack cached when it was installed. Run it again to switch
+    /// forward. It does not check whether that version has since been revoked;
+    /// `npack update --check` does.
+    Rollback {
+        #[arg(help = "<publisher>/<name>")]
+        package: String,
+        #[arg(
+            long = "allow-capability",
+            help = "Runtime capability this install may grant (e.g. service-manager); repeatable"
+        )]
+        allowed_capabilities: Vec<String>,
+        #[arg(
+            long,
+            help = "Package store root; defaults to /var/lib/npack, or ~/.local with --user"
+        )]
+        store: Option<PathBuf>,
+        #[arg(long, conflicts_with = "system", help = "Use the user's prefix")]
+        user: bool,
+        #[arg(long, conflicts_with = "user", help = "Use the system prefix")]
+        system: bool,
+    },
     /// Remove an installed package.
     Remove {
         #[arg(help = "<publisher>/<name>")]
@@ -1355,6 +1400,42 @@ async fn main() -> Result<()> {
             .await?
         }
         Command::Pack { source, output } => pack_npk(&source, &output)?,
+        Command::History {
+            package,
+            limit,
+            store,
+            user,
+            system,
+        } => history_command(
+            package.as_deref(),
+            limit,
+            store.as_deref(),
+            user || (!system && config.install.user),
+        )?,
+        Command::Rollback {
+            package,
+            allowed_capabilities,
+            store,
+            user,
+            system,
+        } => {
+            let (from, to) = rollback_package_at(
+                &package,
+                store.as_deref(),
+                user || (!system && config.install.user),
+                &allowed_capabilities,
+            )?;
+            println!(
+                "{} {package} {} -> {}",
+                green("rolled back"),
+                from.version,
+                to.version
+            );
+            println!(
+                "Run `npack update --check` to confirm {} has not been revoked.",
+                to.version
+            );
+        }
         Command::Remove {
             package,
             store,
@@ -4548,6 +4629,14 @@ fn daemon_error_code(message: &str) -> &'static str {
         "download_failed"
     } else if has("installation cancelled") || has("update cancelled") {
         "cancelled"
+    } else if has("is recorded to roll back to") {
+        "no_rollback"
+    } else if has("cannot roll back")
+        || has("refusing to roll back")
+        || has("cannot be verified offline")
+        || has("stored archive")
+    {
+        "rollback_blocked"
     } else if has("has no store icon") {
         "no_icon"
     } else if has("is not installed") || has("no release named") || has("no verified release") {
@@ -4615,6 +4704,8 @@ fn polkit_action_for_method(method: &str) -> Option<&'static str> {
         "Install" => Some("io.npack.install"),
         "Remove" => Some("io.npack.remove"),
         "Update" => Some("io.npack.update"),
+        // Switching to another stored version is a package change like an update.
+        "Rollback" => Some("io.npack.update"),
         // Editing trust or network settings on the system daemon changes what
         // root will install, so it is gated like a mutation.
         "AddTrustedPublisher" | "RemoveTrustedPublisher" | "SaveConfig" => {
@@ -4955,6 +5046,9 @@ async fn dispatch_daemon_request(
         "GetConfig" => daemon_get_config(state),
         "ListTrustedPublishers" => daemon_list_trusted_publishers(state),
         "GetIcon" => daemon_get_icon(request.params).await,
+        "GetHistory" => daemon_get_history(&state.config(), request.params),
+        "ListRollbacks" => daemon_list_rollbacks(&state.config(), request.params),
+        "Rollback" => daemon_rollback(&state.config(), request.params),
         "ResolvePublisher" => daemon_resolve_publisher(state, request.params).await,
         "GetPublisherProfiles" => daemon_get_publisher_profiles(state, request.params).await,
         "AddTrustedPublisher" => daemon_add_trusted_publisher(state, request.params).await,
@@ -5857,6 +5951,97 @@ async fn daemon_resolve_publisher(
         .as_array()
         .and_then(|items| items.first().cloned())
         .unwrap_or_else(|| serde_json::to_value(PublisherIdentity::bare(&hex)).unwrap_or_default()))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct HistoryParams {
+    #[serde(default)]
+    package: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    user: bool,
+    #[serde(default)]
+    store: Option<PathBuf>,
+}
+
+/// Newest-first change history, each entry with a display `reference`.
+fn daemon_get_history(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
+    let params: HistoryParams =
+        serde_json::from_value(params).context("invalid GetHistory params")?;
+    let root = install_paths(params.store.as_deref(), params.user || config.install.user).0;
+    let filter = params
+        .package
+        .as_deref()
+        .map(split_package_reference)
+        .transpose()?;
+    let entries: Vec<serde_json::Value> = load_history(&root)
+        .into_iter()
+        .rev()
+        .filter(|entry| {
+            filter.as_ref().is_none_or(|(publisher, name)| {
+                &entry.publisher == publisher && &entry.name == name
+            })
+        })
+        .take(params.limit.unwrap_or(100))
+        .map(|entry| {
+            let mut value = serde_json::to_value(&entry).unwrap_or_default();
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "reference".into(),
+                    format!("{}/{}", display_publisher(&entry.publisher), entry.name).into(),
+                );
+            }
+            value
+        })
+        .collect();
+    Ok(serde_json::Value::Array(entries))
+}
+
+/// The installed packages that can be switched back right now, and to what.
+fn daemon_list_rollbacks(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
+    let params: HistoryParams =
+        serde_json::from_value(params).context("invalid ListRollbacks params")?;
+    let root = install_paths(params.store.as_deref(), params.user || config.install.user).0;
+    Ok(serde_json::Value::Array(
+        available_rollbacks(&root)?
+            .into_iter()
+            .map(|(installed, target)| {
+                serde_json::json!({
+                    "reference": installed_package_reference(&installed),
+                    "current_version": installed.version,
+                    "previous_version": target.version,
+                })
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct RollbackParams {
+    package: String,
+    #[serde(default)]
+    allow_capability: Vec<String>,
+    #[serde(default)]
+    user: bool,
+    #[serde(default)]
+    store: Option<PathBuf>,
+}
+
+fn daemon_rollback(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
+    let params: RollbackParams =
+        serde_json::from_value(params).context("invalid Rollback params")?;
+    let (from, to) = rollback_package_at(
+        &params.package,
+        params.store.as_deref(),
+        params.user || config.install.user,
+        &params.allow_capability,
+    )?;
+    Ok(serde_json::json!({
+        "package": params.package,
+        "from_version": from.version,
+        "to_version": to.version,
+    }))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -8020,6 +8205,28 @@ fn install_with_capabilities_at(
     user: bool,
     allowed_capabilities: &[String],
 ) -> Result<InstalledPackage> {
+    install_with_history_at(
+        manifest,
+        manifest_path,
+        store,
+        prefix_override,
+        user,
+        allowed_capabilities,
+        None,
+    )
+}
+
+/// Installs a package and records the change in the store's history.
+/// `action` overrides the recorded action (a rollback is not "downgrade").
+fn install_with_history_at(
+    manifest: &Manifest,
+    manifest_path: &Path,
+    store: Option<&Path>,
+    prefix_override: Option<&Path>,
+    user: bool,
+    allowed_capabilities: &[String],
+    action: Option<&str>,
+) -> Result<InstalledPackage> {
     ensure_installable_kind(manifest)?;
     let (root, default_prefix) = install_paths(store, user);
     let prefix = prefix_override.unwrap_or(&default_prefix);
@@ -8035,6 +8242,14 @@ fn install_with_capabilities_at(
         &format!("{}/{}", manifest.publisher, manifest.name),
         &package_dir,
     )?;
+    // Read under the store lock so the "from" version cannot be stale.
+    let previous = installed_packages(Some(&root))?
+        .into_iter()
+        .find(|package| package.publisher == manifest.publisher && package.name == manifest.name)
+        .map(|package| HistoryVersion {
+            version: package.version,
+            sha256: package.sha256,
+        });
     let installed = install_locked(
         manifest,
         manifest_path,
@@ -8045,6 +8260,23 @@ fn install_with_capabilities_at(
         allowed_capabilities,
     )?;
     transaction.commit()?;
+    let to = HistoryVersion {
+        version: installed.version.clone(),
+        sha256: installed.sha256.clone(),
+    };
+    append_history(
+        &root,
+        &HistoryEntry {
+            at: now_unix(),
+            action: action
+                .unwrap_or_else(|| history_action(previous.as_ref(), &to))
+                .to_owned(),
+            publisher: installed.publisher.clone(),
+            name: installed.name.clone(),
+            from: previous,
+            to: Some(to),
+        },
+    );
     Ok(installed)
 }
 
@@ -8762,8 +8994,29 @@ fn remove_package_at(package: &str, store: Option<&Path>, user: bool) -> Result<
     let root = install_paths(store, user).0;
     let transaction =
         StoreTransaction::begin(&root, "remove", &format!("{publisher}/{name}"), &root)?;
+    let before: Vec<HistoryVersion> = installed_packages(Some(&root))?
+        .into_iter()
+        .filter(|installed| installed.publisher == publisher && installed.name == name)
+        .map(|installed| HistoryVersion {
+            version: installed.version,
+            sha256: installed.sha256,
+        })
+        .collect();
     let removed = remove_locked(&publisher, name, package, &root)?;
     transaction.commit()?;
+    for version in before {
+        append_history(
+            &root,
+            &HistoryEntry {
+                at: now_unix(),
+                action: "remove".into(),
+                publisher: publisher.clone(),
+                name: name.to_owned(),
+                from: Some(version),
+                to: None,
+            },
+        );
+    }
     println!("removed {package} ({removed} version(s))");
     Ok(())
 }
@@ -8858,6 +9111,347 @@ fn remove_locked(publisher: &str, name: &str, package: &str, root: &Path) -> Res
         serde_json::to_vec_pretty(&remaining)?,
     )?;
     Ok(removed)
+}
+
+// ---------------------------------------------------------------------------
+// History and rollback
+//
+// Every install, upgrade, downgrade, rollback and removal appends one line to
+// `<store>/history.jsonl`. Upgrades leave the old version's archive in its own
+// directory and the signed release event for every resolved version is cached,
+// so rolling back is an ordinary install of the stored archive, re-checked
+// against both its recorded hash and the cached signed metadata, with no
+// network and no separate "restore files" mechanism to go wrong.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HistoryVersion {
+    version: String,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HistoryEntry {
+    /// Unix seconds.
+    at: u64,
+    /// `install`, `upgrade`, `downgrade`, `reinstall`, `rollback` or `remove`.
+    action: String,
+    publisher: String,
+    name: String,
+    #[serde(default)]
+    from: Option<HistoryVersion>,
+    #[serde(default)]
+    to: Option<HistoryVersion>,
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+fn history_path(root: &Path) -> PathBuf {
+    root.join("history.jsonl")
+}
+
+/// Appends one entry. History is a convenience record: failing to write it
+/// warns but never fails (or undoes) the install or removal that succeeded.
+fn append_history(root: &Path, entry: &HistoryEntry) {
+    let write = || -> Result<()> {
+        fs::create_dir_all(root)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(history_path(root))?;
+        let mut line = serde_json::to_string(entry)?;
+        line.push('\n');
+        file.write_all(line.as_bytes())?;
+        Ok(())
+    };
+    if let Err(error) = write() {
+        eprintln!("warning: could not record history: {error:#}");
+    }
+}
+
+/// All entries, oldest first. Lines that do not parse are skipped.
+fn load_history(root: &Path) -> Vec<HistoryEntry> {
+    fs::read_to_string(history_path(root))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+fn history_action(previous: Option<&HistoryVersion>, new: &HistoryVersion) -> &'static str {
+    let Some(previous) = previous else {
+        return "install";
+    };
+    match (
+        Version::parse(&previous.version),
+        Version::parse(&new.version),
+    ) {
+        (Ok(old), Ok(new_version)) if new_version > old => "upgrade",
+        (Ok(old), Ok(new_version)) if new_version < old => "downgrade",
+        _ => "reinstall",
+    }
+}
+
+/// The version `installed` replaced, according to history: the `from` of the
+/// newest entry that produced exactly this version and archive. After a
+/// rollback this is the version rolled back from, so running it again
+/// switches forward.
+fn rollback_target(
+    history: &[HistoryEntry],
+    installed: &InstalledPackage,
+) -> Option<HistoryVersion> {
+    history
+        .iter()
+        .rev()
+        .find(|entry| {
+            entry.publisher == installed.publisher
+                && entry.name == installed.name
+                && entry.to.as_ref().is_some_and(|to| {
+                    to.version == installed.version
+                        && to.sha256.eq_ignore_ascii_case(&installed.sha256)
+                })
+        })
+        .and_then(|entry| entry.from.clone())
+}
+
+/// `YYYY-MM-DD HH:MM` in UTC.
+fn format_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let remainder = secs % 86_400;
+    let (hour, minute) = (remainder / 3600, (remainder % 3600) / 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
+}
+
+fn split_package_reference(package: &str) -> Result<(String, String)> {
+    let (publisher, name) = package
+        .split_once('/')
+        .context("package reference must be publisher/name")?;
+    let publisher = normalize_publisher_reference(publisher);
+    if publisher.is_empty() || name.is_empty() || publisher.contains('/') || name.contains('/') {
+        bail!("package reference must be publisher/name");
+    }
+    Ok((publisher, name.to_owned()))
+}
+
+fn history_command(
+    package: Option<&str>,
+    limit: usize,
+    store: Option<&Path>,
+    user: bool,
+) -> Result<()> {
+    let root = install_paths(store, user).0;
+    let filter = package.map(split_package_reference).transpose()?;
+    let entries: Vec<HistoryEntry> = load_history(&root)
+        .into_iter()
+        .rev()
+        .filter(|entry| {
+            filter.as_ref().is_none_or(|(publisher, name)| {
+                &entry.publisher == publisher && &entry.name == name
+            })
+        })
+        .take(limit)
+        .collect();
+    if entries.is_empty() {
+        println!("No history recorded.");
+        return Ok(());
+    }
+    for entry in entries {
+        let change = match (&entry.from, &entry.to) {
+            (Some(from), Some(to)) => format!("{} -> {}", from.version, to.version),
+            (None, Some(to)) => to.version.clone(),
+            (Some(from), None) => from.version.clone(),
+            (None, None) => String::new(),
+        };
+        println!(
+            "{}  {:<9} {}/{} {change}",
+            format_utc(entry.at),
+            entry.action,
+            display_publisher(&entry.publisher),
+            entry.name
+        );
+    }
+    Ok(())
+}
+
+/// Everything needed to switch an installed package back, already verified.
+struct RollbackPlan {
+    current: HistoryVersion,
+    target: HistoryVersion,
+    artifact: PathBuf,
+    release: Event,
+}
+
+/// Works out, without changing anything, whether `installed` can be switched
+/// back and to what: history names the target; its stored archive must still
+/// hash to the recorded value; and the signed release event cached when it was
+/// first installed must be present and valid.
+fn plan_rollback(root: &Path, installed: &InstalledPackage) -> Result<RollbackPlan> {
+    let reference = format!(
+        "{}/{}",
+        display_publisher(&installed.publisher),
+        installed.name
+    );
+    let target = rollback_target(&load_history(root), installed).with_context(|| {
+        format!("no earlier version of {reference} is recorded to roll back to")
+    })?;
+    let directory = root
+        .join("packages")
+        .join(&installed.publisher)
+        .join(&installed.name)
+        .join(&target.version);
+    // The archive is stored under whatever name the download had, so find it
+    // by what it is: a file in the version's directory with the recorded hash.
+    let files: Vec<PathBuf> = fs::read_dir(&directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect();
+    if files.is_empty() {
+        bail!(
+            "the stored archive for {reference} {} is gone ({} has no archive)",
+            target.version,
+            directory.display()
+        );
+    }
+    let artifact = files
+        .into_iter()
+        .find(|path| hash_file(path).is_ok_and(|hash| hash.eq_ignore_ascii_case(&target.sha256)))
+        .with_context(|| {
+            format!(
+                "the stored archive for {reference} {} no longer matches its recorded SHA-256; refusing to roll back",
+                target.version
+            )
+        })?;
+    let release = load_cached_release(
+        root,
+        &LockedPackage {
+            publisher: installed.publisher.clone(),
+            name: installed.name.clone(),
+            version: target.version.clone(),
+            sha256: target.sha256.to_ascii_lowercase(),
+            dependencies: Vec::new(),
+            conflicts: Vec::new(),
+            runtime_requires: Vec::new(),
+            provides: Vec::new(),
+        },
+    )
+    .with_context(|| {
+        format!(
+            "the signed release metadata for {reference} {} was not cached, so it cannot be verified offline",
+            target.version
+        )
+    })?;
+    Ok(RollbackPlan {
+        current: HistoryVersion {
+            version: installed.version.clone(),
+            sha256: installed.sha256.clone(),
+        },
+        target,
+        artifact,
+        release,
+    })
+}
+
+/// The installed packages that can currently be switched back, with the
+/// version each would switch to.
+fn available_rollbacks(root: &Path) -> Result<Vec<(InstalledPackage, HistoryVersion)>> {
+    Ok(installed_packages(Some(root))?
+        .into_iter()
+        .filter_map(|installed| {
+            let plan = plan_rollback(root, &installed).ok()?;
+            Some((installed, plan.target))
+        })
+        .collect())
+}
+
+/// Switches `package` back to the version it replaced. Returns (from, to).
+fn rollback_package_at(
+    package: &str,
+    store: Option<&Path>,
+    user: bool,
+    allowed_capabilities: &[String],
+) -> Result<(HistoryVersion, HistoryVersion)> {
+    let (publisher, name) = split_package_reference(package)?;
+    let root = install_paths(store, user).0;
+    let installed = installed_packages(Some(&root))?;
+    let current = installed
+        .iter()
+        .find(|candidate| candidate.publisher == publisher && candidate.name == name)
+        .with_context(|| format!("package {package} is not installed"))?;
+    let plan = plan_rollback(&root, current)?;
+    let target_version = Version::parse(&plan.target.version)
+        .with_context(|| format!("recorded version {} is not SemVer", plan.target.version))?;
+    // Never break something that depends on the version being left behind.
+    for other in &installed {
+        for dependency in &other.dependencies {
+            if dependency.name == name
+                && dependency
+                    .publisher
+                    .as_deref()
+                    .is_none_or(|dependency_publisher| dependency_publisher == publisher)
+                && VersionReq::parse(&dependency.requirement)
+                    .is_ok_and(|requirement| !requirement.matches(&target_version))
+            {
+                bail!(
+                    "cannot roll back {package} to {}: {}/{} requires {}",
+                    plan.target.version,
+                    display_publisher(&other.publisher),
+                    other.name,
+                    dependency.requirement
+                );
+            }
+        }
+    }
+    // Install from a private copy: the normal install path copies the archive
+    // into the package directory, which here is where it already lives.
+    let staging = root
+        .join("rollback-staging")
+        .join(std::process::id().to_string());
+    fs::create_dir_all(&staging)?;
+    let result = (|| -> Result<()> {
+        let staged = staging.join(
+            plan.artifact
+                .file_name()
+                .context("archive has no filename")?,
+        );
+        fs::copy(&plan.artifact, &staged)?;
+        let manifest = manifest_from_release(&plan.release, &staged, &plan.target.sha256)?;
+        install_with_history_at(
+            &manifest,
+            &staging.join("manifest.json"),
+            store,
+            None,
+            user,
+            allowed_capabilities,
+            Some("rollback"),
+        )?;
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(&staging);
+    result?;
+    Ok((plan.current, plan.target))
 }
 
 #[cfg(test)]
@@ -10878,6 +11472,17 @@ mod tests {
             required_authorization(DaemonRole::System, 1000, "Update"),
             Some("io.npack.update")
         );
+        assert_eq!(
+            required_authorization(DaemonRole::System, 1000, "Rollback"),
+            Some("io.npack.update"),
+            "switching versions changes installed software"
+        );
+        for method in ["GetHistory", "ListRollbacks"] {
+            assert_eq!(
+                required_authorization(DaemonRole::System, 1000, method),
+                None
+            );
+        }
         for method in [
             "AddTrustedPublisher",
             "RemoveTrustedPublisher",
@@ -12169,6 +12774,296 @@ mod tests {
         let mut impostor = installed.clone();
         impostor.publisher = stranger.public_key().to_hex();
         assert_eq!(installed_revocation_reason(&impostor, &[revocation]), None);
+        Ok(())
+    }
+
+    /// Packs and installs one version of a signed test package into `root`,
+    /// the way a remote install would: archive stored as `artifact`, the
+    /// signed release event cached.
+    fn install_test_version(
+        dir: &Path,
+        root: &Path,
+        keys: &Keys,
+        version: &str,
+    ) -> Result<Manifest> {
+        let source = dir.join(format!("src-{version}"));
+        fs::create_dir_all(source.join("bin"))?;
+        fs::write(source.join("bin/app"), format!("app {version}"))?;
+        let download = dir.join(format!("download-{version}"));
+        fs::create_dir_all(&download)?;
+        pack_npk(&source, &download.join("artifact"))?;
+        let mut manifest = sample_manifest_with_app(AppMetadata::default());
+        manifest.publisher = keys.public_key().to_hex();
+        manifest.name = "app".into();
+        manifest.version = version.into();
+        manifest.artifact = "artifact".into();
+        manifest.sha256 = hash_file(&download.join("artifact"))?;
+        manifest.artifact_event = Some("11".repeat(32));
+        let event =
+            sign_release_event(&manifest, &keys.secret_key().to_secret_hex(), 1_700_000_000)?;
+        cache_release(root, &event)?;
+        install_with_capabilities_at(
+            &manifest,
+            &download.join("manifest.json"),
+            Some(root),
+            None,
+            false,
+            &[],
+        )?;
+        Ok(manifest)
+    }
+
+    fn installed_version(root: &Path) -> Result<String> {
+        Ok(installed_packages(Some(root))?
+            .first()
+            .context("nothing installed")?
+            .version
+            .clone())
+    }
+
+    fn app_file(root: &Path) -> Result<String> {
+        Ok(fs::read_to_string(root.join("packages/bin/app"))?)
+    }
+
+    #[test]
+    fn upgrades_are_recorded_and_can_be_rolled_back_and_forward_offline() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("store");
+        let keys = Keys::generate();
+        let reference = format!("{}/app", keys.public_key().to_hex());
+
+        install_test_version(dir.path(), &root, &keys, "1.0.0")?;
+        install_test_version(dir.path(), &root, &keys, "2.0.0")?;
+        assert_eq!(
+            (installed_version(&root)?, app_file(&root)?),
+            ("2.0.0".into(), "app 2.0.0".into())
+        );
+        let actions: Vec<String> = load_history(&root).into_iter().map(|e| e.action).collect();
+        assert_eq!(actions, ["install", "upgrade"]);
+
+        let (from, to) = rollback_package_at(&reference, Some(&root), false, &[])?;
+        assert_eq!(
+            (from.version.as_str(), to.version.as_str()),
+            ("2.0.0", "1.0.0")
+        );
+        assert_eq!(
+            (installed_version(&root)?, app_file(&root)?),
+            ("1.0.0".into(), "app 1.0.0".into())
+        );
+        assert_eq!(load_history(&root).last().unwrap().action, "rollback");
+        assert!(
+            !root
+                .join("rollback-staging")
+                .join(std::process::id().to_string())
+                .exists()
+        );
+
+        // Running it again switches forward.
+        rollback_package_at(&reference, Some(&root), false, &[])?;
+        assert_eq!(
+            (installed_version(&root)?, app_file(&root)?),
+            ("2.0.0".into(), "app 2.0.0".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_refuses_when_there_is_nothing_to_go_back_to() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("store");
+        let keys = Keys::generate();
+        let reference = format!("{}/app", keys.public_key().to_hex());
+        install_test_version(dir.path(), &root, &keys, "1.0.0")?;
+        let error = rollback_package_at(&reference, Some(&root), false, &[]).unwrap_err();
+        assert_eq!(
+            daemon_error_code(&error.to_string()),
+            "no_rollback",
+            "{error}"
+        );
+        let error = rollback_package_at("nobody/else", Some(&root), false, &[]).unwrap_err();
+        assert!(error.to_string().contains("is not installed"));
+        assert_eq!(installed_version(&root)?, "1.0.0");
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_leaves_the_install_alone_if_the_stored_archive_or_metadata_is_bad() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("store");
+        let keys = Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let reference = format!("{hex}/app");
+        install_test_version(dir.path(), &root, &keys, "1.0.0")?;
+        install_test_version(dir.path(), &root, &keys, "2.0.0")?;
+        let stored = root.join("packages").join(&hex).join("app/1.0.0/artifact");
+
+        let good = fs::read(&stored)?;
+        fs::write(&stored, b"tampered")?;
+        let error = rollback_package_at(&reference, Some(&root), false, &[]).unwrap_err();
+        assert!(error.to_string().contains("no longer matches"), "{error}");
+        assert_eq!(daemon_error_code(&error.to_string()), "rollback_blocked");
+        fs::remove_file(&stored)?;
+        let error = rollback_package_at(&reference, Some(&root), false, &[]).unwrap_err();
+        assert!(error.to_string().contains("is gone"), "{error}");
+
+        fs::write(&stored, &good)?;
+        fs::remove_dir_all(root.join("metadata"))?;
+        let error = rollback_package_at(&reference, Some(&root), false, &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot be verified offline"),
+            "{error}"
+        );
+        assert!(
+            available_rollbacks(&root)?.is_empty(),
+            "the GUI is not offered a rollback that cannot work"
+        );
+        assert_eq!(
+            (installed_version(&root)?, app_file(&root)?),
+            ("2.0.0".into(), "app 2.0.0".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_will_not_break_a_package_that_depends_on_the_newer_version() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("store");
+        let keys = Keys::generate();
+        let hex = keys.public_key().to_hex();
+        install_test_version(dir.path(), &root, &keys, "1.0.0")?;
+        install_test_version(dir.path(), &root, &keys, "2.0.0")?;
+        let mut packages = installed_packages(Some(&root))?;
+        packages.push(InstalledPackage {
+            publisher: "someone".into(),
+            name: "needs-new-app".into(),
+            version: "1.0.0".into(),
+            sha256: "00".repeat(32),
+            artifact: "x".into(),
+            dependencies: vec![Dependency {
+                publisher: Some(hex.clone()),
+                name: "app".into(),
+                requirement: ">=2.0.0".into(),
+            }],
+            conflicts: vec![],
+            files: vec![],
+            runtime_requires: vec![],
+            provides: vec![],
+        });
+        fs::write(root.join("installed.json"), serde_json::to_vec(&packages)?)?;
+        let error =
+            rollback_package_at(&format!("{hex}/app"), Some(&root), false, &[]).unwrap_err();
+        assert!(error.to_string().contains("cannot roll back"), "{error}");
+        assert_eq!(
+            installed_packages(Some(&root))?
+                .iter()
+                .find(|p| p.name == "app")
+                .unwrap()
+                .version,
+            "2.0.0"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removal_is_recorded_in_history() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("store");
+        let keys = Keys::generate();
+        let hex = keys.public_key().to_hex();
+        install_test_version(dir.path(), &root, &keys, "1.0.0")?;
+        remove_package_at(&format!("{hex}/app"), Some(&root), false)?;
+        let last = load_history(&root).pop().unwrap();
+        assert_eq!(last.action, "remove");
+        assert_eq!(last.from.unwrap().version, "1.0.0");
+        assert!(last.to.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn history_helpers_classify_changes_and_pick_the_replaced_version() {
+        let v = |version: &str, hash: &str| HistoryVersion {
+            version: version.into(),
+            sha256: hash.repeat(32),
+        };
+        assert_eq!(history_action(None, &v("1.0.0", "aa")), "install");
+        assert_eq!(
+            history_action(Some(&v("1.0.0", "aa")), &v("1.1.0", "bb")),
+            "upgrade"
+        );
+        assert_eq!(
+            history_action(Some(&v("1.1.0", "bb")), &v("1.0.0", "aa")),
+            "downgrade"
+        );
+        assert_eq!(
+            history_action(Some(&v("1.0.0", "aa")), &v("1.0.0", "bb")),
+            "reinstall"
+        );
+
+        let entry = |from: Option<HistoryVersion>, to: HistoryVersion| HistoryEntry {
+            at: 1,
+            action: "x".into(),
+            publisher: "p".into(),
+            name: "n".into(),
+            from,
+            to: Some(to),
+        };
+        let installed = |version: &str, hash: &str| InstalledPackage {
+            publisher: "p".into(),
+            name: "n".into(),
+            version: version.into(),
+            sha256: hash.repeat(32),
+            artifact: "a".into(),
+            dependencies: vec![],
+            conflicts: vec![],
+            files: vec![],
+            runtime_requires: vec![],
+            provides: vec![],
+        };
+        let history = vec![
+            entry(None, v("1.0.0", "aa")),
+            entry(Some(v("1.0.0", "aa")), v("2.0.0", "bb")),
+        ];
+        assert_eq!(
+            rollback_target(&history, &installed("2.0.0", "bb")),
+            Some(v("1.0.0", "aa"))
+        );
+        assert_eq!(
+            rollback_target(&history, &installed("1.0.0", "aa")),
+            None,
+            "a fresh install has nothing before it"
+        );
+        assert_eq!(
+            rollback_target(&history, &installed("2.0.0", "cc")),
+            None,
+            "a different archive is not that entry"
+        );
+    }
+
+    #[test]
+    fn history_survives_garbage_lines_and_formats_utc_dates() -> Result<()> {
+        let dir = tempdir()?;
+        let entry = HistoryEntry {
+            at: 1_700_000_000,
+            action: "install".into(),
+            publisher: "p".into(),
+            name: "n".into(),
+            from: None,
+            to: Some(HistoryVersion {
+                version: "1.0.0".into(),
+                sha256: "aa".repeat(32),
+            }),
+        };
+        append_history(dir.path(), &entry);
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(history_path(dir.path()))?;
+        writeln!(file, "not json")?;
+        drop(file);
+        append_history(dir.path(), &entry);
+        assert_eq!(load_history(dir.path()), vec![entry.clone(), entry]);
+        assert_eq!(format_utc(0), "1970-01-01 00:00");
+        assert_eq!(format_utc(1_700_000_000), "2023-11-14 22:13");
+        assert_eq!(format_utc(951_782_400), "2000-02-29 00:00");
         Ok(())
     }
 }

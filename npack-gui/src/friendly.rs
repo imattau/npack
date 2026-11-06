@@ -85,6 +85,10 @@ impl UiError {
             Some("unknown_method") => {
                 "This app is newer than the npack background service. Update npack and restart the service."
             }
+            Some("no_rollback") => "There's no earlier version of this package to switch back to.",
+            Some("rollback_blocked") => {
+                "Couldn't switch back safely. The saved copy is missing or has changed, or something installed needs the newer version. Nothing was changed."
+            }
             Some("nip05_failed") => {
                 "Couldn't verify that name. Check the spelling, or paste the publisher's npub instead."
             }

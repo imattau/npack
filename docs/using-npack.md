@@ -655,6 +655,9 @@ Supported methods, mirroring the CLI operations above:
 | `GetConfig` | none | `{first_run, config_path, relays[], blossom[], relays_defaulted, blossom_defaulted, trusted_publishers[{publisher, npub}]}`. `first_run` is true when no `config.toml` exists yet. |
 | `ListTrustedPublishers` | none | Array of `{publisher, npub}`. |
 | `AddTrustedPublisher` | `publisher` (npub, hex, or a NIP-05 `name@domain`) | `{publisher, npub}` (plus `nip05`/`label` when a name was given); the resolved key is written to `[trust].publishers` in `config.toml`. |
+| `GetHistory` | `package`, `limit`, `user`, `store` | Array of `{at, action, publisher, name, from?, to?, reference}`, newest first. |
+| `ListRollbacks` | `user`, `store` | Array of `{reference, current_version, previous_version}` for packages that can be switched back right now (archive and metadata verified). |
+| `Rollback` | `package`, `allow_capability[]`, `user`, `store` | `{package, from_version, to_version}`. Gated like `Update` on the system daemon. |
 | `GetIcon` | `release_event_id`, `store` | `{sha256, media_type, data}` where `data` is the base64 icon (PNG or SVG, at most 256 KiB) of a release in the local catalogue. See "Store icons" below. |
 | `ResolvePublisher` | `query` (npub, hex, or `name@domain`), `relay[]` | A publisher identity (below). Use it to show who a typed value is before trusting them. |
 | `GetPublisherProfiles` | `publishers[]` (hex or npub), `relay[]`, `refresh` | One identity per input, in order. Best effort: unreachable relays or domains give a bare identity, not an error. Cached for an hour (successful lookups only). |
@@ -677,7 +680,7 @@ category a frontend can map to its own wording: `unknown_method`,
 `invalid_params`, `invalid_request`, `invalid_input` (a value such as a
 publisher key or relay URL was rejected), `nip05_failed`, `not_authorized`, `no_relays`,
 `no_blossom_servers`, `relay_unreachable`, `store_busy`, `publisher_untrusted`,
-`download_failed`, `cancelled`, `not_found`, `no_icon`, and `internal` for anything else.
+`download_failed`, `cancelled`, `not_found`, `no_icon`, `no_rollback`, `rollback_blocked`, and `internal` for anything else.
 A `failed` `GetTransaction` status carries `error_code` the same way. The
 field is additive; older daemons omit it.
 
@@ -1032,6 +1035,36 @@ npack remove npub1.../myapp --user
 Removal is refused when another installed package depends on the package or
 when removing it would leave a required runtime capability unavailable.
 
+### History and rollback
+
+Every install, upgrade, downgrade, rollback and removal is recorded in
+`history.jsonl` in the store. View it, and switch a package back to the version
+it replaced:
+
+```bash
+npack history [<publisher>/<name>] [--limit 20] [--user]
+npack rollback <publisher>/<name> [--user] [--allow-capability <capability>]
+```
+
+`rollback` works offline. npack keeps each installed version's archive and the
+signed release metadata it cached when it resolved that version, so a rollback
+is an ordinary transactional install of the stored archive, not a separate
+restore mechanism. Before changing anything it checks that:
+
+- history names an earlier version (a fresh install has none);
+- the stored archive still hashes to the SHA-256 recorded for it;
+- the signed release event cached for that version is still present and valid;
+- no installed package depends on a version range the older version fails to
+  satisfy.
+
+If any check fails it says why and leaves the install untouched. Running
+`rollback` again switches forward to the version you just left. It does not
+check whether the older version has since been revoked (that needs the network):
+run `npack update --check`, which reports revoked installs.
+
+Old versions' archives are kept until the package is removed, so they use disk
+space; `remove` deletes all of them.
+
 ### Transaction locking and interrupted-install recovery
 
 Every `install`/`remove` against a given store (system, `--user`, or a
@@ -1121,6 +1154,8 @@ npack update <publisher>/<name> [options]
 npack list [--user|--system]
 npack verify-installed [--user|--system]
 npack remove <publisher>/<name> [--user|--system]
+npack history [<publisher>/<name>] [--limit <n>] [--user|--system]
+npack rollback <publisher>/<name> [--user|--system] [--allow-capability <capability>]
 npack publish <manifest> --secret-key <key> [options]
 npack appstream <file.npk> [--output <metainfo.xml>]
 npack daemon [--socket <path>] [--system]
