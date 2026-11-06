@@ -85,6 +85,9 @@ impl UiError {
             Some("unknown_method") => {
                 "This app is newer than the npack background service. Update npack and restart the service."
             }
+            Some("nip05_failed") => {
+                "Couldn't verify that name. Check the spelling, or paste the publisher's npub instead."
+            }
             Some("invalid_input") => {
                 "That doesn't look right. Check what you entered and try again (see Details)."
             }
@@ -127,6 +130,15 @@ mod tests {
         assert_eq!(error.code.as_deref(), Some("daemon_unreachable"));
         assert!(error.headline().contains("isn't running"));
         assert!(!error.suggests_settings());
+    }
+
+    #[test]
+    fn name_lookup_failures_have_their_own_advice() {
+        let error = UiError {
+            code: Some("nip05_failed".into()),
+            detail: "NIP-05 lookup failed for a@b.com".into(),
+        };
+        assert!(error.headline().contains("verify that name"));
     }
 
     #[test]

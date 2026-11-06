@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, mpsc},
     thread,
@@ -31,6 +32,10 @@ enum Event {
     Config(Result<Value, UiError>),
     /// Extra package details for the "unknown publisher" dialog.
     InstallPreview(Result<Value, UiError>),
+    /// Readable identities (verified NIP-05 names) from `GetPublisherProfiles`.
+    Profiles(Result<Vec<Value>, UiError>),
+    /// `ResolvePublisher`: who the typed npub / hex key / name@domain is.
+    PublisherResolved(Result<Value, UiError>),
     /// `Install`/`Update` were started with `"async": true`; this carries
     /// the transaction id so the app can poll `GetTransaction`.
     TransactionStarted {
@@ -83,6 +88,11 @@ pub struct NpackGuiApp {
     show_error_details: bool,
     pending_install: Option<PendingInstall>,
     trust_input: String,
+    /// The resolved publisher awaiting the user's "Trust" confirmation.
+    trust_preview: Option<Value>,
+    /// Publisher hex -> identity (names are display aids, never the identity).
+    identities: HashMap<String, Value>,
+    profiles_requested: HashSet<String>,
     relays_text: String,
     blossom_text: String,
 
@@ -113,6 +123,9 @@ impl NpackGuiApp {
             show_error_details: false,
             pending_install: None,
             trust_input: String::new(),
+            trust_preview: None,
+            identities: HashMap::new(),
+            profiles_requested: HashSet::new(),
             relays_text: String::new(),
             blossom_text: String::new(),
             tx,
@@ -187,6 +200,47 @@ impl NpackGuiApp {
                 Err(error) => Event::Config(Err(UiError::from_anyhow(&error))),
             }
         });
+    }
+
+    /// Asks npackd for readable names for publishers we haven't looked up yet.
+    /// Best effort and cached by the daemon; failures just leave npubs showing.
+    fn request_profiles(&mut self, publishers: Vec<String>) {
+        let wanted: Vec<String> = publishers
+            .into_iter()
+            .filter(|publisher| {
+                !publisher.is_empty() && self.profiles_requested.insert(publisher.clone())
+            })
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        self.spawn(move |client| {
+            Event::Profiles(
+                client
+                    .call(
+                        "GetPublisherProfiles",
+                        serde_json::json!({ "publishers": wanted }),
+                    )
+                    .map(|value| value.as_array().cloned().unwrap_or_default())
+                    .map_err(|e| UiError::from_anyhow(&e)),
+            )
+        });
+    }
+
+    fn resolve_publisher(&self, query: String) {
+        self.spawn(move |client| {
+            Event::PublisherResolved(
+                client
+                    .call("ResolvePublisher", serde_json::json!({ "query": query }))
+                    .map_err(|e| UiError::from_anyhow(&e)),
+            )
+        });
+    }
+
+    /// How to show a publisher: a verified name, a clearly-marked claim, or
+    /// just the shortened npub.
+    fn publisher_text(&self, hex: &str, npub: &str) -> String {
+        describe_publisher(self.identities.get(hex), npub)
     }
 
     /// Fetches dependencies / requirements for the trust dialog.
@@ -322,6 +376,7 @@ impl NpackGuiApp {
             return;
         }
         self.load_install_preview(&reference);
+        self.request_profiles(vec![value_str(item, "publisher")]);
         self.pending_install = Some(PendingInstall {
             reference,
             publisher: value_str(item, "publisher"),
@@ -391,7 +446,12 @@ impl NpackGuiApp {
                 Event::Installed(Err(error)) => self.fail("Loading installed packages", error),
                 Event::Search(Ok(items)) => {
                     self.status = format!("{} result(s).", items.len());
+                    let publishers = items
+                        .iter()
+                        .map(|item| value_str(item, "publisher"))
+                        .collect();
                     self.search_results = items;
+                    self.request_profiles(publishers);
                 }
                 Event::Search(Err(error)) => self.fail("Search", error),
                 Event::Updates(Ok(items)) => {
@@ -404,7 +464,18 @@ impl NpackGuiApp {
                 Event::Config(Ok(value)) => {
                     self.relays_text = string_lines(&value, "relays");
                     self.blossom_text = string_lines(&value, "blossom");
+                    let trusted = value
+                        .get("trusted_publishers")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .map(|item| value_str(item, "publisher"))
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     self.config = Some(value);
+                    self.request_profiles(trusted);
                 }
                 Event::Config(Err(error)) => self.fail("Updating settings", error),
                 Event::InstallPreview(Ok(value)) => {
@@ -414,6 +485,22 @@ impl NpackGuiApp {
                 }
                 // The dialog still works without the extra detail.
                 Event::InstallPreview(Err(_)) => {}
+                Event::Profiles(Ok(items)) => {
+                    for item in items {
+                        self.identities.insert(value_str(&item, "publisher"), item);
+                    }
+                }
+                // Names are optional; a failed lookup just leaves npubs showing.
+                Event::Profiles(Err(_)) => {}
+                Event::PublisherResolved(Ok(identity)) => {
+                    self.identities
+                        .insert(value_str(&identity, "publisher"), identity.clone());
+                    self.trust_preview = Some(identity);
+                }
+                Event::PublisherResolved(Err(error)) => {
+                    self.trust_preview = None;
+                    self.fail("Looking up that publisher", error);
+                }
                 Event::TransactionStarted { action, id } => {
                     self.active_transaction = Some((action, id));
                     self.status =
@@ -506,6 +593,28 @@ fn short_npub(npub: &str) -> String {
         .rev()
         .collect();
     format!("{head}…{tail}")
+}
+
+/// A verified NIP-05 name, a clearly marked self-reported claim, or just the
+/// shortened npub. Only the first is ever shown without a caveat: a profile
+/// can claim any name, so claims are labelled "(unverified)".
+fn describe_publisher(identity: Option<&Value>, npub: &str) -> String {
+    let short = short_npub(npub);
+    let Some(identity) = identity else {
+        return short;
+    };
+    let verified = identity.get("nip05_verified").and_then(Value::as_bool) == Some(true);
+    if verified && let Some(label) = identity.get("label").and_then(Value::as_str) {
+        return format!("{label} ✓");
+    }
+    let claimed = identity
+        .get("claimed_name")
+        .or_else(|| identity.get("nip05"))
+        .and_then(Value::as_str);
+    match claimed {
+        Some(claimed) => format!("“{claimed}” (unverified) · {short}"),
+        None => short,
+    }
 }
 
 /// Search results carry the publisher as hex; people recognise npubs.
@@ -702,8 +811,9 @@ impl NpackGuiApp {
         }
         let mut to_remove = None;
         for (publisher, npub) in &publishers {
+            let text = self.publisher_text(publisher, npub);
             ui.horizontal(|ui| {
-                ui.label(npub).on_hover_text(npub);
+                ui.label(text).on_hover_text(npub);
                 if ui.button("Stop trusting").clicked() {
                     to_remove = Some(publisher.clone());
                 }
@@ -713,13 +823,41 @@ impl NpackGuiApp {
             self.remove_trusted(publisher);
         }
         ui.horizontal(|ui| {
-            ui.label("Add publisher (npub or hex):");
+            ui.label("Add publisher (name@domain, npub or hex):");
             ui.text_edit_singleline(&mut self.trust_input);
-            if ui.button("Trust").clicked() && !self.trust_input.trim().is_empty() {
-                self.add_trusted(self.trust_input.trim().to_owned());
-                self.trust_input.clear();
+            if ui.button("Look up").clicked() && !self.trust_input.trim().is_empty() {
+                self.trust_preview = None;
+                self.resolve_publisher(self.trust_input.trim().to_owned());
             }
         });
+        if let Some(preview) = self.trust_preview.clone() {
+            let hex = value_str(&preview, "publisher");
+            let npub = value_str(&preview, "npub");
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(120, 120, 120, 30))
+                .inner_margin(egui::Margin::same(8))
+                .corner_radius(4)
+                .show(ui, |ui| {
+                    ui.strong(describe_publisher(Some(&preview), &npub));
+                    ui.label(&npub);
+                    if preview.get("nip05_verified").and_then(Value::as_bool) != Some(true) {
+                        ui.label(
+                            "Names claimed in a profile can't be verified. Make sure this key \
+                             matches what the publisher gave you.",
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Trust this publisher").clicked() {
+                            self.add_trusted(hex.clone());
+                            self.trust_preview = None;
+                            self.trust_input.clear();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.trust_preview = None;
+                        }
+                    });
+                });
+        }
 
         ui.add_space(12.0);
         ui.heading("Network");
@@ -757,8 +895,22 @@ impl NpackGuiApp {
                     .and_then(|preview| preview.get("npub"))
                     .and_then(Value::as_str)
                     .unwrap_or(&pending.publisher);
-                ui.label(format!("Published by {}", short_npub(npub)))
-                    .on_hover_text(npub);
+                let identity = self.identities.get(&pending.publisher);
+                ui.label(format!(
+                    "Published by {}",
+                    describe_publisher(identity, npub)
+                ))
+                .on_hover_text(npub);
+                if identity
+                    .and_then(|i| i.get("nip05_verified"))
+                    .and_then(Value::as_bool)
+                    != Some(true)
+                {
+                    ui.label(
+                        "No verified name for this publisher. Any name shown above is \
+                         self-reported and could be someone else's.",
+                    );
+                }
                 ui.add_space(4.0);
                 ui.label(
                     "npack has checked the signature and checksum. That proves who published \
@@ -867,7 +1019,9 @@ impl NpackGuiApp {
                     value_str(item, "version")
                 ));
                 trust_badge(ui, item.get("trust").and_then(Value::as_str));
-                ui.weak(short_npub(&display_publisher(item)));
+                ui.weak(
+                    self.publisher_text(&value_str(item, "publisher"), &display_publisher(item)),
+                );
                 if ui.button("Details").clicked() {
                     to_show = Some(reference.clone());
                 }
@@ -905,5 +1059,42 @@ impl NpackGuiApp {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NPUB: &str = "npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+
+    #[test]
+    fn only_verified_names_are_shown_without_a_caveat() {
+        let verified = serde_json::json!({
+            "nip05_verified": true, "label": "alice@example.com", "claimed_name": "Alice"
+        });
+        assert_eq!(
+            describe_publisher(Some(&verified), NPUB),
+            "alice@example.com ✓"
+        );
+
+        let claim = serde_json::json!({
+            "nip05_verified": false, "nip05": "linus@kernel.org", "claimed_name": "Linus"
+        });
+        let text = describe_publisher(Some(&claim), NPUB);
+        assert!(text.contains("(unverified)") && text.contains("Linus"));
+        assert!(!text.contains('✓'));
+
+        // An unverified record must never earn the tick, even with a label.
+        let forged = serde_json::json!({"nip05_verified": false, "label": "x@y.com"});
+        assert!(!describe_publisher(Some(&forged), NPUB).contains('✓'));
+    }
+
+    #[test]
+    fn unknown_publishers_show_a_short_npub() {
+        let text = describe_publisher(None, NPUB);
+        assert!(text.starts_with("npub1") && text.contains('…') && text.len() < NPUB.len());
+        let bare = serde_json::json!({"nip05_verified": false});
+        assert_eq!(describe_publisher(Some(&bare), NPUB), text);
     }
 }

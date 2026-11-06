@@ -4226,6 +4226,8 @@ fn daemon_error_code(message: &str) -> &'static str {
         "unknown_method"
     } else if message.starts_with("invalid ") && has(" params") {
         "invalid_params"
+    } else if has("nip-05 lookup failed") {
+        "nip05_failed"
     } else if has("invalid publisher key")
         || has("invalid relay ")
         || has("invalid blossom server ")
@@ -4438,6 +4440,9 @@ struct DaemonState {
     /// without a daemon restart.
     config: std::sync::RwLock<Config>,
     config_path: Option<PathBuf>,
+    /// Verified publisher names (NIP-05) looked up recently, so a GUI listing
+    /// the same publishers repeatedly does not re-query relays and domains.
+    identities: std::sync::Mutex<HashMap<String, (std::time::Instant, PublisherIdentity)>>,
     role: DaemonRole,
     transactions: std::sync::Mutex<HashMap<u64, TransactionEntry>>,
     next_transaction_id: AtomicU64,
@@ -4452,6 +4457,7 @@ impl DaemonState {
         Self {
             config: std::sync::RwLock::new(config),
             config_path,
+            identities: std::sync::Mutex::new(HashMap::new()),
             role,
             transactions: std::sync::Mutex::new(HashMap::new()),
             next_transaction_id: AtomicU64::new(1),
@@ -4611,7 +4617,9 @@ async fn dispatch_daemon_request(
         "CheckUpdates" => daemon_check_updates(&state.config(), request.params).await,
         "GetConfig" => daemon_get_config(state),
         "ListTrustedPublishers" => daemon_list_trusted_publishers(state),
-        "AddTrustedPublisher" => daemon_add_trusted_publisher(state, request.params),
+        "ResolvePublisher" => daemon_resolve_publisher(state, request.params).await,
+        "GetPublisherProfiles" => daemon_get_publisher_profiles(state, request.params).await,
+        "AddTrustedPublisher" => daemon_add_trusted_publisher(state, request.params).await,
         "RemoveTrustedPublisher" => daemon_remove_trusted_publisher(state, request.params),
         "SaveConfig" => daemon_save_config(state, request.params),
         "GetTransaction" => daemon_get_transaction(state, request.params),
@@ -4678,15 +4686,13 @@ fn config_write_path(state: &DaemonState) -> Result<&Path> {
         .context("no config directory available to save settings")
 }
 
-fn daemon_add_trusted_publisher(
+async fn daemon_add_trusted_publisher(
     state: &Arc<DaemonState>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value> {
     let params: PublisherParams =
         serde_json::from_value(params).context("invalid AddTrustedPublisher params")?;
-    let hex = PublicKey::parse(params.publisher.trim())
-        .map(|key| key.to_hex())
-        .with_context(|| format!("invalid publisher key: {}", params.publisher))?;
+    let (hex, name) = resolve_publisher_input(&params.publisher).await?;
     let npub = display_publisher(&hex);
     let path = config_write_path(state)?;
     let mut config = state
@@ -4705,7 +4711,12 @@ fn daemon_add_trusted_publisher(
     })?;
     config.trust.publishers = publishers;
     config.first_run = false;
-    Ok(publisher_json(&hex))
+    let mut value = publisher_json(&hex);
+    if let (Some(name), Some(object)) = (name, value.as_object_mut()) {
+        object.insert("nip05".into(), name.display().into());
+        object.insert("label".into(), name.display().into());
+    }
+    Ok(value)
 }
 
 fn daemon_remove_trusted_publisher(
@@ -4812,6 +4823,386 @@ fn daemon_save_config(
     *config = updated;
     drop(config);
     daemon_get_config(state)
+}
+
+// ---------------------------------------------------------------------------
+// Publisher names (NIP-05)
+//
+// A publisher is a pubkey; a NIP-05 name (`alice@example.com`) is a readable
+// pointer to one. Names are only ever a convenience: the key is what gets
+// trusted and stored, a name is shown as verified only when its domain maps it
+// back to the same key, and a self-reported profile name is always labelled as
+// unverified because anyone can claim any name.
+// ---------------------------------------------------------------------------
+
+const NIP05_MAX_BYTES: usize = 64 * 1024;
+const NIP05_TIMEOUT_SECS: u64 = 10;
+const IDENTITY_CACHE_SECS: u64 = 3600;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Nip05Identifier {
+    name: String,
+    domain: String,
+}
+
+impl Nip05Identifier {
+    /// `_@domain` is displayed as just `domain`, per NIP-05.
+    fn display(&self) -> String {
+        if self.name == "_" {
+            self.domain.clone()
+        } else {
+            format!("{}@{}", self.name, self.domain)
+        }
+    }
+}
+
+/// Parses `name@domain` (or a bare `domain`, meaning `_@domain`). Returns
+/// `None` for anything that is not a plausible public NIP-05 identifier --
+/// including IP literals, ports, and local-only domains, which the daemon
+/// refuses to query.
+fn parse_nip05(input: &str) -> Option<Nip05Identifier> {
+    let input = input.trim().to_lowercase();
+    let (name, domain) = input.split_once('@').unwrap_or(("_", input.as_str()));
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
+        || !is_public_dns_name(domain)
+    {
+        return None;
+    }
+    Some(Nip05Identifier {
+        name: name.to_owned(),
+        domain: domain.to_owned(),
+    })
+}
+
+fn is_public_dns_name(domain: &str) -> bool {
+    if domain.len() > 253 {
+        return false;
+    }
+    let labels: Vec<&str> = domain.split('.').collect();
+    if labels.len() < 2 {
+        return false;
+    }
+    let well_formed = labels.iter().all(|label| {
+        (1..=63).contains(&label.len())
+            && label
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    });
+    let tld = labels[labels.len() - 1];
+    // An all-numeric last label is an IPv4 address, not a name.
+    well_formed
+        && !tld.chars().all(|c| c.is_ascii_digit())
+        && !matches!(
+            tld,
+            "local" | "localhost" | "internal" | "lan" | "home" | "corp"
+        )
+}
+
+/// Looks `identifier` up under `base` (`https://domain` in production) and
+/// returns the lowercase hex pubkey it maps to. Redirects are not followed
+/// (NIP-05 forbids it), the body is size-capped, and with `https_only` a
+/// plain-http `base` is refused.
+async fn fetch_nip05_pubkey_at(
+    base: &str,
+    identifier: &Nip05Identifier,
+    https_only: bool,
+) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(NIP05_TIMEOUT_SECS))
+        .https_only(https_only)
+        .build()?;
+    let mut response = client
+        .get(format!("{base}/.well-known/nostr.json"))
+        .query(&[("name", identifier.name.as_str())])
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .context("could not reach the domain")?;
+    if !response.status().is_success() {
+        bail!("the domain answered HTTP {}", response.status().as_u16());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("reading the response")? {
+        if body.len() + chunk.len() > NIP05_MAX_BYTES {
+            bail!("the response was larger than {NIP05_MAX_BYTES} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let document: serde_json::Value =
+        serde_json::from_slice(&body).context("the response was not valid JSON")?;
+    let key = document
+        .get("names")
+        .and_then(|names| names.get(&identifier.name))
+        .and_then(serde_json::Value::as_str)
+        .with_context(|| format!("the domain has no entry for {}", identifier.name))?;
+    // NIP-05 specifies hex keys; npub here would be a spec violation.
+    if key.len() != 64 {
+        bail!("the domain returned a key that is not 64-character hex");
+    }
+    Ok(PublicKey::from_hex(key)
+        .context("the domain returned an invalid public key")?
+        .to_hex())
+}
+
+async fn resolve_nip05(identifier: &Nip05Identifier) -> Result<String> {
+    fetch_nip05_pubkey_at(&format!("https://{}", identifier.domain), identifier, true)
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "NIP-05 lookup failed for {}: {error:#}",
+                identifier.display()
+            )
+        })
+}
+
+/// Turns user input -- an npub, a hex key, or a NIP-05 name -- into a hex
+/// pubkey, plus the verified name when the input was one.
+async fn resolve_publisher_input(input: &str) -> Result<(String, Option<Nip05Identifier>)> {
+    let input = input.trim();
+    if let Ok(key) = PublicKey::parse(input) {
+        return Ok((key.to_hex(), None));
+    }
+    match parse_nip05(input) {
+        Some(identifier) => Ok((resolve_nip05(&identifier).await?, Some(identifier))),
+        None => bail!("invalid publisher key: {input} (expected an npub, hex key or name@domain)"),
+    }
+}
+
+/// Strips control and bidirectional-override characters from text a stranger
+/// controls (profile names), and caps its length, before it is shown.
+fn sanitize_display_text(text: &str) -> Option<String> {
+    let cleaned: String = text
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(*c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .take(64)
+        .collect();
+    let cleaned = cleaned.trim().to_owned();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PublisherIdentity {
+    publisher: String,
+    npub: String,
+    /// Set only when the publisher's claimed NIP-05 name was confirmed by its
+    /// domain. This is the one name a frontend may present as verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    /// The NIP-05 name the profile claims, verified or not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nip05: Option<String>,
+    nip05_verified: bool,
+    /// Self-reported profile name. Unverified: anyone can claim any name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claimed_name: Option<String>,
+}
+
+impl PublisherIdentity {
+    fn bare(hex: &str) -> Self {
+        Self {
+            publisher: hex.to_owned(),
+            npub: display_publisher(hex),
+            label: None,
+            nip05: None,
+            nip05_verified: false,
+            claimed_name: None,
+        }
+    }
+}
+
+/// Fetches the newest signed kind-0 profile for each author from `relays`.
+async fn fetch_profile_claims(
+    relays: &[String],
+    authors: &[PublicKey],
+) -> Result<HashMap<String, serde_json::Value>> {
+    if relays.is_empty() || authors.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let client = Client::default();
+    for relay in relays {
+        client.add_relay(relay).await?;
+    }
+    connect_with_timeout(&client).await?;
+    let events = client
+        .fetch_events(
+            Filter::new()
+                .kind(Kind::Metadata)
+                .authors(authors.iter().copied())
+                .limit(authors.len() * 4),
+        )
+        .timeout(std::time::Duration::from_secs(10))
+        .await;
+    client.disconnect().await;
+    let mut newest: HashMap<String, (u64, serde_json::Value)> = HashMap::new();
+    for event in events? {
+        if event.verify().is_err() {
+            continue;
+        }
+        let Ok(profile) = serde_json::from_str::<serde_json::Value>(&event.content) else {
+            continue;
+        };
+        let created = event.created_at.as_secs();
+        let author = event.pubkey.to_hex();
+        if newest.get(&author).is_none_or(|(seen, _)| created > *seen) {
+            newest.insert(author, (created, profile));
+        }
+    }
+    Ok(newest
+        .into_iter()
+        .map(|(author, (_, profile))| (author, profile))
+        .collect())
+}
+
+/// Builds a publisher's identity from its (unverified) profile claims,
+/// confirming any claimed NIP-05 name against its domain.
+async fn build_identity(hex: &str, claims: Option<&serde_json::Value>) -> PublisherIdentity {
+    let mut identity = PublisherIdentity::bare(hex);
+    let Some(claims) = claims else {
+        return identity;
+    };
+    let text = |field: &str| {
+        claims
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .and_then(sanitize_display_text)
+    };
+    identity.claimed_name = text("display_name").or_else(|| text("name"));
+    if let Some(claimed) = claims
+        .get("nip05")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_nip05)
+    {
+        identity.nip05 = Some(claimed.display());
+        if resolve_nip05(&claimed)
+            .await
+            .is_ok_and(|resolved| resolved == hex)
+        {
+            identity.nip05_verified = true;
+            identity.label = Some(claimed.display());
+        }
+    }
+    identity
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ProfilesParams {
+    #[serde(default)]
+    publishers: Vec<String>,
+    #[serde(default)]
+    relay: Vec<String>,
+    /// Bypass the one-hour identity cache.
+    #[serde(default)]
+    refresh: bool,
+}
+
+/// Looks up readable identities for `publishers` (hex or npub), best effort:
+/// a relay or domain that cannot be reached yields a bare identity rather
+/// than an error, and such results are not cached so the next call retries.
+async fn daemon_get_publisher_profiles(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: ProfilesParams =
+        serde_json::from_value(params).context("invalid GetPublisherProfiles params")?;
+    let config = state.config();
+    let keys = params
+        .publishers
+        .iter()
+        .map(|publisher| {
+            PublicKey::parse(publisher.trim())
+                .with_context(|| format!("invalid publisher key: {publisher}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ttl = std::time::Duration::from_secs(IDENTITY_CACHE_SECS);
+    let cached = |hex: &str| -> Option<PublisherIdentity> {
+        if params.refresh {
+            return None;
+        }
+        let cache = state.identities.lock().ok()?;
+        let (stored, identity) = cache.get(hex)?;
+        (stored.elapsed() < ttl).then(|| identity.clone())
+    };
+    let missing: Vec<PublicKey> = keys
+        .iter()
+        .filter(|key| cached(&key.to_hex()).is_none())
+        .copied()
+        .collect();
+    let mut fresh: HashMap<String, PublisherIdentity> = HashMap::new();
+    if !missing.is_empty() {
+        let relays = normalize_relays(params.relay, &config);
+        let claims = fetch_profile_claims(&relays, &missing).await;
+        let reached = claims.is_ok();
+        let claims = claims.unwrap_or_default();
+        let built = futures_util::future::join_all(missing.iter().map(|key| {
+            let hex = key.to_hex();
+            let claim = claims.get(&hex);
+            async move { build_identity(&hex, claim).await }
+        }))
+        .await;
+        for identity in built {
+            if reached && let Ok(mut cache) = state.identities.lock() {
+                cache.insert(
+                    identity.publisher.clone(),
+                    (std::time::Instant::now(), identity.clone()),
+                );
+            }
+            fresh.insert(identity.publisher.clone(), identity);
+        }
+    }
+    let identities: Vec<PublisherIdentity> = keys
+        .iter()
+        .map(|key| {
+            let hex = key.to_hex();
+            cached(&hex)
+                .or_else(|| fresh.get(&hex).cloned())
+                .unwrap_or_else(|| PublisherIdentity::bare(&hex))
+        })
+        .collect();
+    Ok(serde_json::to_value(identities)?)
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolvePublisherParams {
+    query: String,
+    #[serde(default)]
+    relay: Vec<String>,
+}
+
+/// Resolves what a user typed -- npub, hex key, or `name@domain` -- to one
+/// publisher identity, so a frontend can show who it is before trusting them.
+async fn daemon_resolve_publisher(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: ResolvePublisherParams =
+        serde_json::from_value(params).context("invalid ResolvePublisher params")?;
+    let (hex, name) = resolve_publisher_input(&params.query).await?;
+    if let Some(name) = name {
+        // The domain vouched for this key just now, so the name is verified.
+        let mut identity = PublisherIdentity::bare(&hex);
+        identity.nip05 = Some(name.display());
+        identity.label = Some(name.display());
+        identity.nip05_verified = true;
+        return Ok(serde_json::to_value(identity)?);
+    }
+    let profiles = daemon_get_publisher_profiles(
+        state,
+        serde_json::json!({ "publishers": [hex], "relay": params.relay }),
+    )
+    .await?;
+    Ok(profiles
+        .as_array()
+        .and_then(|items| items.first().cloned())
+        .unwrap_or_else(|| serde_json::to_value(PublisherIdentity::bare(&hex)).unwrap_or_default()))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -9919,5 +10310,152 @@ mod tests {
             ok.get("error_code").is_none(),
             "success responses are unchanged"
         );
+    }
+
+    #[test]
+    fn parses_nip05_identifiers_and_rejects_non_public_ones() {
+        let alice = parse_nip05(" Alice@Example.COM ").unwrap();
+        assert_eq!(
+            (alice.name.as_str(), alice.domain.as_str()),
+            ("alice", "example.com")
+        );
+        assert_eq!(alice.display(), "alice@example.com");
+        let root = parse_nip05("example.com").unwrap();
+        assert_eq!(root.name, "_");
+        assert_eq!(root.display(), "example.com");
+        for bad in [
+            "",
+            "alice@",
+            "@example.com",
+            "alice@localhost",
+            "alice@127.0.0.1",
+            "alice@[::1]",
+            "alice@example.com:8080",
+            "alice@printer.local",
+            "alice@intranet.internal",
+            "alice@-bad.example.com",
+            "ali ce@example.com",
+            "alice@exa mple.com",
+            "npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d",
+            TEST_PUBKEY_HEX,
+        ] {
+            assert!(parse_nip05(bad).is_none(), "{bad:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn profile_text_from_strangers_is_sanitised() {
+        assert_eq!(
+            sanitize_display_text("  Alice\u{202e}evil  ").as_deref(),
+            Some("Aliceevil")
+        );
+        assert_eq!(sanitize_display_text("a\nb\u{0}c").as_deref(), Some("abc"));
+        assert_eq!(sanitize_display_text("   "), None);
+        assert_eq!(sanitize_display_text(&"x".repeat(200)).unwrap().len(), 64);
+    }
+
+    /// Serves one canned HTTP response on a loopback port and returns its base URL.
+    async fn serve_http_once(response: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = [0u8; 2048];
+                let _ = stream.read(&mut buffer).await;
+                let _ = stream.write_all(&response).await;
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn http_ok(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn nip05_lookup_returns_the_mapped_key() -> Result<()> {
+        let id = parse_nip05("alice@example.com").unwrap();
+        let base = serve_http_once(http_ok(&format!(
+            r#"{{"names":{{"alice":"{}"}}}}"#,
+            TEST_PUBKEY_HEX.to_uppercase()
+        )))
+        .await;
+        assert_eq!(
+            fetch_nip05_pubkey_at(&base, &id, false).await?,
+            TEST_PUBKEY_HEX
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nip05_lookup_rejects_bad_answers() {
+        let id = parse_nip05("alice@example.com").unwrap();
+        let missing = serve_http_once(http_ok(r#"{"names":{"bob":"00"}}"#)).await;
+        assert!(fetch_nip05_pubkey_at(&missing, &id, false).await.is_err());
+
+        let not_hex = serve_http_once(http_ok(
+            r#"{"names":{"alice":"npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d"}}"#,
+        ))
+        .await;
+        assert!(fetch_nip05_pubkey_at(&not_hex, &id, false).await.is_err());
+
+        let garbage = serve_http_once(http_ok("not json")).await;
+        assert!(fetch_nip05_pubkey_at(&garbage, &id, false).await.is_err());
+
+        let redirect = serve_http_once(
+            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        )
+        .await;
+        let error = fetch_nip05_pubkey_at(&redirect, &id, false)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("302"),
+            "redirects are not followed: {error}"
+        );
+
+        let huge = serve_http_once(http_ok(&" ".repeat(NIP05_MAX_BYTES + 10))).await;
+        let error = fetch_nip05_pubkey_at(&huge, &id, false).await.unwrap_err();
+        assert!(error.to_string().contains("larger than"));
+
+        // Production refuses plain http outright.
+        let plain = serve_http_once(http_ok(r#"{"names":{}}"#)).await;
+        assert!(fetch_nip05_pubkey_at(&plain, &id, true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn publisher_input_accepts_keys_and_rejects_junk_without_network() -> Result<()> {
+        let (hex, name) = resolve_publisher_input(TEST_PUBKEY_HEX).await?;
+        assert_eq!(hex, TEST_PUBKEY_HEX);
+        assert!(name.is_none());
+        let error = resolve_publisher_input("localhost").await.unwrap_err();
+        assert!(error.to_string().contains("invalid publisher key"));
+        assert_eq!(daemon_error_code(&error.to_string()), "invalid_input");
+        assert_eq!(
+            daemon_error_code(
+                "NIP-05 lookup failed for alice@example.com: the domain answered HTTP 404"
+            ),
+            "nip05_failed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identity_without_a_profile_is_bare_and_never_verified() {
+        let identity = build_identity(TEST_PUBKEY_HEX, None).await;
+        assert!(identity.label.is_none() && !identity.nip05_verified);
+        assert!(identity.npub.starts_with("npub1"));
+        // A claimed name that cannot be a public NIP-05 identifier is kept as
+        // an unverified claim only; no network lookup happens for it.
+        let claims = serde_json::json!({"name": "Linus", "nip05": "linus@localhost"});
+        let identity = build_identity(TEST_PUBKEY_HEX, Some(&claims)).await;
+        assert_eq!(identity.claimed_name.as_deref(), Some("Linus"));
+        assert!(identity.nip05.is_none() && identity.label.is_none());
     }
 }

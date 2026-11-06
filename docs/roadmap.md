@@ -292,7 +292,10 @@ works with no config (built-in public relays and Blossom servers), reports
 publishers outside the trust list (`include_untrusted`) marked `unknown`, and
 responses carry stable `error_code`s. `npack-gui` uses these for a welcome
 screen, a Settings tab, a "trust this publisher?" dialog and plain-language
-errors. Not yet done: NIP-05/profile names instead of npubs, publishing `app`
+errors. Publisher names follow: NIP-05 names can be typed to find a publisher,
+and verified names (confirmed by the publisher's domain) are shown instead of
+npubs, with self-reported names marked unverified. Not yet done: `name@domain`
+in package references and CLI trust commands, publishing `app`
 metadata to Nostr, curated starter trust sets, and verifying the default
 endpoints against live infrastructure.
 

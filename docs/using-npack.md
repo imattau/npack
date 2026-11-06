@@ -618,7 +618,9 @@ Supported methods, mirroring the CLI operations above:
 | `CancelTransaction` | `transaction_id` | `{"cancel_requested": true}`. |
 | `GetConfig` | none | `{first_run, config_path, relays[], blossom[], relays_defaulted, blossom_defaulted, trusted_publishers[{publisher, npub}]}`. `first_run` is true when no `config.toml` exists yet. |
 | `ListTrustedPublishers` | none | Array of `{publisher, npub}`. |
-| `AddTrustedPublisher` | `publisher` (hex or npub) | `{publisher, npub}`; written to `[trust].publishers` in `config.toml`. |
+| `AddTrustedPublisher` | `publisher` (npub, hex, or a NIP-05 `name@domain`) | `{publisher, npub}` (plus `nip05`/`label` when a name was given); the resolved key is written to `[trust].publishers` in `config.toml`. |
+| `ResolvePublisher` | `query` (npub, hex, or `name@domain`), `relay[]` | A publisher identity (below). Use it to show who a typed value is before trusting them. |
+| `GetPublisherProfiles` | `publishers[]` (hex or npub), `relay[]`, `refresh` | One identity per input, in order. Best effort: unreachable relays or domains give a bare identity, not an error. Cached for an hour (successful lookups only). |
 | `RemoveTrustedPublisher` | `publisher` | `{removed, publisher}`. |
 | `SaveConfig` | `relays[]`, `blossom[]` (both optional) | The new `GetConfig` result. Omitted fields keep their effective value (so `{}` saves the built-in defaults and ends first run); an empty list reverts that setting to the built-in defaults. Relays must be `ws://`/`wss://`, servers `http://`/`https://`. |
 
@@ -629,11 +631,32 @@ connection is handled concurrently.
 **Error codes.** `error` is the full human text; `error_code` is a stable
 category a frontend can map to its own wording: `unknown_method`,
 `invalid_params`, `invalid_request`, `invalid_input` (a value such as a
-publisher key or relay URL was rejected), `not_authorized`, `no_relays`,
+publisher key or relay URL was rejected), `nip05_failed`, `not_authorized`, `no_relays`,
 `no_blossom_servers`, `relay_unreachable`, `store_busy`, `publisher_untrusted`,
 `download_failed`, `cancelled`, `not_found`, and `internal` for anything else.
 A `failed` `GetTransaction` status carries `error_code` the same way. The
 field is additive; older daemons omit it.
+
+**Publisher names (NIP-05).** A publisher is a key; a name like
+`alice@example.com` is only a readable pointer to one, so the key is always what
+is stored and trusted. An identity is `{publisher, npub, label?, nip05?,
+nip05_verified, claimed_name?}`:
+
+- `label` is present only when the publisher's profile (kind 0) claims a NIP-05
+  name **and** that domain's `/.well-known/nostr.json` maps the name back to the
+  same key. It is the one name a frontend may show as verified.
+- `nip05` and `claimed_name` are self-reported by the profile and are not
+  verified: anyone can claim any name. Frontends must label them as such.
+- Typing a `name@domain` into `ResolvePublisher`/`AddTrustedPublisher` resolves
+  it through the domain, which vouches for the key at that moment.
+
+Lookups are HTTPS-only, never follow redirects (as NIP-05 requires), time out
+after 10 seconds, cap the response at 64 KiB, and refuse IP literals, ports and
+local-only domains (`localhost`, `.local`, `.internal`, `.lan`, ...). A failed
+lookup returns `error_code` `nip05_failed`. Lookups tell the domain's operator
+that someone resolved that name, and tell relays which profiles were requested.
+They are read-only and not PolicyKit-gated, so on the system daemon any local
+user can make it fetch a public domain's `nostr.json`.
 
 **Zero-config defaults.** When `[network].relays` or `[storage].blossom` is
 empty or the file is missing, npack uses built-in public relays and Blossom
