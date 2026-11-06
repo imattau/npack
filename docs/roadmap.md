@@ -283,6 +283,19 @@ this was built in, so the actual rendered window was not visually
 inspected as part of this work -- a reasonable next step for whoever picks
 up Phase 6 or 7 is a manual click-through on a normal desktop.
 
+### First-run and trust UX slice (shipped)
+
+A normal desktop user should never need to edit `config.toml`. The daemon now
+works with no config (built-in public relays and Blossom servers), reports
+`first_run`, and exposes `GetConfig`, `AddTrustedPublisher`,
+`RemoveTrustedPublisher` and `SaveConfig`. `Search`/`GetPackage` can return
+publishers outside the trust list (`include_untrusted`) marked `unknown`, and
+responses carry stable `error_code`s. `npack-gui` uses these for a welcome
+screen, a Settings tab, a "trust this publisher?" dialog and plain-language
+errors. Not yet done: NIP-05/profile names instead of npubs, publishing `app`
+metadata to Nostr, curated starter trust sets, and verifying the default
+endpoints against live infrastructure.
+
 ## Phase 6: COSMIC Store integration
 
 Investigate COSMIC first because its newer Rust-oriented codebase should make

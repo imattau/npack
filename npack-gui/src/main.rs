@@ -6,6 +6,7 @@
 
 mod app;
 mod client;
+mod friendly;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();

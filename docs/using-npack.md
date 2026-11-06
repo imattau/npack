@@ -607,19 +607,47 @@ Supported methods, mirroring the CLI operations above:
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `Search` | `query`, `relay[]`, `trusted_publisher[]`, `pubkey`, `refresh`, `no_cache` | Array of matching releases. |
-| `GetPackage` | `package`, `relay[]`, `requirement`, `os`, `arch`, `trusted_publisher[]`, `store`, `user` | The same resolved-metadata object as `npack resolve`. |
+| `Search` | `query`, `relay[]`, `trusted_publisher[]`, `pubkey`, `refresh`, `no_cache`, `include_untrusted` | Array of matching releases, each with `trust` (`"trusted"` or `"unknown"`) and `npub`. With `include_untrusted` the trust list does not filter results. |
+| `GetPackage` | `package`, `relay[]`, `requirement`, `os`, `arch`, `trusted_publisher[]`, `store`, `user`, `include_untrusted` | The same resolved-metadata object as `npack resolve`, plus `trust` and `npub`; `verification.publisher_trusted` reflects the trust list even when it is empty. |
 | `ListInstalled` | `user`, `store` | Array of installed packages. |
-| `Install` | `package`, `requirement`, `relay[]`, `server[]`, `user`, `store`, `allow_capability[]`, `install_values{}`, `async` | The installed package's record, or `{"transaction_id": N}` if `async` is true. `install_values` is a per-install object keyed by descriptor id. |
+| `Install` | `package`, `requirement`, `relay[]`, `server[]`, `user`, `store`, `allow_capability[]`, `trust_once[]`, `install_values{}`, `async` | The installed package's record, or `{"transaction_id": N}` if `async` is true. `install_values` is a per-install object keyed by descriptor id. |
 | `Remove` | `package`, `user`, `store` | `{"removed": "<package>"}`. |
 | `Update` | `package` (omit for all), `relay[]`, `server[]`, `user`, `store`, `allow_capability[]`, `async` | Array of per-package update outcomes, or `{"transaction_id": N}` if `async` is true. |
 | `CheckUpdates` | `package` (omit for all), `relay[]`, `trusted_publisher[]`, `user`, `store` | Array of `{reference, current_version, available_version}`. |
 | `GetTransaction` | `transaction_id` | `{"status": "running", "progress": {...}}`, `{"status": "succeeded", "result": ...}`, `{"status": "failed", "error": "..."}`, or `{"status": "cancelled"}`. |
 | `CancelTransaction` | `transaction_id` | `{"cancel_requested": true}`. |
+| `GetConfig` | none | `{first_run, config_path, relays[], blossom[], relays_defaulted, blossom_defaulted, trusted_publishers[{publisher, npub}]}`. `first_run` is true when no `config.toml` exists yet. |
+| `ListTrustedPublishers` | none | Array of `{publisher, npub}`. |
+| `AddTrustedPublisher` | `publisher` (hex or npub) | `{publisher, npub}`; written to `[trust].publishers` in `config.toml`. |
+| `RemoveTrustedPublisher` | `publisher` | `{removed, publisher}`. |
+| `SaveConfig` | `relays[]`, `blossom[]` (both optional) | The new `GetConfig` result. Omitted fields keep their effective value (so `{}` saves the built-in defaults and ends first run); an empty list reverts that setting to the built-in defaults. Relays must be `ws://`/`wss://`, servers `http://`/`https://`. |
 
 An unknown method or a request that fails to deserialize its params returns
-`{"id": ..., "error": "..."}` instead of `result`. Each connection is handled
-concurrently.
+`{"id": ..., "error": "...", "error_code": "..."}` instead of `result`. Each
+connection is handled concurrently.
+
+**Error codes.** `error` is the full human text; `error_code` is a stable
+category a frontend can map to its own wording: `unknown_method`,
+`invalid_params`, `invalid_request`, `invalid_input` (a value such as a
+publisher key or relay URL was rejected), `not_authorized`, `no_relays`,
+`no_blossom_servers`, `relay_unreachable`, `store_busy`, `publisher_untrusted`,
+`download_failed`, `cancelled`, `not_found`, and `internal` for anything else.
+A `failed` `GetTransaction` status carries `error_code` the same way. The
+field is additive; older daemons omit it.
+
+**Zero-config defaults.** When `[network].relays` or `[storage].blossom` is
+empty or the file is missing, npack uses built-in public relays and Blossom
+servers (`DEFAULT_RELAYS` / `DEFAULT_BLOSSOM_SERVERS` in `npack-cli`) instead
+of failing, for the CLI and the daemon alike. They are only written to
+`config.toml` if the user saves settings. No publisher is trusted by default.
+
+**Trust and `include_untrusted`.** On the CLI, an empty `[trust].publishers`
+list accepts any publisher and a non-empty list hides all others. The daemon
+keeps that behaviour for scripts, and adds `include_untrusted` plus a per-result
+`trust` field so a GUI can show publishers the user has not trusted yet and ask
+first: "Trust and install" (`AddTrustedPublisher`, then `Install`) or "Install
+once" (`Install` with `trust_once`). The confirmation is a frontend policy; the
+daemon's enforcement is still the configured list.
 
 By default `Install` and `Update` run to completion before responding. Pass
 `"async": true` to get `{"transaction_id": N}` back immediately and poll
@@ -675,8 +703,10 @@ credentials read off the socket (`SO_PEERCRED`), not anything the client
 claims. This is the same model PackageKit and other system package
 services use.
 
-The three actions -- `io.npack.install`, `io.npack.remove`, `io.npack.update`
--- are defined in [`packaging/io.npack.policy`](../packaging/io.npack.policy),
+The four actions -- `io.npack.install`, `io.npack.remove`, `io.npack.update`
+and `io.npack.configure` (which gates `AddTrustedPublisher`,
+`RemoveTrustedPublisher` and `SaveConfig`, since they change what root will
+install) -- are defined in [`packaging/io.npack.policy`](../packaging/io.npack.policy),
 which a system package installs to `/usr/share/polkit-1/actions/`. They
 default to `auth_admin`, so a non-root caller normally sees their desktop's
 usual "authenticate as an administrator" prompt (handled by whatever

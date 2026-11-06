@@ -15,6 +15,23 @@ use std::{
 
 use serde_json::Value;
 
+/// An error reported by npackd itself: its full message plus the stable
+/// `error_code` (absent from older daemons). Carried inside `anyhow::Error`
+/// so callers can `downcast_ref` it for friendly wording.
+#[derive(Debug)]
+pub struct DaemonError {
+    pub code: Option<String>,
+    pub message: String,
+}
+
+impl std::fmt::Display for DaemonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DaemonError {}
+
 pub struct DaemonClient {
     socket_path: PathBuf,
     next_id: AtomicU64,
@@ -60,7 +77,14 @@ impl DaemonClient {
         }
         let response: Value = serde_json::from_str(&response_line)?;
         if let Some(error) = response.get("error").and_then(Value::as_str) {
-            anyhow::bail!("{error}");
+            return Err(DaemonError {
+                code: response
+                    .get("error_code")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                message: error.to_owned(),
+            }
+            .into());
         }
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -120,6 +144,22 @@ mod tests {
         let client = DaemonClient::new(socket_path);
         let error = client.call("Bogus", serde_json::json!({})).unwrap_err();
         assert!(error.to_string().contains("unknown method Bogus"));
+    }
+
+    #[test]
+    fn call_keeps_the_error_code_for_friendly_wording() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("npackd.sock");
+        fake_daemon(
+            socket_path.clone(),
+            vec![serde_json::json!({
+                "id": 1, "error": "no relays configured", "error_code": "no_relays"
+            })],
+        );
+        let client = DaemonClient::new(socket_path);
+        let error = client.call("Search", serde_json::json!({})).unwrap_err();
+        let daemon_error = error.downcast_ref::<DaemonError>().unwrap();
+        assert_eq!(daemon_error.code.as_deref(), Some("no_relays"));
     }
 
     #[test]

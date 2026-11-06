@@ -8,13 +8,14 @@ use std::{
 use eframe::egui;
 use serde_json::Value;
 
-use crate::client::DaemonClient;
+use crate::{client::DaemonClient, friendly::UiError};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Installed,
     Search,
     Updates,
+    Settings,
 }
 
 /// One background result delivered back into the UI thread. Every network
@@ -22,10 +23,14 @@ enum Tab {
 /// `logic()` drains this channel each frame with `try_recv` so a slow
 /// relay or Blossom fetch never freezes the window.
 enum Event {
-    Installed(Result<Vec<Value>, String>),
-    Search(Result<Vec<Value>, String>),
-    Updates(Result<Vec<Value>, String>),
-    Details(Result<Value, String>),
+    Installed(Result<Vec<Value>, UiError>),
+    Search(Result<Vec<Value>, UiError>),
+    Updates(Result<Vec<Value>, UiError>),
+    Details(Result<Value, UiError>),
+    /// `GetConfig`: first-run flag, relays, download servers, trusted publishers.
+    Config(Result<Value, UiError>),
+    /// Extra package details for the "unknown publisher" dialog.
+    InstallPreview(Result<Value, UiError>),
     /// `Install`/`Update` were started with `"async": true`; this carries
     /// the transaction id so the app can poll `GetTransaction`.
     TransactionStarted {
@@ -36,8 +41,24 @@ enum Event {
     /// A `Remove`, or a completed/failed/cancelled transaction.
     ActionFinished {
         action: &'static str,
-        result: Result<Value, String>,
+        result: Result<Value, UiError>,
     },
+}
+
+/// An install the user must confirm because its publisher isn't trusted yet.
+struct PendingInstall {
+    reference: String,
+    publisher: String,
+    name: String,
+    version: String,
+    /// `GetPackage` result (dependencies, runtime requirements), once loaded.
+    preview: Option<Value>,
+}
+
+enum TrustChoice {
+    TrustAndInstall,
+    InstallOnce,
+    Cancel,
 }
 
 pub struct NpackGuiApp {
@@ -56,6 +77,15 @@ pub struct NpackGuiApp {
     status: String,
     active_transaction: Option<(&'static str, u64)>,
 
+    config: Option<Value>,
+    welcome_dismissed: bool,
+    error: Option<UiError>,
+    show_error_details: bool,
+    pending_install: Option<PendingInstall>,
+    trust_input: String,
+    relays_text: String,
+    blossom_text: String,
+
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
 }
@@ -64,7 +94,7 @@ impl NpackGuiApp {
     pub fn new() -> Self {
         let socket_path = DaemonClient::default_socket_path();
         let (tx, rx) = mpsc::channel();
-        Self {
+        let app = Self {
             socket_path_text: socket_path.display().to_string(),
             client: Arc::new(DaemonClient::new(socket_path)),
             tab: Tab::Installed,
@@ -77,9 +107,101 @@ impl NpackGuiApp {
             details: None,
             status: "Not connected yet -- pick a tab to load data.".to_owned(),
             active_transaction: None,
+            config: None,
+            welcome_dismissed: false,
+            error: None,
+            show_error_details: false,
+            pending_install: None,
+            trust_input: String::new(),
+            relays_text: String::new(),
+            blossom_text: String::new(),
             tx,
             rx,
-        }
+        };
+        app.refresh_config();
+        app
+    }
+
+    /// Records a failed action: a short status plus a banner with plain-language
+    /// advice (the daemon's raw message stays under "Details").
+    fn fail(&mut self, action: &str, error: UiError) {
+        self.status = format!("{action} didn't complete.");
+        self.error = Some(error);
+        self.show_error_details = false;
+    }
+
+    fn refresh_config(&self) {
+        self.spawn(|client| {
+            Event::Config(
+                client
+                    .call("GetConfig", serde_json::json!({}))
+                    .map_err(|e| UiError::from_anyhow(&e)),
+            )
+        });
+    }
+
+    fn save_config(&self, relays: Option<Vec<String>>, blossom: Option<Vec<String>>) {
+        self.spawn(move |client| {
+            let mut params = serde_json::Map::new();
+            if let Some(relays) = relays {
+                params.insert("relays".into(), relays.into());
+            }
+            if let Some(blossom) = blossom {
+                params.insert("blossom".into(), blossom.into());
+            }
+            Event::Config(
+                client
+                    .call("SaveConfig", Value::Object(params))
+                    .map_err(|e| UiError::from_anyhow(&e)),
+            )
+        });
+    }
+
+    fn add_trusted(&self, publisher: String) {
+        self.spawn(move |client| {
+            match client.call(
+                "AddTrustedPublisher",
+                serde_json::json!({ "publisher": publisher }),
+            ) {
+                Ok(_) => Event::Config(
+                    client
+                        .call("GetConfig", serde_json::json!({}))
+                        .map_err(|e| UiError::from_anyhow(&e)),
+                ),
+                Err(error) => Event::Config(Err(UiError::from_anyhow(&error))),
+            }
+        });
+    }
+
+    fn remove_trusted(&self, publisher: String) {
+        self.spawn(move |client| {
+            match client.call(
+                "RemoveTrustedPublisher",
+                serde_json::json!({ "publisher": publisher }),
+            ) {
+                Ok(_) => Event::Config(
+                    client
+                        .call("GetConfig", serde_json::json!({}))
+                        .map_err(|e| UiError::from_anyhow(&e)),
+                ),
+                Err(error) => Event::Config(Err(UiError::from_anyhow(&error))),
+            }
+        });
+    }
+
+    /// Fetches dependencies / requirements for the trust dialog.
+    fn load_install_preview(&self, reference: &str) {
+        let reference = reference.to_owned();
+        self.spawn(move |client| {
+            Event::InstallPreview(
+                client
+                    .call(
+                        "GetPackage",
+                        serde_json::json!({ "package": reference, "include_untrusted": true }),
+                    )
+                    .map_err(|e| UiError::from_anyhow(&e)),
+            )
+        });
     }
 
     fn spawn<F>(&self, work: F)
@@ -99,7 +221,7 @@ impl NpackGuiApp {
             let result = client
                 .call("ListInstalled", serde_json::json!({}))
                 .map(|value| value.as_array().cloned().unwrap_or_default())
-                .map_err(|error| error.to_string());
+                .map_err(|error| UiError::from_anyhow(&error));
             Event::Installed(result)
         });
     }
@@ -119,11 +241,14 @@ impl NpackGuiApp {
                 "query": query,
                 "relay": relays,
                 "refresh": rebuild,
+                // Show publishers outside the trust list too (marked
+                // "unknown") so installing from one can ask first.
+                "include_untrusted": true,
             });
             let result = client
                 .call("Search", params)
                 .map(|value| value.as_array().cloned().unwrap_or_default())
-                .map_err(|error| error.to_string());
+                .map_err(|error| UiError::from_anyhow(&error));
             Event::Search(result)
         });
     }
@@ -133,7 +258,7 @@ impl NpackGuiApp {
             let result = client
                 .call("CheckUpdates", serde_json::json!({}))
                 .map(|value| value.as_array().cloned().unwrap_or_default())
-                .map_err(|error| error.to_string());
+                .map_err(|error| UiError::from_anyhow(&error));
             Event::Updates(result)
         });
     }
@@ -142,17 +267,33 @@ impl NpackGuiApp {
         let package = package.to_owned();
         self.spawn(move |client| {
             let result = client
-                .call("GetPackage", serde_json::json!({ "package": package }))
-                .map_err(|error| error.to_string());
+                .call(
+                    "GetPackage",
+                    serde_json::json!({ "package": package, "include_untrusted": true }),
+                )
+                .map_err(|error| UiError::from_anyhow(&error));
             Event::Details(result)
         });
     }
 
-    fn install(&mut self, package: &str) {
+    fn install(&mut self, package: &str, trust_once: Vec<String>, trust_first: Option<String>) {
         let package = package.to_owned();
         self.status = format!("Starting install of {package}...");
         self.spawn(move |client| {
-            let params = serde_json::json!({ "package": package, "async": true });
+            if let Some(publisher) = trust_first
+                && let Err(error) = client.call(
+                    "AddTrustedPublisher",
+                    serde_json::json!({ "publisher": publisher }),
+                )
+            {
+                return Event::ActionFinished {
+                    action: "trust",
+                    result: Err(UiError::from_anyhow(&error)),
+                };
+            }
+            let params = serde_json::json!({
+                "package": package, "async": true, "trust_once": trust_once
+            });
             match client.call("Install", params) {
                 Ok(value) => match value.get("transaction_id").and_then(Value::as_u64) {
                     Some(id) => Event::TransactionStarted {
@@ -166,9 +307,27 @@ impl NpackGuiApp {
                 },
                 Err(error) => Event::ActionFinished {
                     action: "install",
-                    result: Err(error.to_string()),
+                    result: Err(UiError::from_anyhow(&error)),
                 },
             }
+        });
+    }
+
+    /// Install button: go straight ahead for a trusted publisher, otherwise
+    /// open the confirmation dialog first.
+    fn request_install(&mut self, item: &Value) {
+        let reference = package_reference(item);
+        if item.get("trust").and_then(Value::as_str) == Some("trusted") {
+            self.install(&reference, Vec::new(), None);
+            return;
+        }
+        self.load_install_preview(&reference);
+        self.pending_install = Some(PendingInstall {
+            reference,
+            publisher: value_str(item, "publisher"),
+            name: value_str(item, "name"),
+            version: value_str(item, "version"),
+            preview: None,
         });
     }
 
@@ -178,7 +337,7 @@ impl NpackGuiApp {
         self.spawn(move |client| {
             let result = client
                 .call("Remove", serde_json::json!({ "package": package }))
-                .map_err(|error| error.to_string());
+                .map_err(|error| UiError::from_anyhow(&error));
             Event::ActionFinished {
                 action: "remove",
                 result,
@@ -213,7 +372,7 @@ impl NpackGuiApp {
                     Err(error) => {
                         let _ = tx.send(Event::ActionFinished {
                             action,
-                            result: Err(error.to_string()),
+                            result: Err(UiError::from_anyhow(&error)),
                         });
                         return;
                     }
@@ -229,21 +388,32 @@ impl NpackGuiApp {
                     self.status = format!("{} package(s) installed.", items.len());
                     self.installed = items;
                 }
-                Event::Installed(Err(error)) => {
-                    self.status = format!("ListInstalled failed: {error}")
-                }
+                Event::Installed(Err(error)) => self.fail("Loading installed packages", error),
                 Event::Search(Ok(items)) => {
                     self.status = format!("{} result(s).", items.len());
                     self.search_results = items;
                 }
-                Event::Search(Err(error)) => self.status = format!("Search failed: {error}"),
+                Event::Search(Err(error)) => self.fail("Search", error),
                 Event::Updates(Ok(items)) => {
                     self.status = format!("Checked {} installed package(s).", items.len());
                     self.updates = items;
                 }
-                Event::Updates(Err(error)) => self.status = format!("CheckUpdates failed: {error}"),
+                Event::Updates(Err(error)) => self.fail("Checking for updates", error),
                 Event::Details(Ok(value)) => self.details = Some(value),
-                Event::Details(Err(error)) => self.status = format!("GetPackage failed: {error}"),
+                Event::Details(Err(error)) => self.fail("Loading details", error),
+                Event::Config(Ok(value)) => {
+                    self.relays_text = string_lines(&value, "relays");
+                    self.blossom_text = string_lines(&value, "blossom");
+                    self.config = Some(value);
+                }
+                Event::Config(Err(error)) => self.fail("Updating settings", error),
+                Event::InstallPreview(Ok(value)) => {
+                    if let Some(pending) = &mut self.pending_install {
+                        pending.preview = Some(value);
+                    }
+                }
+                // The dialog still works without the extra detail.
+                Event::InstallPreview(Err(_)) => {}
                 Event::TransactionStarted { action, id } => {
                     self.active_transaction = Some((action, id));
                     self.status =
@@ -268,11 +438,16 @@ impl NpackGuiApp {
                 Event::ActionFinished { action, result } => {
                     self.active_transaction = None;
                     match result {
-                        Ok(value) => {
-                            self.status = format!("{action} finished: {value}");
-                            self.refresh_installed();
-                        }
-                        Err(error) => self.status = format!("{action} failed: {error}"),
+                        Ok(value) => match UiError::from_failed_status(&value) {
+                            Some(error) => self.fail(action, error),
+                            None => {
+                                self.status = format!("{action} finished.");
+                                self.error = None;
+                                self.refresh_installed();
+                                self.refresh_config();
+                            }
+                        },
+                        Err(error) => self.fail(action, error),
                     }
                 }
             }
@@ -292,6 +467,63 @@ fn value_str(value: &Value, field: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or("?")
         .to_owned()
+}
+
+fn string_lines(config: &Value, field: &str) -> String {
+    config
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+fn lines_to_list(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `npub1abcdefgh…uvwxyz`: enough to recognise, short enough to read.
+fn short_npub(npub: &str) -> String {
+    if npub.chars().count() <= 20 {
+        return npub.to_owned();
+    }
+    let head: String = npub.chars().take(12).collect();
+    let tail: String = npub
+        .chars()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}…{tail}")
+}
+
+/// Search results carry the publisher as hex; people recognise npubs.
+fn display_publisher(item: &Value) -> String {
+    item.get("npub")
+        .and_then(Value::as_str)
+        .map_or_else(|| value_str(item, "publisher"), str::to_owned)
+}
+
+fn trust_badge(ui: &mut egui::Ui, trust: Option<&str>) {
+    match trust {
+        Some("trusted") => {
+            ui.colored_label(egui::Color32::from_rgb(40, 150, 70), "● Trusted");
+        }
+        _ => {
+            ui.colored_label(egui::Color32::from_rgb(200, 130, 20), "● Unknown publisher");
+        }
+    }
 }
 
 fn package_reference(value: &Value) -> String {
@@ -342,10 +574,16 @@ impl eframe::App for NpackGuiApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
+            self.show_error_banner(ui);
+            if self.is_first_run() {
+                self.show_welcome(ui);
+                return;
+            }
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Installed, "Installed");
                 ui.selectable_value(&mut self.tab, Tab::Search, "Search");
                 ui.selectable_value(&mut self.tab, Tab::Updates, "Updates");
+                ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
             });
             ui.separator();
 
@@ -353,12 +591,227 @@ impl eframe::App for NpackGuiApp {
                 Tab::Installed => self.show_installed_tab(ui),
                 Tab::Search => self.show_search_tab(ui),
                 Tab::Updates => self.show_updates_tab(ui),
+                Tab::Settings => self.show_settings_tab(ui),
             }
         });
+
+        self.show_trust_dialog(&ui.ctx().clone());
     }
 }
 
 impl NpackGuiApp {
+    fn is_first_run(&self) -> bool {
+        !self.welcome_dismissed
+            && self
+                .config
+                .as_ref()
+                .and_then(|config| config.get("first_run"))
+                .and_then(Value::as_bool)
+                == Some(true)
+    }
+
+    fn show_error_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(error) = self.error.clone() else {
+            return;
+        };
+        let mut dismiss = false;
+        let mut open_settings = false;
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgba_unmultiplied(200, 60, 40, 40))
+            .inner_margin(egui::Margin::same(8))
+            .corner_radius(4)
+            .show(ui, |ui| {
+                ui.label(error.headline());
+                ui.horizontal(|ui| {
+                    if error.suggests_settings() && ui.button("Open Settings").clicked() {
+                        open_settings = true;
+                    }
+                    if ui.button("Dismiss").clicked() {
+                        dismiss = true;
+                    }
+                    ui.toggle_value(&mut self.show_error_details, "Details");
+                });
+                if self.show_error_details {
+                    ui.weak(&error.detail);
+                }
+            });
+        ui.add_space(6.0);
+        if open_settings {
+            self.tab = Tab::Settings;
+            self.welcome_dismissed = true;
+            self.error = None;
+        }
+        if dismiss {
+            self.error = None;
+        }
+    }
+
+    fn show_welcome(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Welcome to npack");
+        ui.add_space(6.0);
+        ui.label(
+            "npack installs software published by people you choose to trust. Every download is \
+             checked against a signed checksum before anything is installed.",
+        );
+        ui.label(
+            "Nobody is trusted to start with. You'll be asked before installing from a new \
+             publisher, and you can change your mind any time in Settings.",
+        );
+        ui.add_space(10.0);
+        if let Some(config) = &self.config {
+            ui.strong("Where npack looks for software (relays)");
+            for relay in lines_to_list(&string_lines(config, "relays")) {
+                ui.label(format!("  {relay}"));
+            }
+            ui.add_space(4.0);
+            ui.strong("Where it downloads from");
+            for server in lines_to_list(&string_lines(config, "blossom")) {
+                ui.label(format!("  {server}"));
+            }
+        }
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ui.button("Use recommended settings").clicked() {
+                self.save_config(None, None);
+                self.welcome_dismissed = true;
+            }
+            if ui.button("Customise in Settings").clicked() {
+                self.tab = Tab::Settings;
+                self.welcome_dismissed = true;
+            }
+        });
+    }
+
+    fn show_settings_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Trusted publishers");
+        ui.label("npack only installs without asking from publishers on this list.");
+        let publishers: Vec<(String, String)> = self
+            .config
+            .as_ref()
+            .and_then(|config| config.get("trusted_publishers"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| (value_str(item, "publisher"), value_str(item, "npub")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if publishers.is_empty() {
+            ui.weak("No one is trusted yet.");
+        }
+        let mut to_remove = None;
+        for (publisher, npub) in &publishers {
+            ui.horizontal(|ui| {
+                ui.label(npub).on_hover_text(npub);
+                if ui.button("Stop trusting").clicked() {
+                    to_remove = Some(publisher.clone());
+                }
+            });
+        }
+        if let Some(publisher) = to_remove {
+            self.remove_trusted(publisher);
+        }
+        ui.horizontal(|ui| {
+            ui.label("Add publisher (npub or hex):");
+            ui.text_edit_singleline(&mut self.trust_input);
+            if ui.button("Trust").clicked() && !self.trust_input.trim().is_empty() {
+                self.add_trusted(self.trust_input.trim().to_owned());
+                self.trust_input.clear();
+            }
+        });
+
+        ui.add_space(12.0);
+        ui.heading("Network");
+        ui.label("Relays (one per line):");
+        ui.add(egui::TextEdit::multiline(&mut self.relays_text).desired_rows(3));
+        ui.label("Download servers (one per line):");
+        ui.add(egui::TextEdit::multiline(&mut self.blossom_text).desired_rows(3));
+        ui.horizontal(|ui| {
+            if ui.button("Save").clicked() {
+                self.save_config(
+                    Some(lines_to_list(&self.relays_text)),
+                    Some(lines_to_list(&self.blossom_text)),
+                );
+            }
+            if ui.button("Restore recommended").clicked() {
+                self.save_config(Some(Vec::new()), Some(Vec::new()));
+            }
+        });
+    }
+
+    fn show_trust_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &self.pending_install else {
+            return;
+        };
+        let mut choice = None;
+        egui::Window::new("Install from a publisher you haven't trusted?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.strong(format!("{} {}", pending.name, pending.version));
+                let npub = pending
+                    .preview
+                    .as_ref()
+                    .and_then(|preview| preview.get("npub"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(&pending.publisher);
+                ui.label(format!("Published by {}", short_npub(npub)))
+                    .on_hover_text(npub);
+                ui.add_space(4.0);
+                ui.label(
+                    "npack has checked the signature and checksum. That proves who published \
+                     these exact files, not that the software is safe.",
+                );
+                if let Some(preview) = &pending.preview {
+                    let dependencies: Vec<String> = preview
+                        .get("dependencies")
+                        .and_then(Value::as_array)
+                        .map(|items| items.iter().map(|d| value_str(d, "name")).collect())
+                        .unwrap_or_default();
+                    if !dependencies.is_empty() {
+                        ui.label(format!("Also installs: {}", dependencies.join(", ")));
+                    }
+                    let requires: Vec<&str> = preview
+                        .get("runtime_requires")
+                        .and_then(Value::as_array)
+                        .map(|items| items.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    if !requires.is_empty() {
+                        ui.label(format!("Needs on your system: {}", requires.join(", ")));
+                    }
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Trust this publisher and install").clicked() {
+                        choice = Some(TrustChoice::TrustAndInstall);
+                    }
+                    if ui.button("Install just this once").clicked() {
+                        choice = Some(TrustChoice::InstallOnce);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(TrustChoice::Cancel);
+                    }
+                });
+            });
+        let Some(choice) = choice else {
+            return;
+        };
+        let Some(pending) = self.pending_install.take() else {
+            return;
+        };
+        match choice {
+            TrustChoice::TrustAndInstall => {
+                self.install(&pending.reference, Vec::new(), Some(pending.publisher));
+            }
+            TrustChoice::InstallOnce => {
+                self.install(&pending.reference, vec![pending.publisher], None);
+            }
+            TrustChoice::Cancel => {}
+        }
+    }
+
     fn show_installed_tab(&mut self, ui: &mut egui::Ui) {
         if ui.button("Refresh installed list").clicked() {
             self.refresh_installed();
@@ -408,20 +861,26 @@ impl NpackGuiApp {
         for item in &self.search_results {
             let reference = package_reference(item);
             ui.horizontal(|ui| {
-                ui.label(format!("{reference} {}", value_str(item, "version")));
+                ui.label(format!(
+                    "{} {}",
+                    value_str(item, "name"),
+                    value_str(item, "version")
+                ));
+                trust_badge(ui, item.get("trust").and_then(Value::as_str));
+                ui.weak(short_npub(&display_publisher(item)));
                 if ui.button("Details").clicked() {
                     to_show = Some(reference.clone());
                 }
                 if ui.button("Install").clicked() {
-                    to_install = Some(reference.clone());
+                    to_install = Some(item.clone());
                 }
             });
         }
         if let Some(reference) = to_show {
             self.show_details(&reference);
         }
-        if let Some(reference) = to_install {
-            self.install(&reference);
+        if let Some(item) = to_install {
+            self.request_install(&item);
         }
     }
 

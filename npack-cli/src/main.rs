@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bitcoin_hashes::sha256::Hash as Sha256Hash;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_mangen::Man;
@@ -114,8 +114,31 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Debug, Default, Deserialize)]
+/// Built-in fallbacks used when `[network].relays` / `[storage].blossom` are
+/// empty, so a first run works without hand-editing `config.toml`. These are
+/// public community infrastructure npack does not operate; a user's own
+/// config always wins, and `npack` never writes them to disk unless the user
+/// saves settings (`SaveConfig`).
+const DEFAULT_RELAYS: &[&str] = &[
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://relay.primal.net",
+];
+const DEFAULT_BLOSSOM_SERVERS: &[&str] =
+    &["https://blossom.primal.net", "https://cdn.satellite.earth"];
+
+#[derive(Debug, Clone, Default, Deserialize)]
 struct Config {
+    /// True when no `config.toml` existed at load time (the daemon reports it
+    /// so a GUI can show a first-run screen). Not part of the file.
+    #[serde(skip)]
+    first_run: bool,
+    /// True when the built-in default relays / Blossom servers are in use
+    /// because the user's config named none.
+    #[serde(skip)]
+    relays_defaulted: bool,
+    #[serde(skip)]
+    blossom_defaulted: bool,
     #[serde(default)]
     network: NetworkConfig,
     #[serde(default)]
@@ -128,31 +151,31 @@ struct Config {
     identity: IdentityConfig,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct NetworkConfig {
     #[serde(default)]
     relays: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct StorageConfig {
     #[serde(default)]
     blossom: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct TrustConfig {
     #[serde(default)]
     publishers: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct InstallConfig {
     #[serde(default)]
     user: bool,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct IdentityConfig {
     #[serde(default)]
     pubkey: Option<String>,
@@ -4187,6 +4210,48 @@ struct DaemonResponse {
     result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Stable machine-readable category for `error` (additive; `error` keeps
+    /// the full human text). See `daemon_error_code`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<&'static str>,
+}
+
+/// Maps an error message to a stable, documented category so a GUI can show
+/// its own friendly wording and offer the right action (retry, open
+/// settings, trust the publisher) instead of printing a raw error string.
+fn daemon_error_code(message: &str) -> &'static str {
+    let message = message.to_lowercase();
+    let has = |needle: &str| message.contains(needle);
+    if message.starts_with("unknown method") {
+        "unknown_method"
+    } else if message.starts_with("invalid ") && has(" params") {
+        "invalid_params"
+    } else if has("invalid publisher key")
+        || has("invalid relay ")
+        || has("invalid blossom server ")
+    {
+        "invalid_input"
+    } else if has("not authorized") || has("cannot authorize") {
+        "not_authorized"
+    } else if has("no relays configured") {
+        "no_relays"
+    } else if has("no blossom servers configured") {
+        "no_blossom_servers"
+    } else if has("timed out connecting") {
+        "relay_unreachable"
+    } else if has("another npack operation is already in progress") {
+        "store_busy"
+    } else if has("untrusted publisher") || has("not in the trusted publisher list") {
+        "publisher_untrusted"
+    } else if has("returned the expected sha-256") {
+        "download_failed"
+    } else if has("installation cancelled") || has("update cancelled") {
+        "cancelled"
+    } else if has("is not installed") || has("no release named") || has("no verified release") {
+        "not_found"
+    } else {
+        "internal"
+    }
 }
 
 impl DaemonResponse {
@@ -4195,14 +4260,17 @@ impl DaemonResponse {
             id,
             result: Some(result),
             error: None,
+            error_code: None,
         }
     }
 
     fn err(id: u64, error: impl std::fmt::Display) -> Self {
+        let message = error.to_string();
         Self {
             id,
             result: None,
-            error: Some(error.to_string()),
+            error_code: Some(daemon_error_code(&message)),
+            error: Some(message),
         }
     }
 }
@@ -4244,6 +4312,11 @@ fn polkit_action_for_method(method: &str) -> Option<&'static str> {
         "Install" => Some("io.npack.install"),
         "Remove" => Some("io.npack.remove"),
         "Update" => Some("io.npack.update"),
+        // Editing trust or network settings on the system daemon changes what
+        // root will install, so it is gated like a mutation.
+        "AddTrustedPublisher" | "RemoveTrustedPublisher" | "SaveConfig" => {
+            Some("io.npack.configure")
+        }
         _ => None,
     }
 }
@@ -4290,8 +4363,13 @@ async fn authorize_system_action(action_id: &str, pid: Option<u32>) -> Result<()
 #[serde(tag = "status", rename_all = "lowercase")]
 enum TransactionStatus {
     Running,
-    Succeeded { result: serde_json::Value },
-    Failed { error: String },
+    Succeeded {
+        result: serde_json::Value,
+    },
+    Failed {
+        error: String,
+        error_code: &'static str,
+    },
     Cancelled,
 }
 
@@ -4355,7 +4433,11 @@ struct TransactionEntry {
 }
 
 struct DaemonState {
-    config: Config,
+    /// Live config. Trust and network settings edited over RPC are written
+    /// back to `config_path` and swapped in here, so later requests see them
+    /// without a daemon restart.
+    config: std::sync::RwLock<Config>,
+    config_path: Option<PathBuf>,
     role: DaemonRole,
     transactions: std::sync::Mutex<HashMap<u64, TransactionEntry>>,
     next_transaction_id: AtomicU64,
@@ -4363,12 +4445,26 @@ struct DaemonState {
 
 impl DaemonState {
     fn new(config: Config, role: DaemonRole) -> Self {
+        Self::with_config_path(config, role, config_file_path())
+    }
+
+    fn with_config_path(config: Config, role: DaemonRole, config_path: Option<PathBuf>) -> Self {
         Self {
-            config,
+            config: std::sync::RwLock::new(config),
+            config_path,
             role,
             transactions: std::sync::Mutex::new(HashMap::new()),
             next_transaction_id: AtomicU64::new(1),
         }
+    }
+
+    /// A snapshot of the current config; handlers work on the snapshot so no
+    /// lock is held across an await.
+    fn config(&self) -> Config {
+        self.config
+            .read()
+            .map(|config| config.clone())
+            .unwrap_or_default()
     }
 
     /// Registers a new transaction and spawns `make_work` (given a fresh
@@ -4395,6 +4491,7 @@ impl DaemonState {
                 Ok(result) => TransactionStatus::Succeeded { result },
                 Err(error) if is_cancellation_error(&error) => TransactionStatus::Cancelled,
                 Err(error) => TransactionStatus::Failed {
+                    error_code: daemon_error_code(&error.to_string()),
                     error: error.to_string(),
                 },
             };
@@ -4471,6 +4568,7 @@ async fn handle_daemon_connection(
                 id: 0,
                 result: None,
                 error: Some(format!("invalid request: {error}")),
+                error_code: Some("invalid_request"),
             },
         };
         let mut serialized = serde_json::to_string(&response)?;
@@ -4504,17 +4602,216 @@ async fn dispatch_daemon_request(
         None => {}
     }
     match request.method.as_str() {
-        "Search" => daemon_search(&state.config, request.params).await,
-        "GetPackage" => daemon_get_package(&state.config, request.params).await,
-        "ListInstalled" => daemon_list_installed(&state.config, request.params),
+        "Search" => daemon_search(&state.config(), request.params).await,
+        "GetPackage" => daemon_get_package(&state.config(), request.params).await,
+        "ListInstalled" => daemon_list_installed(&state.config(), request.params),
         "Install" => daemon_install(state, request.params).await,
-        "Remove" => daemon_remove(&state.config, request.params),
+        "Remove" => daemon_remove(&state.config(), request.params),
         "Update" => daemon_update(state, request.params).await,
-        "CheckUpdates" => daemon_check_updates(&state.config, request.params).await,
+        "CheckUpdates" => daemon_check_updates(&state.config(), request.params).await,
+        "GetConfig" => daemon_get_config(state),
+        "ListTrustedPublishers" => daemon_list_trusted_publishers(state),
+        "AddTrustedPublisher" => daemon_add_trusted_publisher(state, request.params),
+        "RemoveTrustedPublisher" => daemon_remove_trusted_publisher(state, request.params),
+        "SaveConfig" => daemon_save_config(state, request.params),
         "GetTransaction" => daemon_get_transaction(state, request.params),
         "CancelTransaction" => daemon_cancel_transaction(state, request.params),
         other => bail!("unknown method {other}"),
     }
+}
+
+/// Whether `publisher` (hex or npub) is in the configured trust list. This is
+/// the daemon-side notion shown to GUIs as `"trust": "trusted" | "unknown"`:
+/// with an empty list nobody is "trusted" yet, even though the CLI's filter
+/// treats an empty list as "accept any publisher".
+fn trust_status(config: &Config, publisher: &str) -> &'static str {
+    let hex = normalize_publisher_reference(publisher);
+    let trusted = config
+        .trust
+        .publishers
+        .iter()
+        .any(|entry| normalize_publisher_reference(entry) == hex);
+    if trusted { "trusted" } else { "unknown" }
+}
+
+fn publisher_json(entry: &str) -> serde_json::Value {
+    serde_json::json!({
+        "publisher": normalize_publisher_reference(entry),
+        "npub": display_publisher(entry),
+    })
+}
+
+fn daemon_get_config(state: &Arc<DaemonState>) -> Result<serde_json::Value> {
+    let config = state.config();
+    Ok(serde_json::json!({
+        "first_run": config.first_run,
+        "config_path": state.config_path,
+        "relays": config.network.relays,
+        "blossom": config.storage.blossom,
+        "relays_defaulted": config.relays_defaulted,
+        "blossom_defaulted": config.blossom_defaulted,
+        "trusted_publishers": config.trust.publishers.iter().map(|p| publisher_json(p)).collect::<Vec<_>>(),
+    }))
+}
+
+fn daemon_list_trusted_publishers(state: &Arc<DaemonState>) -> Result<serde_json::Value> {
+    let config = state.config();
+    Ok(serde_json::Value::Array(
+        config
+            .trust
+            .publishers
+            .iter()
+            .map(|publisher| publisher_json(publisher))
+            .collect(),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct PublisherParams {
+    publisher: String,
+}
+
+fn config_write_path(state: &DaemonState) -> Result<&Path> {
+    state
+        .config_path
+        .as_deref()
+        .context("no config directory available to save settings")
+}
+
+fn daemon_add_trusted_publisher(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: PublisherParams =
+        serde_json::from_value(params).context("invalid AddTrustedPublisher params")?;
+    let hex = PublicKey::parse(params.publisher.trim())
+        .map(|key| key.to_hex())
+        .with_context(|| format!("invalid publisher key: {}", params.publisher))?;
+    let npub = display_publisher(&hex);
+    let path = config_write_path(state)?;
+    let mut config = state
+        .config
+        .write()
+        .map_err(|_| anyhow!("config lock poisoned"))?;
+    let mut publishers = config.trust.publishers.clone();
+    if !publishers
+        .iter()
+        .any(|entry| normalize_publisher_reference(entry) == hex)
+    {
+        publishers.push(npub.clone());
+    }
+    update_config_file(path, |table| {
+        config_section(table, "trust").insert("publishers".into(), string_array(&publishers));
+    })?;
+    config.trust.publishers = publishers;
+    config.first_run = false;
+    Ok(publisher_json(&hex))
+}
+
+fn daemon_remove_trusted_publisher(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: PublisherParams =
+        serde_json::from_value(params).context("invalid RemoveTrustedPublisher params")?;
+    let hex = normalize_publisher_reference(params.publisher.trim());
+    let path = config_write_path(state)?;
+    let mut config = state
+        .config
+        .write()
+        .map_err(|_| anyhow!("config lock poisoned"))?;
+    let publishers: Vec<String> = config
+        .trust
+        .publishers
+        .iter()
+        .filter(|entry| normalize_publisher_reference(entry) != hex)
+        .cloned()
+        .collect();
+    let removed = publishers.len() != config.trust.publishers.len();
+    if removed {
+        update_config_file(path, |table| {
+            config_section(table, "trust").insert("publishers".into(), string_array(&publishers));
+        })?;
+        config.trust.publishers = publishers;
+    }
+    Ok(serde_json::json!({ "removed": removed, "publisher": hex }))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct SaveConfigParams {
+    #[serde(default)]
+    relays: Option<Vec<String>>,
+    #[serde(default)]
+    blossom: Option<Vec<String>>,
+}
+
+fn clean_endpoints(values: Vec<String>, schemes: &[&str], what: &str) -> Result<Vec<String>> {
+    let mut cleaned = Vec::new();
+    for value in values {
+        let value = value.trim().trim_end_matches('/').to_owned();
+        if value.is_empty() {
+            continue;
+        }
+        if !schemes.iter().any(|scheme| value.starts_with(scheme)) {
+            bail!(
+                "invalid {what} {value}: expected a URL starting with {}",
+                schemes.join(" or ")
+            );
+        }
+        if !cleaned.contains(&value) {
+            cleaned.push(value);
+        }
+    }
+    Ok(cleaned)
+}
+
+/// Writes the relays / Blossom servers to `config.toml` (the effective ones
+/// when a field is omitted, which is how a first-run "use recommended
+/// settings" persists the built-in defaults). An explicitly empty list reverts
+/// that setting to the built-in defaults.
+fn daemon_save_config(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: SaveConfigParams =
+        serde_json::from_value(params).context("invalid SaveConfig params")?;
+    let path = config_write_path(state)?;
+    let mut config = state
+        .config
+        .write()
+        .map_err(|_| anyhow!("config lock poisoned"))?;
+    let mut updated = config.clone();
+    if let Some(relays) = params.relays {
+        updated.network.relays = clean_endpoints(relays, &["ws://", "wss://"], "relay")?;
+        updated.relays_defaulted = false;
+    }
+    if let Some(blossom) = params.blossom {
+        updated.storage.blossom =
+            clean_endpoints(blossom, &["http://", "https://"], "Blossom server")?;
+        updated.blossom_defaulted = false;
+    }
+    let (relays, blossom) = (
+        updated.network.relays.clone(),
+        updated.storage.blossom.clone(),
+    );
+    update_config_file(path, |table| {
+        // Only persist non-empty lists; an empty list means "use defaults".
+        if !relays.is_empty() {
+            config_section(table, "network").insert("relays".into(), string_array(&relays));
+        } else {
+            config_section(table, "network").remove("relays");
+        }
+        if !blossom.is_empty() {
+            config_section(table, "storage").insert("blossom".into(), string_array(&blossom));
+        } else {
+            config_section(table, "storage").remove("blossom");
+        }
+    })?;
+    updated.first_run = false;
+    updated.apply_defaults();
+    *config = updated;
+    drop(config);
+    daemon_get_config(state)
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -4532,12 +4829,21 @@ struct SearchParams {
     no_cache: bool,
     #[serde(default)]
     store: Option<PathBuf>,
+    /// Also return publishers outside the trust list, each annotated with
+    /// `"trust": "unknown"`, so a GUI can ask before trusting them. Without
+    /// it the configured list filters results exactly as the CLI does.
+    #[serde(default)]
+    include_untrusted: bool,
 }
 
 async fn daemon_search(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
     let params: SearchParams = serde_json::from_value(params).context("invalid Search params")?;
     let relays = normalize_relays(params.relay, config);
-    let trusted_publishers = configured_publishers(params.trusted_publisher, config)?;
+    let trusted_publishers = if params.include_untrusted {
+        Vec::new()
+    } else {
+        configured_publishers(params.trusted_publisher, config)?
+    };
     let pubkey = params.pubkey.or_else(|| config.identity.pubkey.clone());
     let root = params.store.unwrap_or_else(default_store);
     let results = search_matching_releases(
@@ -4550,7 +4856,24 @@ async fn daemon_search(config: &Config, params: serde_json::Value) -> Result<ser
         &root,
     )
     .await?;
-    Ok(serde_json::to_value(results)?)
+    let mut value = serde_json::to_value(results)?;
+    for item in value.as_array_mut().into_iter().flatten() {
+        let status = item
+            .get("publisher")
+            .and_then(serde_json::Value::as_str)
+            .map(|publisher| trust_status(config, publisher));
+        let npub = item
+            .get("publisher")
+            .and_then(serde_json::Value::as_str)
+            .map(display_publisher);
+        if let (Some(status), Some(object)) = (status, item.as_object_mut()) {
+            object.insert("trust".into(), status.into());
+            if let Some(npub) = npub {
+                object.insert("npub".into(), npub.into());
+            }
+        }
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Deserialize)]
@@ -4570,6 +4893,10 @@ struct GetPackageParams {
     store: Option<PathBuf>,
     #[serde(default)]
     user: bool,
+    /// Resolve even when the publisher is outside the trust list; the result
+    /// carries `"trust": "unknown"` instead of the request failing.
+    #[serde(default)]
+    include_untrusted: bool,
 }
 
 async fn daemon_get_package(
@@ -4579,7 +4906,11 @@ async fn daemon_get_package(
     let params: GetPackageParams =
         serde_json::from_value(params).context("invalid GetPackage params")?;
     let relays = configured_relays(params.relay, config)?;
-    let trusted_publishers = configured_publishers(params.trusted_publisher, config)?;
+    let trusted_publishers = if params.include_untrusted {
+        Vec::new()
+    } else {
+        configured_publishers(params.trusted_publisher, config)?
+    };
     let (publisher, name) = params
         .package
         .split_once('/')
@@ -4606,7 +4937,30 @@ async fn daemon_get_package(
     )
     .await;
     client.disconnect().await;
-    Ok(serde_json::to_value(resolved?)?)
+    let mut value = serde_json::to_value(resolved?)?;
+    let status = value
+        .get("publisher")
+        .and_then(serde_json::Value::as_str)
+        .map(|publisher| trust_status(config, publisher));
+    let npub = value
+        .get("publisher")
+        .and_then(serde_json::Value::as_str)
+        .map(display_publisher);
+    if let (Some(status), Some(object)) = (status, value.as_object_mut()) {
+        object.insert("trust".into(), status.into());
+        if let Some(npub) = npub {
+            object.insert("npub".into(), npub.into());
+        }
+        if let Some(verification) = object
+            .get_mut("verification")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            // The resolver treats an empty list as "trust anyone"; report the
+            // daemon's stricter notion so a GUI never shows a false "trusted".
+            verification.insert("publisher_trusted".into(), (status == "trusted").into());
+        }
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -4640,6 +4994,10 @@ struct InstallParams {
     store: Option<PathBuf>,
     #[serde(default)]
     allow_capability: Vec<String>,
+    /// Publishers (hex or npub) the user approved for this install only,
+    /// without adding them to the trust list.
+    #[serde(default)]
+    trust_once: Vec<String>,
     /// Per-install values keyed by install-input id. Kept only in memory.
     #[serde(default)]
     install_values: serde_json::Map<String, serde_json::Value>,
@@ -4657,11 +5015,11 @@ async fn daemon_install(
     if params.background {
         let daemon_state = state.clone();
         let id = state.start_transaction(move |cancel| async move {
-            daemon_install_sync(&daemon_state.config, params, Some(cancel)).await
+            daemon_install_sync(&daemon_state.config(), params, Some(cancel)).await
         });
         return Ok(serde_json::json!({ "transaction_id": id }));
     }
-    daemon_install_sync(&state.config, params, None).await
+    daemon_install_sync(&state.config(), params, None).await
 }
 
 async fn daemon_install_sync(
@@ -4670,6 +5028,14 @@ async fn daemon_install_sync(
     control: Option<Arc<TransactionControl>>,
 ) -> Result<serde_json::Value> {
     let package = params.package.clone();
+    let mut config = config.clone();
+    if !config.trust.publishers.is_empty() {
+        config
+            .trust
+            .publishers
+            .extend(params.trust_once.iter().cloned());
+    }
+    let config = &config;
     let input_metadata = daemon_get_package(
         config,
         serde_json::json!({
@@ -4777,11 +5143,11 @@ async fn daemon_update(
     if params.background {
         let daemon_state = state.clone();
         let id = state.start_transaction(move |cancel| async move {
-            daemon_update_sync(&daemon_state.config, params, Some(cancel)).await
+            daemon_update_sync(&daemon_state.config(), params, Some(cancel)).await
         });
         return Ok(serde_json::json!({ "transaction_id": id }));
     }
-    daemon_update_sync(&state.config, params, None).await
+    daemon_update_sync(&state.config(), params, None).await
 }
 
 async fn daemon_update_sync(
@@ -5820,17 +6186,89 @@ fn default_store() -> PathBuf {
         .join("npack")
 }
 
+fn config_file_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("npack/config.toml"))
+}
+
 fn load_config() -> Result<Config> {
-    let Some(config_dir) = dirs::config_dir() else {
-        return Ok(Config::default());
+    load_config_from(config_file_path().as_deref())
+}
+
+/// Loads the config at `path` (or an empty one when the file or directory is
+/// missing), then fills in the built-in relays / Blossom servers for any list
+/// the user left empty.
+fn load_config_from(path: Option<&Path>) -> Result<Config> {
+    let mut config = match path {
+        Some(path) if path.exists() => {
+            let contents = fs::read_to_string(path)
+                .with_context(|| format!("reading npack config {}", path.display()))?;
+            toml::from_str(&contents)
+                .with_context(|| format!("parsing npack config {}", path.display()))?
+        }
+        _ => Config {
+            first_run: true,
+            ..Config::default()
+        },
     };
-    let path = config_dir.join("npack/config.toml");
-    if !path.exists() {
-        return Ok(Config::default());
+    config.apply_defaults();
+    Ok(config)
+}
+
+impl Config {
+    fn apply_defaults(&mut self) {
+        if self.network.relays.is_empty() {
+            self.network.relays = DEFAULT_RELAYS
+                .iter()
+                .map(|relay| (*relay).to_owned())
+                .collect();
+            self.relays_defaulted = true;
+        }
+        if self.storage.blossom.is_empty() {
+            self.storage.blossom = DEFAULT_BLOSSOM_SERVERS
+                .iter()
+                .map(|server| (*server).to_owned())
+                .collect();
+            self.blossom_defaulted = true;
+        }
     }
-    let contents = fs::read_to_string(&path)
-        .with_context(|| format!("reading npack config {}", path.display()))?;
-    toml::from_str(&contents).with_context(|| format!("parsing npack config {}", path.display()))
+}
+
+/// Read-modify-writes the config file as a generic TOML table so keys npack
+/// does not know about survive (comments do not). Refuses to touch a file
+/// that does not parse, rather than overwriting what the user wrote. The new
+/// contents are written to a sibling temp file and renamed into place.
+fn update_config_file(path: &Path, edit: impl FnOnce(&mut toml::Table)) -> Result<()> {
+    let mut table = if path.exists() {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("reading npack config {}", path.display()))?;
+        toml::from_str::<toml::Table>(&contents)
+            .with_context(|| format!("parsing npack config {}", path.display()))?
+    } else {
+        toml::Table::new()
+    };
+    edit(&mut table);
+    let rendered = toml::to_string_pretty(&table).context("serializing npack config")?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let temporary = path.with_extension("toml.tmp");
+    fs::write(&temporary, rendered).with_context(|| format!("writing {}", temporary.display()))?;
+    fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
+}
+
+fn config_section<'a>(table: &'a mut toml::Table, name: &str) -> &'a mut toml::Table {
+    let entry = table
+        .entry(name.to_owned())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if !entry.is_table() {
+        *entry = toml::Value::Table(toml::Table::new());
+    }
+    entry.as_table_mut().expect("section was just made a table")
+}
+
+fn string_array(values: &[String]) -> toml::Value {
+    toml::Value::Array(values.iter().cloned().map(toml::Value::String).collect())
 }
 
 /// Merges CLI-supplied relays with `[network].relays`, normalizing and
@@ -8980,6 +9418,23 @@ mod tests {
             required_authorization(DaemonRole::System, 1000, "Update"),
             Some("io.npack.update")
         );
+        for method in [
+            "AddTrustedPublisher",
+            "RemoveTrustedPublisher",
+            "SaveConfig",
+        ] {
+            assert_eq!(
+                required_authorization(DaemonRole::System, 1000, method),
+                Some("io.npack.configure"),
+                "{method} changes what root will install, so it is gated"
+            );
+        }
+        for method in ["GetConfig", "ListTrustedPublishers"] {
+            assert_eq!(
+                required_authorization(DaemonRole::System, 1000, method),
+                None
+            );
+        }
         assert_eq!(
             required_authorization(DaemonRole::System, 1000, "ListInstalled"),
             None
@@ -9246,5 +9701,223 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!("transaction never completed");
+    }
+
+    const TEST_PUBKEY_HEX: &str =
+        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    fn call_daemon(
+        state: &Arc<DaemonState>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        runtime.block_on(dispatch_daemon_request(
+            state,
+            DaemonRequest {
+                id: 1,
+                method: method.to_owned(),
+                params,
+            },
+            None,
+        ))
+    }
+
+    fn state_with_config_file(dir: &Path) -> (Arc<DaemonState>, PathBuf) {
+        let path = dir.join("npack/config.toml");
+        let config = load_config_from(Some(&path)).unwrap();
+        let state = Arc::new(DaemonState::with_config_path(
+            config,
+            DaemonRole::User,
+            Some(path.clone()),
+        ));
+        (state, path)
+    }
+
+    #[test]
+    fn missing_config_means_first_run_with_builtin_defaults() -> Result<()> {
+        let dir = tempdir()?;
+        let config = load_config_from(Some(&dir.path().join("config.toml")))?;
+        assert!(config.first_run);
+        assert!(config.relays_defaulted && config.blossom_defaulted);
+        assert!(!config.network.relays.is_empty());
+        assert!(!config.storage.blossom.is_empty());
+        assert!(
+            config.trust.publishers.is_empty(),
+            "no publisher is pre-trusted"
+        );
+        // The defaults must satisfy the CLI's non-empty requirements.
+        assert!(configured_relays(Vec::new(), &config).is_ok());
+        assert!(configured_servers(Vec::new(), &config).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn user_configured_endpoints_win_over_defaults() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[network]\nrelays = [\"ws://127.0.0.1:1\"]\n[storage]\nblossom = [\"http://127.0.0.1:2\"]\n",
+        )?;
+        let config = load_config_from(Some(&path))?;
+        assert!(!config.first_run && !config.relays_defaulted && !config.blossom_defaulted);
+        assert_eq!(config.network.relays, ["ws://127.0.0.1:1"]);
+        assert_eq!(config.storage.blossom, ["http://127.0.0.1:2"]);
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_publishers_round_trip_through_the_daemon_and_config_file() -> Result<()> {
+        let dir = tempdir()?;
+        let (state, path) = state_with_config_file(dir.path());
+        assert_eq!(
+            call_daemon(&state, "GetConfig", serde_json::json!({}))?["first_run"],
+            true
+        );
+
+        let added = call_daemon(
+            &state,
+            "AddTrustedPublisher",
+            serde_json::json!({ "publisher": TEST_PUBKEY_HEX }),
+        )?;
+        assert_eq!(added["publisher"], TEST_PUBKEY_HEX);
+        assert!(added["npub"].as_str().unwrap().starts_with("npub1"));
+        // Adding twice does not duplicate.
+        call_daemon(
+            &state,
+            "AddTrustedPublisher",
+            serde_json::json!({ "publisher": added["npub"] }),
+        )?;
+        let listed = call_daemon(&state, "ListTrustedPublishers", serde_json::json!({}))?;
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+
+        // Persisted, and a fresh load sees it and is no longer a first run.
+        let reloaded = load_config_from(Some(&path))?;
+        assert!(!reloaded.first_run);
+        assert_eq!(
+            configured_publishers(Vec::new(), &reloaded)?,
+            [TEST_PUBKEY_HEX]
+        );
+        assert_eq!(trust_status(&state.config(), TEST_PUBKEY_HEX), "trusted");
+
+        let removed = call_daemon(
+            &state,
+            "RemoveTrustedPublisher",
+            serde_json::json!({ "publisher": added["npub"] }),
+        )?;
+        assert_eq!(removed["removed"], true);
+        assert_eq!(trust_status(&state.config(), TEST_PUBKEY_HEX), "unknown");
+        assert!(load_config_from(Some(&path))?.trust.publishers.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn editing_trust_keeps_unrelated_config_keys_and_rejects_bad_keys() -> Result<()> {
+        let dir = tempdir()?;
+        let (state, path) = state_with_config_file(dir.path());
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(
+            &path,
+            "[install]\nuser = true\n[identity]\npubkey = \"abc\"\n",
+        )?;
+        call_daemon(
+            &state,
+            "AddTrustedPublisher",
+            serde_json::json!({ "publisher": TEST_PUBKEY_HEX }),
+        )?;
+        let reloaded = load_config_from(Some(&path))?;
+        assert!(reloaded.install.user);
+        assert_eq!(reloaded.identity.pubkey.as_deref(), Some("abc"));
+
+        let error = call_daemon(
+            &state,
+            "AddTrustedPublisher",
+            serde_json::json!({ "publisher": "not-a-key" }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid publisher key"));
+
+        // A config file that does not parse is never overwritten.
+        fs::write(&path, "this is = not [valid")?;
+        assert!(
+            call_daemon(
+                &state,
+                "AddTrustedPublisher",
+                serde_json::json!({ "publisher": TEST_PUBKEY_HEX }),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&path)?, "this is = not [valid");
+        Ok(())
+    }
+
+    #[test]
+    fn save_config_persists_validates_and_ends_first_run() -> Result<()> {
+        let dir = tempdir()?;
+        let (state, path) = state_with_config_file(dir.path());
+        let saved = call_daemon(&state, "SaveConfig", serde_json::json!({}))?;
+        assert_eq!(saved["first_run"], false);
+        let reloaded = load_config_from(Some(&path))?;
+        assert!(!reloaded.first_run && !reloaded.relays_defaulted);
+        assert_eq!(reloaded.network.relays, DEFAULT_RELAYS);
+
+        let saved = call_daemon(
+            &state,
+            "SaveConfig",
+            serde_json::json!({ "relays": [" wss://relay.example/ ", "wss://relay.example"] }),
+        )?;
+        assert_eq!(saved["relays"], serde_json::json!(["wss://relay.example"]));
+
+        let error = call_daemon(
+            &state,
+            "SaveConfig",
+            serde_json::json!({ "relays": ["https://not-a-relay"] }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid relay"));
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_errors_carry_a_stable_code() {
+        for (message, code) in [
+            ("unknown method Bogus", "unknown_method"),
+            ("invalid Search params: missing field", "invalid_params"),
+            (
+                "not authorized for io.npack.install: denied",
+                "not_authorized",
+            ),
+            ("no relays configured; pass --relay", "no_relays"),
+            (
+                "timed out connecting to configured Nostr relays",
+                "relay_unreachable",
+            ),
+            (
+                "another npack operation is already in progress (pid 4)",
+                "store_busy",
+            ),
+            (
+                "publisher is not in the trusted publisher list",
+                "publisher_untrusted",
+            ),
+            ("no verified release found for hello", "not_found"),
+            ("installation cancelled", "cancelled"),
+            ("invalid publisher key: junk", "invalid_input"),
+            ("invalid relay https://x: expected a URL", "invalid_input"),
+            ("something unexpected", "internal"),
+        ] {
+            assert_eq!(daemon_error_code(message), code, "{message}");
+        }
+        let response = DaemonResponse::err(7, "unknown method Bogus");
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["error_code"],
+            "unknown_method"
+        );
+        let ok = serde_json::to_value(DaemonResponse::ok(7, serde_json::json!(1))).unwrap();
+        assert!(
+            ok.get("error_code").is_none(),
+            "success responses are unchanged"
+        );
     }
 }
