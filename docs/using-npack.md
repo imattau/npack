@@ -1106,6 +1106,37 @@ interrupted operation.
 
 ## Troubleshooting
 
+### Start with `npack doctor`
+
+```bash
+npack doctor            # a report, grouped by area, with a suggested fix for each finding
+npack doctor --offline  # skip the relay and download-server checks
+npack doctor --json     # the same findings as JSON, for scripts and other tools
+```
+
+`doctor` changes nothing. It checks the config file (and that every trusted
+publisher entry is a valid key), the package store (writable, a stale lock or
+transaction left by an interrupted install, a readable `installed.json`, and
+that every installed package's archive still matches its recorded hash and its
+files are still there), the catalogue (present and how old), whether `npackd` is
+answering, whether helpers such as `notify-send` and PolicyKit are installed and
+the daily update check is set up, and finally whether each configured relay and
+download server answers (all at once, so a dead one costs at most eight
+seconds).
+
+Each finding is one of four kinds: a tick (fine), a dot (just worth knowing),
+`!` (something is off but npack still works) or `✗` (npack can't do its job).
+The command exits with status 1 only when there is a `✗`, so it can be used in
+scripts. A missing relay is a warning; having *no* working relay is a failure.
+A missing optional helper is never more than a note.
+
+It runs even when the config file is broken, which stops every other command at
+startup, and shows the line the parser objected to. Pass `--user`, `--system` or
+`--store` to choose which package store to inspect, as with other commands. It
+only reads: a stale lock is reported but left for the next install to recover,
+and the one thing it writes is a tiny file it creates and deletes in the store to
+test that the folder is writable.
+
 ### `no verified release found`
 
 Add more package relays with `--relay`, use the publisher-qualified package
@@ -1174,6 +1205,7 @@ npack resolve <publisher>/<name> --relay <url> [options]
 npack update <publisher>/<name> [options]
 npack list [--user|--system]
 npack verify-installed [--user|--system]
+npack doctor [--user|--system] [--store <path>] [--offline] [--json]
 npack remove <publisher>/<name> [--user|--system]
 npack history [<publisher>/<name>] [--limit <n>] [--user|--system]
 npack rollback <publisher>/<name> [--user|--system] [--allow-capability <capability>]

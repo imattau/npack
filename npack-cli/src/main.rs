@@ -321,6 +321,27 @@ enum Command {
         )]
         system: bool,
     },
+    /// Check that npack is set up and working, and say how to fix what isn't.
+    ///
+    /// Reads the configuration, the package store, the catalogue and the local
+    /// service, and (unless --offline) tests that the relays and download
+    /// servers answer. It changes nothing. Exits with status 1 if it finds a
+    /// problem that stops npack working.
+    Doctor {
+        #[arg(
+            long,
+            help = "Package store root; defaults to /var/lib/npack, or ~/.local with --user"
+        )]
+        store: Option<PathBuf>,
+        #[arg(long, conflicts_with = "system", help = "Check the user's prefix")]
+        user: bool,
+        #[arg(long, conflicts_with = "user", help = "Check the system prefix")]
+        system: bool,
+        #[arg(long, help = "Skip the relay and download-server reachability checks")]
+        offline: bool,
+        #[arg(long, help = "Print the findings as JSON instead of a report")]
+        json: bool,
+    },
     /// Verify the files and metadata of installed packages.
     VerifyInstalled {
         #[arg(
@@ -1018,8 +1039,19 @@ struct InstalledPackage {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = load_config()?;
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let config = match load_config() {
+        Ok(config) => config,
+        // `npack doctor` exists to explain exactly this problem, so it carries
+        // on with built-in settings and reports the broken file itself.
+        Err(_) if matches!(cli.command, Command::Doctor { .. }) => {
+            let mut fallback = Config::default();
+            fallback.apply_defaults();
+            fallback
+        }
+        Err(error) => return Err(error),
+    };
+    match cli.command {
         Command::Hash { artifact } => println!("{}", hash_file(&artifact)?),
         Command::Verify { target } => {
             let package = if target.extension().and_then(|ext| ext.to_str()) == Some("npk") {
@@ -1103,6 +1135,24 @@ async fn main() -> Result<()> {
                     package.name,
                     package.version
                 );
+            }
+        }
+        Command::Doctor {
+            store,
+            user,
+            system,
+            offline,
+            json,
+        } => {
+            let healthy = doctor_command(
+                store.as_deref(),
+                user || (!system && config.install.user),
+                offline,
+                json,
+            )
+            .await?;
+            if !healthy {
+                std::process::exit(1);
             }
         }
         Command::VerifyInstalled {
@@ -9360,6 +9410,634 @@ fn remove_locked(publisher: &str, name: &str, package: &str, root: &Path) -> Res
 }
 
 // ---------------------------------------------------------------------------
+// npack doctor
+//
+// Diagnoses a setup without changing it. Each check is a small function that
+// takes what it needs and returns `Finding`s, so it can be tested on its own;
+// `doctor_command` only gathers inputs, runs them and prints the result.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Level {
+    Ok,
+    /// Worth knowing, nothing to fix.
+    Info,
+    /// Something is off but npack still works.
+    Warn,
+    /// npack cannot do its job until this is fixed.
+    Fail,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Finding {
+    level: Level,
+    area: &'static str,
+    title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    /// What to do about it, in words a person can act on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fix: Option<String>,
+}
+
+impl Finding {
+    fn new(level: Level, area: &'static str, title: impl Into<String>) -> Self {
+        Self {
+            level,
+            area,
+            title: title.into(),
+            detail: None,
+            fix: None,
+        }
+    }
+
+    fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    fn fix(mut self, fix: impl Into<String>) -> Self {
+        self.fix = Some(fix.into());
+        self
+    }
+}
+
+fn doctor_has_failures(findings: &[Finding]) -> bool {
+    findings.iter().any(|finding| finding.level == Level::Fail)
+}
+
+/// Config file and trust list. Returns the config the other checks should use.
+fn doctor_config(path: Option<&Path>) -> (Vec<Finding>, Config) {
+    let mut findings = Vec::new();
+    let config = match load_config_from(path) {
+        Ok(config) => config,
+        Err(error) => {
+            findings.push(
+                Finding::new(Level::Fail, "Config", "The config file can't be read")
+                    .detail(format!("{error:#}"))
+                    .fix("Fix the TOML syntax in the file above, or move it aside to start fresh."),
+            );
+            let mut fallback = Config::default();
+            fallback.apply_defaults();
+            return (findings, fallback);
+        }
+    };
+    let shown = path.map_or_else(
+        || "(no config directory)".to_owned(),
+        |p| p.display().to_string(),
+    );
+    if config.first_run {
+        findings.push(
+            Finding::new(
+                Level::Info,
+                "Config",
+                "No config file yet, so built-in settings are in use",
+            )
+            .detail(format!(
+                "It will be created at {shown} when you change a setting."
+            )),
+        );
+    } else {
+        findings.push(Finding::new(Level::Ok, "Config", "Config file is valid").detail(shown));
+    }
+    if config.relays_defaulted && !config.first_run {
+        findings.push(
+            Finding::new(Level::Info, "Config", "Using the built-in relays")
+                .detail("[network].relays is empty. Add your own to change them."),
+        );
+    }
+    if config.blossom_defaulted && !config.first_run {
+        findings.push(
+            Finding::new(Level::Info, "Config", "Using the built-in download servers")
+                .detail("[storage].blossom is empty. Add your own to change them."),
+        );
+    }
+    let bad: Vec<&String> = config
+        .trust
+        .publishers
+        .iter()
+        .filter(|entry| PublicKey::parse(entry).is_err())
+        .collect();
+    if !bad.is_empty() {
+        findings.push(
+            Finding::new(
+                Level::Fail,
+                "Trust",
+                format!("{} trusted publisher entr{} can't be understood", bad.len(), if bad.len() == 1 { "y" } else { "ies" }),
+            )
+            .detail(bad.iter().map(|b| b.as_str()).collect::<Vec<_>>().join(", "))
+            .fix("Each entry must be an npub or a 64-character hex key. Remove it with `npack trust remove`, or fix the file."),
+        );
+    } else if config.trust.publishers.is_empty() {
+        findings.push(
+            Finding::new(Level::Info, "Trust", "No publishers are trusted yet")
+                .detail("The command line accepts any publisher until you trust one; the GUI asks before installing from anyone new.")
+                .fix("Trust a publisher with `npack trust add <name@domain|npub>`."),
+        );
+    } else {
+        findings.push(Finding::new(
+            Level::Ok,
+            "Trust",
+            format!("{} trusted publisher(s)", config.trust.publishers.len()),
+        ));
+    }
+    (findings, config)
+}
+
+/// The package store: permissions, locks, `installed.json` and the files and
+/// archives it describes. Read-only apart from a tiny temporary file used to
+/// test that the directory is writable.
+fn doctor_store(root: &Path) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    if !root.exists() {
+        findings.push(
+            Finding::new(Level::Info, "Store", "Nothing has been installed yet").detail(format!(
+                "The store at {} is created by the first install.",
+                root.display()
+            )),
+        );
+        return findings;
+    }
+    let probe = root.join(format!(".npack-doctor-{}", std::process::id()));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            findings.push(
+                Finding::new(Level::Ok, "Store", "The package store is writable")
+                    .detail(root.display().to_string()),
+            );
+        }
+        Err(error) => findings.push(
+            Finding::new(Level::Fail, "Store", "The package store isn't writable")
+                .detail(format!("{}: {error}", root.display()))
+                .fix("Check the folder's permissions, or use `--user` to work in your own folder."),
+        ),
+    }
+    match fs::read_to_string(store_lock_path(root)) {
+        Ok(contents) => {
+            let pid: u32 = contents.trim().parse().unwrap_or(0);
+            if pid != 0 && process_is_alive(pid) {
+                findings.push(Finding::new(
+                    Level::Info,
+                    "Store",
+                    format!("An npack operation is running (pid {pid})"),
+                ));
+            } else {
+                findings.push(
+                    Finding::new(Level::Warn, "Store", "An earlier npack operation was interrupted")
+                        .detail(format!("Its lock (pid {pid}) is stale."))
+                        .fix("Nothing to do: the next install or remove undoes the half-finished change by itself."),
+                );
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if transaction_journal_path(root).exists() {
+                findings.push(
+                    Finding::new(Level::Warn, "Store", "A transaction record was left behind")
+                        .fix("The next install or remove cleans it up."),
+                );
+            }
+        }
+        Err(_) => {}
+    }
+    let installed_path = root.join("installed.json");
+    match fs::read(&installed_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            findings.push(Finding::new(Level::Info, "Packages", "No packages are installed"));
+        }
+        Err(error) => findings.push(
+            Finding::new(Level::Fail, "Packages", "The list of installed packages can't be read")
+                .detail(format!("{}: {error}", installed_path.display())),
+        ),
+        Ok(bytes) => match serde_json::from_slice::<Vec<InstalledPackage>>(&bytes) {
+            Err(error) => findings.push(
+                Finding::new(Level::Fail, "Packages", "The list of installed packages is damaged")
+                    .detail(format!("{}: {error}", installed_path.display()))
+                    .fix("Restore it from a backup. Package files are untouched, so reinstalling the packages repairs this."),
+            ),
+            Ok(packages) => findings.extend(doctor_installed(&packages)),
+        },
+    }
+    findings
+}
+
+/// Checks every installed package's archive hash and file list, reporting all
+/// problems (unlike `verify-installed`, which stops at the first).
+fn doctor_installed(packages: &[InstalledPackage]) -> Vec<Finding> {
+    let mut problems = Vec::new();
+    for package in packages {
+        let name = format!(
+            "{}/{} {}",
+            display_publisher(&package.publisher),
+            package.name,
+            package.version
+        );
+        match hash_file(&package.artifact) {
+            Ok(hash) if hash.eq_ignore_ascii_case(&package.sha256) => {}
+            Ok(_) => problems.push(format!(
+                "{name}: the stored archive no longer matches its recorded hash"
+            )),
+            Err(_) => problems.push(format!("{name}: the stored archive is missing")),
+        }
+        let missing = package
+            .files
+            .iter()
+            .filter(|file| fs::symlink_metadata(file).is_err())
+            .count();
+        if missing > 0 {
+            problems.push(format!("{name}: {missing} installed file(s) are missing"));
+        }
+    }
+    if packages.is_empty() {
+        return vec![Finding::new(
+            Level::Info,
+            "Packages",
+            "No packages are installed",
+        )];
+    }
+    if problems.is_empty() {
+        return vec![Finding::new(
+            Level::Ok,
+            "Packages",
+            format!("{} installed package(s) are intact", packages.len()),
+        )];
+    }
+    let shown = problems.iter().take(5).cloned().collect::<Vec<_>>();
+    let more = problems.len().saturating_sub(5);
+    let mut detail = shown.join("\n");
+    if more > 0 {
+        detail.push_str(&format!("\nand {more} more"));
+    }
+    vec![
+        Finding::new(
+            Level::Warn,
+            "Packages",
+            format!("{} installed package problem(s) found", problems.len()),
+        )
+        .detail(detail)
+        .fix("Reinstall the affected packages with `npack update <package>`, or remove them."),
+    ]
+}
+
+/// The local catalogue: present, readable, and not stale.
+fn doctor_catalogue(root: &Path, now: u64) -> Vec<Finding> {
+    match load_catalogue(root) {
+        Ok(None) => vec![
+            Finding::new(
+                Level::Info,
+                "Catalogue",
+                "The software catalogue hasn't been downloaded yet",
+            )
+            .fix("Run `npack refresh`. The GUI does this automatically the first time you browse."),
+        ],
+        Err(error) => vec![
+            Finding::new(
+                Level::Warn,
+                "Catalogue",
+                "The local catalogue can't be read",
+            )
+            .detail(format!("{error:#}"))
+            .fix("Run `npack refresh` to rebuild it."),
+        ],
+        Ok(Some(catalogue)) => {
+            let days = now.saturating_sub(catalogue.created_at) / 86_400;
+            let title = format!(
+                "The catalogue lists {} release(s) and is {days} day(s) old",
+                catalogue.releases.len()
+            );
+            if days >= 7 {
+                vec![
+                    Finding::new(Level::Warn, "Catalogue", title)
+                        .fix("Run `npack refresh` to pick up new software."),
+                ]
+            } else {
+                vec![Finding::new(Level::Ok, "Catalogue", title)]
+            }
+        }
+    }
+}
+
+/// Finds an executable on `path` (a `PATH`-style string) without running it.
+fn find_in_path(name: &str, path: &str) -> Option<PathBuf> {
+    path.split(':')
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| Path::new(dir).join(name))
+        .find(|candidate| {
+            fs::metadata(candidate)
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+}
+
+/// Optional helpers some features rely on, and whether the daily update check
+/// is set up.
+fn doctor_tools(path: &str, home: Option<&Path>) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    if find_in_path("notify-send", path).is_some() {
+        findings.push(Finding::new(
+            Level::Ok,
+            "Tools",
+            "Desktop notifications are available (notify-send)",
+        ));
+    } else {
+        findings.push(
+            Finding::new(
+                Level::Info,
+                "Tools",
+                "notify-send isn't installed, so update notifications can't be shown",
+            )
+            .fix("Install libnotify (libnotify-bin on Debian and Ubuntu) if you want them."),
+        );
+    }
+    if find_in_path("pkcheck", path).is_some() {
+        findings.push(Finding::new(
+            Level::Ok,
+            "Tools",
+            "PolicyKit is available (pkcheck)",
+        ));
+    } else {
+        findings.push(
+            Finding::new(Level::Info, "Tools", "PolicyKit (pkcheck) isn't installed")
+                .detail("Only the system-wide service needs it, to ask for an administrator's password.")
+                .fix("Install polkit if you plan to run `npack daemon --system`."),
+        );
+    }
+    let timer = home.map(|home| home.join(".config/systemd/user/npack-update-check.timer"));
+    if timer.as_deref().is_some_and(Path::exists) {
+        findings.push(Finding::new(
+            Level::Ok,
+            "Tools",
+            "The daily update check is installed",
+        ));
+    } else {
+        findings.push(
+            Finding::new(Level::Info, "Tools", "The daily update check isn't set up")
+                .fix("Copy packaging/npack-update-check.{service,timer} to ~/.config/systemd/user/ and run `systemctl --user enable --now npack-update-check.timer`."),
+        );
+    }
+    findings
+}
+
+/// Whether a local npackd answers on `socket`. It is optional, so "not
+/// running" is information, not a problem.
+fn doctor_daemon(label: &str, socket: &Path) -> Finding {
+    use std::io::{BufRead, BufReader};
+    let area = "Service";
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) else {
+        return Finding::new(
+            Level::Info,
+            area,
+            format!("The {label} service isn't running"),
+        )
+        .detail("It's optional: the command line works without it, and the GUI needs it.")
+        .fix(if label == "user" {
+            "Start it with `npack daemon`."
+        } else {
+            "Start it with `systemctl start npackd-system` or `sudo npack daemon --system`."
+        });
+    };
+    let timeout = Some(std::time::Duration::from_secs(3));
+    let _ = stream.set_read_timeout(timeout);
+    let _ = stream.set_write_timeout(timeout);
+    if stream
+        .write_all(b"{\"id\":1,\"method\":\"GetConfig\",\"params\":{}}\n")
+        .is_err()
+    {
+        return Finding::new(
+            Level::Warn,
+            area,
+            format!("The {label} service didn't accept a request"),
+        );
+    }
+    let mut line = String::new();
+    if BufReader::new(stream).read_line(&mut line).is_err() || line.is_empty() {
+        return Finding::new(
+            Level::Warn,
+            area,
+            format!("The {label} service didn't answer"),
+        )
+        .fix("Restart it.");
+    }
+    match serde_json::from_str::<serde_json::Value>(&line) {
+        Ok(reply) if reply.get("error_code").and_then(|c| c.as_str()) == Some("unknown_method") => {
+            Finding::new(
+                Level::Warn,
+                area,
+                format!("The {label} service is older than this npack"),
+            )
+            .fix("Restart it so it runs the installed version.")
+        }
+        Ok(_) => Finding::new(Level::Ok, area, format!("The {label} service is running"))
+            .detail(socket.display().to_string()),
+        Err(_) => Finding::new(
+            Level::Warn,
+            area,
+            format!("The {label} service sent a reply that wasn't understood"),
+        ),
+    }
+}
+
+const DOCTOR_NETWORK_SECS: u64 = 8;
+
+/// Whether a relay accepts a WebSocket connection, and how long that took.
+async fn doctor_relay(url: &str, wait: std::time::Duration) -> Finding {
+    let started = std::time::Instant::now();
+    let client = Client::default();
+    let outcome = async {
+        client.add_relay(url).await.map_err(|e| e.to_string())?;
+        client.connect().await;
+        let relay = client
+            .relay(url)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "the relay address wasn't accepted".to_owned())?;
+        while started.elapsed() < wait {
+            if relay.status() == RelayStatus::Connected {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Err(format!(
+            "no connection within {} seconds",
+            wait.as_secs().max(1)
+        ))
+    }
+    .await;
+    client.disconnect().await;
+    match outcome {
+        Ok(()) => Finding::new(
+            Level::Ok,
+            "Relays",
+            format!("{url} answered in {} ms", started.elapsed().as_millis()),
+        ),
+        Err(error) => {
+            Finding::new(Level::Warn, "Relays", format!("{url} didn't answer")).detail(error)
+        }
+    }
+}
+
+/// Whether a download server answers at all. Blossom servers often return 404
+/// for `/`, which still proves the server is up.
+async fn doctor_blossom(url: &str, wait: std::time::Duration) -> Finding {
+    let started = std::time::Instant::now();
+    let client = match reqwest::Client::builder().timeout(wait).build() {
+        Ok(client) => client,
+        Err(error) => {
+            return Finding::new(
+                Level::Warn,
+                "Downloads",
+                format!("{url} couldn't be checked"),
+            )
+            .detail(error.to_string());
+        }
+    };
+    match client.get(url).send().await {
+        Ok(response) => Finding::new(
+            Level::Ok,
+            "Downloads",
+            format!(
+                "{url} answered in {} ms (HTTP {})",
+                started.elapsed().as_millis(),
+                response.status().as_u16()
+            ),
+        ),
+        Err(error) => Finding::new(Level::Warn, "Downloads", format!("{url} didn't answer"))
+            .detail(error.to_string()),
+    }
+}
+
+/// Checks every relay and download server at once, then says what the results
+/// mean together: one dead relay is a warning, no working relay is a failure.
+async fn doctor_network(
+    relays: &[String],
+    servers: &[String],
+    wait: std::time::Duration,
+) -> Vec<Finding> {
+    let (relay_findings, server_findings) = tokio::join!(
+        futures_util::future::join_all(relays.iter().map(|relay| doctor_relay(relay, wait))),
+        futures_util::future::join_all(servers.iter().map(|server| doctor_blossom(server, wait))),
+    );
+    let mut findings = relay_findings.clone();
+    if !relays.is_empty() && relay_findings.iter().all(|f| f.level != Level::Ok) {
+        findings.push(
+            Finding::new(
+                Level::Fail,
+                "Relays",
+                "No relay is reachable, so browsing and installing won't work",
+            )
+            .fix("Check your internet connection, then your relay list in Settings or [network].relays."),
+        );
+    }
+    findings.extend(server_findings.clone());
+    if !servers.is_empty() && server_findings.iter().all(|f| f.level != Level::Ok) {
+        findings.push(
+            Finding::new(Level::Warn, "Downloads", "No download server is reachable")
+                .detail("Packages can still be fetched from the addresses their publishers list.")
+                .fix("Check your internet connection, then [storage].blossom."),
+        );
+    }
+    findings
+}
+
+/// The report as text, grouped by area in the order each first appears.
+fn render_doctor_report(findings: &[Finding]) -> String {
+    let mut areas: Vec<&'static str> = Vec::new();
+    for finding in findings {
+        if !areas.contains(&finding.area) {
+            areas.push(finding.area);
+        }
+    }
+    let mut out = String::new();
+    for area in areas {
+        out.push_str(&format!("\n{area}\n"));
+        for finding in findings.iter().filter(|f| f.area == area) {
+            let mark = match finding.level {
+                Level::Ok => green("✓"),
+                Level::Info => "·".to_owned(),
+                Level::Warn => yellow("!"),
+                Level::Fail => red("✗"),
+            };
+            out.push_str(&format!("  {mark} {}\n", finding.title));
+            for line in finding.detail.iter().flat_map(|d| d.lines()) {
+                out.push_str(&format!("      {line}\n"));
+            }
+            if let Some(fix) = &finding.fix {
+                out.push_str(&format!("      → {fix}\n"));
+            }
+        }
+    }
+    let count = |level| findings.iter().filter(|f| f.level == level).count();
+    let (failures, warnings) = (count(Level::Fail), count(Level::Warn));
+    out.push('\n');
+    out.push_str(&match (failures, warnings) {
+        (0, 0) => green("Everything looks good."),
+        (0, w) => format!("{} {w} warning(s) to look at.", green("npack is working.")),
+        (f, 0) => format!(
+            "{} {f} problem(s) stop npack working.",
+            red("Needs attention:")
+        ),
+        (f, w) => format!(
+            "{} {f} problem(s) stop npack working, plus {w} warning(s).",
+            red("Needs attention:")
+        ),
+    });
+    out.push('\n');
+    out
+}
+
+/// `npack doctor`. Returns false if anything that stops npack working was found.
+async fn doctor_command(
+    store: Option<&Path>,
+    user: bool,
+    offline: bool,
+    json: bool,
+) -> Result<bool> {
+    let (mut findings, config) = doctor_config(config_file_path().as_deref());
+    let package_root = install_paths(store, user).0;
+    let catalogue_root = store.map_or_else(default_store, Path::to_path_buf);
+    findings.extend(doctor_store(&package_root));
+    findings.extend(doctor_catalogue(&catalogue_root, now_unix()));
+    findings.push(doctor_daemon(
+        "user",
+        &daemon_socket_path(None, DaemonRole::User),
+    ));
+    let system_socket = daemon_socket_path(None, DaemonRole::System);
+    if system_socket.exists() {
+        findings.push(doctor_daemon("system", &system_socket));
+    }
+    findings.extend(doctor_tools(
+        &std::env::var("PATH").unwrap_or_default(),
+        dirs::home_dir().as_deref(),
+    ));
+    if offline {
+        findings.push(Finding::new(
+            Level::Info,
+            "Network",
+            "Skipped the relay and download checks (--offline)",
+        ));
+    } else {
+        findings.extend(
+            doctor_network(
+                &config.network.relays,
+                &config.storage.blossom,
+                std::time::Duration::from_secs(DOCTOR_NETWORK_SECS),
+            )
+            .await,
+        );
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&findings)?);
+    } else {
+        print!("npack doctor\n{}", render_doctor_report(&findings));
+    }
+    Ok(!doctor_has_failures(&findings))
+}
+
+// ---------------------------------------------------------------------------
 // History and rollback
 //
 // Every install, upgrade, downgrade, rollback and removal appends one line to
@@ -13538,5 +14216,382 @@ mod tests {
         let tie_b = category_counts(&[result("b", &["Utility"]), result("a", &["utility"])]);
         assert_eq!(tie_a, [("Utility".to_owned(), 2)]);
         assert_eq!(tie_a, tie_b);
+    }
+
+    fn levels(findings: &[Finding]) -> Vec<(Level, &'static str)> {
+        findings.iter().map(|f| (f.level, f.area)).collect()
+    }
+
+    #[test]
+    fn doctor_reads_the_config_without_creating_it() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("npack/config.toml");
+        let (findings, config) = doctor_config(Some(&path));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.level == Level::Info && f.title.contains("No config file yet"))
+        );
+        assert!(
+            config.first_run && !config.network.relays.is_empty(),
+            "defaults still apply"
+        );
+        assert!(!path.exists(), "a diagnosis must not create the file");
+
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(
+            &path,
+            format!("[trust]\npublishers = [\"{TEST_PUBKEY_HEX}\"]\n"),
+        )?;
+        let (findings, _) = doctor_config(Some(&path));
+        assert_eq!(
+            levels(&findings),
+            [
+                (Level::Ok, "Config"),
+                (Level::Info, "Config"),
+                (Level::Info, "Config"),
+                (Level::Ok, "Trust")
+            ]
+        );
+        assert!(!doctor_has_failures(&findings));
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_fails_on_a_broken_config_and_leaves_it_alone() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[trust\nbroken")?;
+        let (findings, config) = doctor_config(Some(&path));
+        assert!(doctor_has_failures(&findings));
+        assert!(findings[0].fix.as_deref().unwrap().contains("Fix the TOML"));
+        assert!(
+            !config.network.relays.is_empty(),
+            "later checks still get usable settings"
+        );
+        assert_eq!(fs::read_to_string(&path)?, "[trust\nbroken");
+
+        fs::write(
+            &path,
+            "[trust]\npublishers = [\"not-a-key\", \"also-bad\"]\n",
+        )?;
+        let (findings, _) = doctor_config(Some(&path));
+        let trust = findings.iter().find(|f| f.area == "Trust").unwrap();
+        assert_eq!(trust.level, Level::Fail);
+        assert!(trust.title.starts_with("2 trusted publisher entries"));
+        assert!(trust.detail.as_deref().unwrap().contains("not-a-key"));
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_store_handles_a_store_that_does_not_exist_yet() {
+        let dir = tempdir().unwrap();
+        let findings = doctor_store(&dir.path().join("nope"));
+        assert_eq!(levels(&findings), [(Level::Info, "Store")]);
+        assert!(
+            !dir.path().join("nope").exists(),
+            "it must not create the store"
+        );
+    }
+
+    #[test]
+    fn doctor_store_calls_a_healthy_install_healthy_and_cleans_up_after_itself() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("store");
+        let keys = Keys::generate();
+        install_test_version(dir.path(), &root, &keys, "1.0.0")?;
+        let before: Vec<_> = fs::read_dir(&root)?
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        let findings = doctor_store(&root);
+        assert!(
+            findings.iter().all(|f| f.level <= Level::Info),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.title.contains("1 installed package(s) are intact"))
+        );
+        let after: Vec<_> = fs::read_dir(&root)?
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "the writability probe file is removed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_store_reports_a_stale_lock_without_clearing_it() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("store");
+        fs::create_dir_all(&root)?;
+        // A pid that cannot be running.
+        fs::write(store_lock_path(&root), (u32::MAX - 1).to_string())?;
+        let findings = doctor_store(&root);
+        let stale = findings
+            .iter()
+            .find(|f| f.title.contains("interrupted"))
+            .expect("stale lock noted");
+        assert_eq!(stale.level, Level::Warn);
+        assert!(
+            store_lock_path(&root).exists(),
+            "recovery is the next install's job, not the doctor's"
+        );
+
+        fs::write(store_lock_path(&root), std::process::id().to_string())?;
+        let findings = doctor_store(&root);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.level == Level::Info && f.title.contains("is running"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_store_fails_on_a_damaged_package_list_and_does_not_touch_it() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("store");
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("installed.json"), "{ not json")?;
+        let findings = doctor_store(&root);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.level == Level::Fail && f.area == "Packages")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("installed.json"))?,
+            "{ not json"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_lists_every_installed_problem_not_just_the_first() -> Result<()> {
+        let dir = tempdir()?;
+        let archive = dir.path().join("a.npk");
+        fs::write(&archive, b"changed")?;
+        let package = |name: &str, archive: PathBuf, files: Vec<PathBuf>| InstalledPackage {
+            publisher: "p".into(),
+            name: name.into(),
+            version: "1.0.0".into(),
+            sha256: "00".repeat(32),
+            artifact: archive,
+            dependencies: vec![],
+            conflicts: vec![],
+            files,
+            runtime_requires: vec![],
+            provides: vec![],
+        };
+        let findings = doctor_installed(&[
+            package("tampered", archive, vec![]),
+            package(
+                "gone",
+                dir.path().join("missing.npk"),
+                vec![dir.path().join("no-such-file")],
+            ),
+        ]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].level, Level::Warn);
+        assert!(
+            findings[0]
+                .title
+                .starts_with("3 installed package problem(s)")
+        );
+        let detail = findings[0].detail.as_deref().unwrap();
+        assert!(detail.contains("tampered") && detail.contains("no longer matches"));
+        assert!(
+            detail.contains("gone")
+                && detail.contains("archive is missing")
+                && detail.contains("1 installed file(s)")
+        );
+        assert!(doctor_installed(&[]).iter().all(|f| f.level == Level::Info));
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_catalogue_reports_age_and_absence() -> Result<()> {
+        let dir = tempdir()?;
+        assert_eq!(
+            levels(&doctor_catalogue(dir.path(), 1_000)),
+            [(Level::Info, "Catalogue")]
+        );
+        save_catalogue(
+            dir.path(),
+            &Catalogue {
+                created_at: 1_000,
+                releases: vec![],
+                revocations: vec![],
+            },
+        )?;
+        let fresh = doctor_catalogue(dir.path(), 1_000 + 86_400);
+        assert_eq!(fresh[0].level, Level::Ok);
+        assert!(fresh[0].title.contains("1 day(s) old"));
+        let stale = doctor_catalogue(dir.path(), 1_000 + 10 * 86_400);
+        assert_eq!(stale[0].level, Level::Warn);
+        assert!(stale[0].fix.as_deref().unwrap().contains("npack refresh"));
+        fs::write(catalogue_path(dir.path()), "garbage")?;
+        assert_eq!(doctor_catalogue(dir.path(), 5)[0].level, Level::Warn);
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_finds_tools_by_looking_not_running() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir()?;
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin)?;
+        fs::write(bin.join("notify-send"), "#!/bin/sh\ntouch RAN\n")?;
+        fs::set_permissions(bin.join("notify-send"), fs::Permissions::from_mode(0o755))?;
+        fs::write(bin.join("pkcheck"), "not executable")?;
+        fs::set_permissions(bin.join("pkcheck"), fs::Permissions::from_mode(0o644))?;
+        let path = format!("{}:/nonexistent", bin.display());
+        assert!(find_in_path("notify-send", &path).is_some());
+        assert!(
+            find_in_path("pkcheck", &path).is_none(),
+            "a non-executable file isn't a tool"
+        );
+        assert!(find_in_path("missing", &path).is_none());
+
+        let findings = doctor_tools(&path, Some(dir.path()));
+        assert_eq!(findings[0].level, Level::Ok);
+        assert!(findings[1].title.contains("isn't installed"));
+        assert!(findings[2].title.contains("isn't set up"));
+        assert!(
+            !bin.join("RAN").exists() && !dir.path().join("RAN").exists(),
+            "the tool must not be executed"
+        );
+        assert!(
+            findings.iter().all(|f| f.level <= Level::Info),
+            "missing helpers are never a failure"
+        );
+
+        let timer = dir.path().join(".config/systemd/user");
+        fs::create_dir_all(&timer)?;
+        fs::write(timer.join("npack-update-check.timer"), "")?;
+        assert_eq!(doctor_tools(&path, Some(dir.path()))[2].level, Level::Ok);
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_tells_a_missing_service_from_a_running_or_outdated_one() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = tempdir()?;
+        let socket = dir.path().join("npackd.sock");
+        assert_eq!(
+            doctor_daemon("user", &socket).level,
+            Level::Info,
+            "optional, so not a problem"
+        );
+
+        let serve = |name: &str, reply: &'static str| -> Result<PathBuf> {
+            let path = dir.path().join(format!("{name}.sock"));
+            let listener = std::os::unix::net::UnixListener::bind(&path)?;
+            std::thread::spawn(move || {
+                if let Ok((stream, _)) = listener.accept() {
+                    let mut line = String::new();
+                    let _ = BufReader::new(stream.try_clone().unwrap()).read_line(&mut line);
+                    let mut stream = stream;
+                    let _ = stream.write_all(reply.as_bytes());
+                }
+            });
+            Ok(path)
+        };
+        let running = serve("running", "{\"id\":1,\"result\":{}}\n")?;
+        assert_eq!(doctor_daemon("user", &running).level, Level::Ok);
+        let outdated = serve(
+            "outdated",
+            "{\"id\":1,\"error\":\"unknown method GetConfig\",\"error_code\":\"unknown_method\"}\n",
+        )?;
+        let finding = doctor_daemon("user", &outdated);
+        assert_eq!(finding.level, Level::Warn);
+        assert!(finding.title.contains("older than this npack"));
+        let garbled = serve("garbled", "what\n")?;
+        assert_eq!(doctor_daemon("user", &garbled).level, Level::Warn);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn doctor_network_distinguishes_one_dead_server_from_none_working() {
+        let wait = std::time::Duration::from_secs(1);
+        let up = serve_http_once(http_ok("{}")).await;
+        assert_eq!(doctor_blossom(&up, wait).await.level, Level::Ok);
+        let down = "http://127.0.0.1:1";
+        assert_eq!(doctor_blossom(down, wait).await.level, Level::Warn);
+        assert_eq!(
+            doctor_relay("ws://127.0.0.1:1", wait).await.level,
+            Level::Warn
+        );
+
+        let findings = doctor_network(&["ws://127.0.0.1:1".into()], &[down.into()], wait).await;
+        assert!(
+            doctor_has_failures(&findings),
+            "no working relay stops npack working"
+        );
+        let downloads: Vec<_> = findings.iter().filter(|f| f.area == "Downloads").collect();
+        assert!(
+            downloads.iter().all(|f| f.level == Level::Warn),
+            "no working download server only warns"
+        );
+        assert!(
+            downloads
+                .iter()
+                .any(|f| f.title.contains("No download server is reachable"))
+        );
+
+        // With no relays configured there is nothing to fail on.
+        let none = doctor_network(&[], &[down.into()], wait).await;
+        assert!(!doctor_has_failures(&none));
+    }
+
+    #[test]
+    fn the_report_groups_by_area_shows_fixes_and_summarises() {
+        let findings = vec![
+            Finding::new(Level::Ok, "Config", "Config file is valid"),
+            Finding::new(Level::Warn, "Store", "Something off")
+                .detail("line one\nline two")
+                .fix("Do the thing."),
+            Finding::new(Level::Ok, "Config", "Second config note"),
+        ];
+        let report = render_doctor_report(&findings);
+        let config_at = report.find("\nConfig\n").unwrap();
+        let store_at = report.find("\nStore\n").unwrap();
+        assert!(config_at < store_at);
+        assert!(
+            report[config_at..store_at].contains("Second config note"),
+            "same-area findings are together"
+        );
+        assert!(report.contains("      line one\n      line two\n"));
+        assert!(report.contains("→ Do the thing."));
+        assert!(report.contains("1 warning(s) to look at."));
+
+        assert!(render_doctor_report(&findings[..1]).contains("Everything looks good."));
+        let failing = [Finding::new(Level::Fail, "Relays", "down")];
+        assert!(render_doctor_report(&failing).contains("1 problem(s) stop npack working."));
+        let both = [
+            Finding::new(Level::Fail, "Relays", "down"),
+            Finding::new(Level::Warn, "Store", "hmm"),
+        ];
+        assert!(render_doctor_report(&both).contains("plus 1 warning(s)."));
+    }
+
+    #[test]
+    fn json_findings_use_lowercase_levels_and_omit_empty_fields() {
+        let value = serde_json::to_value([
+            Finding::new(Level::Fail, "Relays", "down").fix("Check the network."),
+            Finding::new(Level::Ok, "Config", "fine"),
+        ])
+        .unwrap();
+        assert_eq!(value[0]["level"], "fail");
+        assert_eq!(value[0]["fix"], "Check the network.");
+        assert!(value[0].get("detail").is_none() && value[1].get("fix").is_none());
+        assert_eq!(value[1]["level"], "ok");
     }
 }

@@ -318,6 +318,13 @@ CLI has `npack categories` and `search --category/--sort/--limit`. Still to do:
 curated "featured" lists (there is no curation source yet), and screenshots
 (which need a privacy-preserving way to fetch them).
 
+`npack doctor` diagnoses a setup (config, store, interrupted installs, damaged
+packages, catalogue age, the local service, helper tools, and relay and download
+reachability) with a suggested fix for each finding, and works even when the
+config file is broken. Not yet done: running it from the GUI (it would need a
+daemon method; the findings are already structured for that) and checking
+installed packages for revocation, which `npack update --check` still does.
+
 ## Phase 6: COSMIC Store integration
 
 Investigate COSMIC first because its newer Rust-oriented codebase should make
