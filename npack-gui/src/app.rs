@@ -1332,6 +1332,32 @@ fn show_icon(ui: &mut egui::Ui, icon: Option<egui::Image<'static>>, name: &str) 
     }
 }
 
+/// Whether a catalogue entry is already on this computer.
+#[derive(Debug, PartialEq, Eq)]
+enum InstallState {
+    NotInstalled,
+    /// This exact version.
+    Installed,
+    /// The same publisher's package, at another version.
+    OtherVersion(String),
+}
+
+/// Matches on publisher and name (the identity of a package), so a package of
+/// the same name from someone else does not count as installed.
+fn install_state(installed: &[Value], item: &Value) -> InstallState {
+    let publisher = value_str(item, "publisher");
+    let name = value_str(item, "name");
+    let version = value_str(item, "version");
+    match installed.iter().find(|entry| {
+        value_str(entry, "name") == name
+            && value_str(entry, "publisher").eq_ignore_ascii_case(&publisher)
+    }) {
+        None => InstallState::NotInstalled,
+        Some(entry) if value_str(entry, "version") == version => InstallState::Installed,
+        Some(entry) => InstallState::OtherVersion(value_str(entry, "version")),
+    }
+}
+
 fn package_reference(value: &Value) -> String {
     format!(
         "{}/{}",
@@ -2101,11 +2127,35 @@ impl NpackGuiApp {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
-                                                if ui
-                                                    .add(crate::style::primary_button("Install"))
-                                                    .clicked()
-                                                {
-                                                    to_install = Some(item.clone());
+                                                match install_state(&self.installed, item) {
+                                                    InstallState::NotInstalled => {
+                                                        if ui
+                                                            .add(crate::style::primary_button(
+                                                                "Install",
+                                                            ))
+                                                            .clicked()
+                                                        {
+                                                            to_install = Some(item.clone());
+                                                        }
+                                                    }
+                                                    InstallState::Installed => {
+                                                        ui.add_enabled(
+                                                            false,
+                                                            egui::Button::new("Installed"),
+                                                        );
+                                                    }
+                                                    InstallState::OtherVersion(version) => {
+                                                        ui.add_enabled(
+                                                            false,
+                                                            egui::Button::new(format!(
+                                                                "Installed ({version})"
+                                                            )),
+                                                        )
+                                                        .on_disabled_hover_text(
+                                                            "A different version is installed. \
+                                                             Newer versions appear under Updates.",
+                                                        );
+                                                    }
                                                 }
                                                 if ui.button("Details").clicked() {
                                                     to_show = Some(reference.clone());
@@ -2512,6 +2562,35 @@ mod tests {
                 assert!(!body.contains(glyph), "file {index} contains {glyph:?}");
             }
         }
+    }
+
+    #[test]
+    fn installed_apps_are_recognised_by_publisher_and_name() {
+        let installed = vec![serde_json::json!(
+            {"publisher": "AABB", "name": "notepad", "version": "1.0.0"}
+        )];
+        let item = |publisher: &str, name: &str, version: &str| serde_json::json!({"publisher": publisher, "name": name, "version": version});
+        assert_eq!(
+            install_state(&installed, &item("aabb", "notepad", "1.0.0")),
+            InstallState::Installed
+        );
+        assert_eq!(
+            install_state(&installed, &item("aabb", "notepad", "1.2.0")),
+            InstallState::OtherVersion("1.0.0".into())
+        );
+        // Same name from another publisher, or another name, is not installed.
+        assert_eq!(
+            install_state(&installed, &item("ccdd", "notepad", "1.0.0")),
+            InstallState::NotInstalled
+        );
+        assert_eq!(
+            install_state(&installed, &item("aabb", "other", "1.0.0")),
+            InstallState::NotInstalled
+        );
+        assert_eq!(
+            install_state(&[], &item("aabb", "notepad", "1.0.0")),
+            InstallState::NotInstalled
+        );
     }
 
     #[test]
