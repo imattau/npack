@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bitcoin_hashes::sha256::Hash as Sha256Hash;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_mangen::Man;
@@ -107,6 +107,38 @@ fn red(text: &str) -> String {
     paint("31", text)
 }
 
+#[derive(Subcommand)]
+enum TrustAction {
+    /// Trust a publisher (npub, hex key, or name@domain).
+    Add {
+        #[arg(help = "npub, 64-character hex key, or NIP-05 name such as alice@example.com")]
+        publisher: String,
+        #[arg(
+            short = 'y',
+            long,
+            help = "Trust without asking; required when stdin is not a terminal"
+        )]
+        yes: bool,
+        #[arg(long, help = "Relay to look up the publisher's profile on")]
+        relay: Vec<String>,
+    },
+    /// Stop trusting a publisher.
+    Remove {
+        #[arg(help = "npub, 64-character hex key, or NIP-05 name")]
+        publisher: String,
+    },
+    /// List trusted publishers.
+    List {
+        #[arg(
+            long,
+            help = "Look up verified names (contacts relays and each publisher's domain)"
+        )]
+        names: bool,
+        #[arg(long, help = "Relay to look up profiles on")]
+        relay: Vec<String>,
+    },
+}
+
 #[derive(Parser)]
 #[command(name = "npack", version, about = "A Nostr-native package manager")]
 struct Cli {
@@ -114,8 +146,31 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Debug, Default, Deserialize)]
+/// Built-in fallbacks used when `[network].relays` / `[storage].blossom` are
+/// empty, so a first run works without hand-editing `config.toml`. These are
+/// public community infrastructure npack does not operate; a user's own
+/// config always wins, and `npack` never writes them to disk unless the user
+/// saves settings (`SaveConfig`).
+const DEFAULT_RELAYS: &[&str] = &[
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://relay.primal.net",
+];
+const DEFAULT_BLOSSOM_SERVERS: &[&str] =
+    &["https://blossom.primal.net", "https://cdn.satellite.earth"];
+
+#[derive(Debug, Clone, Default, Deserialize)]
 struct Config {
+    /// True when no `config.toml` existed at load time (the daemon reports it
+    /// so a GUI can show a first-run screen). Not part of the file.
+    #[serde(skip)]
+    first_run: bool,
+    /// True when the built-in default relays / Blossom servers are in use
+    /// because the user's config named none.
+    #[serde(skip)]
+    relays_defaulted: bool,
+    #[serde(skip)]
+    blossom_defaulted: bool,
     #[serde(default)]
     network: NetworkConfig,
     #[serde(default)]
@@ -128,31 +183,31 @@ struct Config {
     identity: IdentityConfig,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct NetworkConfig {
     #[serde(default)]
     relays: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct StorageConfig {
     #[serde(default)]
     blossom: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct TrustConfig {
     #[serde(default)]
     publishers: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct InstallConfig {
     #[serde(default)]
     user: bool,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct IdentityConfig {
     #[serde(default)]
     pubkey: Option<String>,
@@ -266,6 +321,27 @@ enum Command {
         )]
         system: bool,
     },
+    /// Check that npack is set up and working, and say how to fix what isn't.
+    ///
+    /// Reads the configuration, the package store, the catalogue and the local
+    /// service, and (unless --offline) tests that the relays and download
+    /// servers answer. It changes nothing. Exits with status 1 if it finds a
+    /// problem that stops npack working.
+    Doctor {
+        #[arg(
+            long,
+            help = "Package store root; defaults to /var/lib/npack, or ~/.local with --user"
+        )]
+        store: Option<PathBuf>,
+        #[arg(long, conflicts_with = "system", help = "Check the user's prefix")]
+        user: bool,
+        #[arg(long, conflicts_with = "user", help = "Check the system prefix")]
+        system: bool,
+        #[arg(long, help = "Skip the relay and download-server reachability checks")]
+        offline: bool,
+        #[arg(long, help = "Print the findings as JSON instead of a report")]
+        json: bool,
+    },
     /// Verify the files and metadata of installed packages.
     VerifyInstalled {
         #[arg(
@@ -360,6 +436,33 @@ enum Command {
             help = "Query relays directly for this search only, without touching the local catalogue"
         )]
         no_cache: bool,
+        #[arg(
+            long,
+            help = "Local catalogue directory; defaults to the npack state dir"
+        )]
+        store: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Only packages listing this category (case-insensitive); see `npack categories`"
+        )]
+        category: Option<String>,
+        #[arg(long, help = "Order results by: name or recent (newest first)")]
+        sort: Option<String>,
+        #[arg(long, help = "Show at most this many results")]
+        limit: Option<usize>,
+    },
+    /// List the software categories in the local catalogue, with how many
+    /// packages are in each.
+    Categories {
+        #[arg(long = "relay", help = "Relay URL to query with --refresh; repeatable")]
+        relays: Vec<String>,
+        #[arg(long, help = "Rebuild the local catalogue from relays now, then list")]
+        refresh: bool,
+        #[arg(
+            long,
+            help = "Include packages built for other operating systems or architectures"
+        )]
+        all_platforms: bool,
         #[arg(
             long,
             help = "Local catalogue directory; defaults to the npack state dir"
@@ -487,6 +590,15 @@ enum Command {
         )]
         fork_of: Option<String>,
     },
+    /// Manage the publishers you trust (`[trust].publishers` in config.toml).
+    ///
+    /// Publishers can be given as an npub, a hex key, or a NIP-05 name such
+    /// as alice@example.com. A name only helps you find the key: npack shows
+    /// the resolved npub and stores that, never the name.
+    Trust {
+        #[command(subcommand)]
+        action: TrustAction,
+    },
     /// Download, verify, and extract a published package into a directory,
     /// optionally scaffolding a fork of it under your own publisher key.
     Unpack {
@@ -587,6 +699,12 @@ enum Command {
         allowed_capabilities: Vec<String>,
         #[arg(long, help = "Report available updates without installing them")]
         check: bool,
+        #[arg(
+            long,
+            requires = "check",
+            help = "With --check, send a desktop notification when new updates or revoked packages are found (for a timer)"
+        )]
+        notify: bool,
     },
     /// Resolve and verify a package's release metadata without installing it.
     ///
@@ -639,6 +757,51 @@ enum Command {
         source: PathBuf,
         #[arg(long, help = "Path to write the .npk archive to")]
         output: PathBuf,
+    },
+    /// Show what npack installed, upgraded, rolled back or removed.
+    History {
+        #[arg(help = "Only show this package: <publisher>/<name>")]
+        package: Option<String>,
+        #[arg(
+            long,
+            default_value_t = 20,
+            help = "Show at most this many entries (newest first)"
+        )]
+        limit: usize,
+        #[arg(
+            long,
+            help = "Package store root; defaults to /var/lib/npack, or ~/.local with --user"
+        )]
+        store: Option<PathBuf>,
+        #[arg(long, conflicts_with = "system", help = "Use the user's prefix")]
+        user: bool,
+        #[arg(long, conflicts_with = "user", help = "Use the system prefix")]
+        system: bool,
+    },
+    /// Switch an installed package back to the version it replaced.
+    ///
+    /// Works offline: it reinstalls the previous version's stored archive after
+    /// re-checking it against its recorded SHA-256 and the signed release
+    /// metadata npack cached when it was installed. Run it again to switch
+    /// forward. It does not check whether that version has since been revoked;
+    /// `npack update --check` does.
+    Rollback {
+        #[arg(help = "<publisher>/<name>")]
+        package: String,
+        #[arg(
+            long = "allow-capability",
+            help = "Runtime capability this install may grant (e.g. service-manager); repeatable"
+        )]
+        allowed_capabilities: Vec<String>,
+        #[arg(
+            long,
+            help = "Package store root; defaults to /var/lib/npack, or ~/.local with --user"
+        )]
+        store: Option<PathBuf>,
+        #[arg(long, conflicts_with = "system", help = "Use the user's prefix")]
+        user: bool,
+        #[arg(long, conflicts_with = "user", help = "Use the system prefix")]
+        system: bool,
     },
     /// Remove an installed package.
     Remove {
@@ -766,6 +929,11 @@ struct AppMetadata {
     screenshots: Vec<String>,
     #[serde(default)]
     desktop_file: Option<PathBuf>,
+    /// Where the icon was published as a stand-alone Blossom blob, so a store
+    /// can show it before the package is downloaded. Set by `npack publish`
+    /// (and read back from the release event); never written by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    icon_blob: Option<IconBlob>,
     /// RFC 3339 date this version was released, e.g. "2026-01-15". Optional
     /// because a bare .npk built with `pack` has no release timestamp of its
     /// own; set by publishers who want a `<releases>` entry in the generated
@@ -820,6 +988,9 @@ struct ResolvedRelease {
     install_inputs: Vec<InstallInput>,
     release_event_id: String,
     artifact_event_id: String,
+    /// Store-listing metadata published with the release, already sanitised.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app: Option<AppListing>,
     verification: VerificationResult,
 }
 
@@ -868,8 +1039,19 @@ struct InstalledPackage {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = load_config()?;
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let config = match load_config() {
+        Ok(config) => config,
+        // `npack doctor` exists to explain exactly this problem, so it carries
+        // on with built-in settings and reports the broken file itself.
+        Err(_) if matches!(cli.command, Command::Doctor { .. }) => {
+            let mut fallback = Config::default();
+            fallback.apply_defaults();
+            fallback
+        }
+        Err(error) => return Err(error),
+    };
+    match cli.command {
         Command::Hash { artifact } => println!("{}", hash_file(&artifact)?),
         Command::Verify { target } => {
             let package = if target.extension().and_then(|ext| ext.to_str()) == Some("npk") {
@@ -955,6 +1137,24 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        Command::Doctor {
+            store,
+            user,
+            system,
+            offline,
+            json,
+        } => {
+            let healthy = doctor_command(
+                store.as_deref(),
+                user || (!system && config.install.user),
+                offline,
+                json,
+            )
+            .await?;
+            if !healthy {
+                std::process::exit(1);
+            }
+        }
         Command::VerifyInstalled {
             store,
             user,
@@ -1032,11 +1232,20 @@ async fn main() -> Result<()> {
             kind,
             no_cache,
             store,
+            category,
+            sort,
+            limit,
         } => {
             let relays = normalize_relays(relays, &config);
             let trusted_publishers = configured_publishers(trusted_publishers, &config)?;
             let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
             let root = store.unwrap_or_else(default_store);
+            let options = SearchOptions {
+                category,
+                sort: SearchSort::parse(sort.as_deref())?,
+                limit,
+                offset: 0,
+            };
             search_releases(
                 &query,
                 &relays,
@@ -1045,9 +1254,40 @@ async fn main() -> Result<()> {
                 refresh,
                 no_cache,
                 kind.as_deref(),
+                &options,
                 &root,
             )
             .await?
+        }
+        Command::Categories {
+            relays,
+            refresh,
+            all_platforms,
+            store,
+        } => {
+            let relays = normalize_relays(relays, &config);
+            let pubkey = config.identity.pubkey.clone();
+            let root = store.unwrap_or_else(default_store);
+            let mut results = search_matching_releases(
+                "",
+                &relays,
+                &[],
+                pubkey.as_deref(),
+                refresh,
+                false,
+                &root,
+            )
+            .await?;
+            if !all_platforms {
+                results.retain(|result| result.compatible);
+            }
+            let counts = category_counts(&results);
+            if counts.is_empty() {
+                println!("No categories listed in the catalogue.");
+            }
+            for (category, count) in counts {
+                println!("{category} ({count})");
+            }
         }
         Command::Refresh {
             relays,
@@ -1197,8 +1437,11 @@ async fn main() -> Result<()> {
             offline,
             allowed_capabilities,
             check,
+            notify,
         } => {
-            if check {
+            if check && notify {
+                notify_updates_command(package, relays, store, user, system, &config).await?
+            } else if check {
                 check_updates_command(
                     package,
                     relays,
@@ -1274,6 +1517,42 @@ async fn main() -> Result<()> {
             .await?
         }
         Command::Pack { source, output } => pack_npk(&source, &output)?,
+        Command::History {
+            package,
+            limit,
+            store,
+            user,
+            system,
+        } => history_command(
+            package.as_deref(),
+            limit,
+            store.as_deref(),
+            user || (!system && config.install.user),
+        )?,
+        Command::Rollback {
+            package,
+            allowed_capabilities,
+            store,
+            user,
+            system,
+        } => {
+            let (from, to) = rollback_package_at(
+                &package,
+                store.as_deref(),
+                user || (!system && config.install.user),
+                &allowed_capabilities,
+            )?;
+            println!(
+                "{} {package} {} -> {}",
+                green("rolled back"),
+                from.version,
+                to.version
+            );
+            println!(
+                "Run `npack update --check` to confirm {} has not been revoked.",
+                to.version
+            );
+        }
         Command::Remove {
             package,
             store,
@@ -1287,6 +1566,7 @@ async fn main() -> Result<()> {
         Command::Inspect { artifact } => inspect_artifact(&artifact)?,
         Command::Manifest { artifact, output } => write_manifest(&artifact, &output)?,
         Command::Appstream { artifact, output } => appstream_command(&artifact, output.as_deref())?,
+        Command::Trust { action } => trust_command(action, &config).await?,
         Command::Daemon { socket, system } => {
             let role = if system {
                 if current_uid() != Some(0) {
@@ -1442,6 +1722,7 @@ async fn check_updates_command(
     let pubkey = pubkey.or_else(|| config.identity.pubkey.clone());
     let use_user = user || (!system && config.install.user);
     let root = install_paths(store.as_deref(), use_user).0;
+    let package_filter = package.clone();
     let client = Client::default();
     for relay in &relays {
         client.add_relay(relay).await?;
@@ -1509,12 +1790,216 @@ async fn check_updates_command(
             outcome.map(|()| available)
         }
     };
+    let mut installed = installed_packages(Some(&root)).unwrap_or_default();
+    if let Some(package) = &package_filter {
+        let (publisher, name) = package
+            .split_once('/')
+            .map_or((None, package.as_str()), |(publisher, name)| {
+                (Some(normalize_publisher_reference(publisher)), name)
+            });
+        installed.retain(|candidate| {
+            candidate.name == name
+                && publisher
+                    .as_deref()
+                    .is_none_or(|publisher| candidate.publisher == publisher)
+        });
+    }
+    let revocations = fetch_revocation_events(&client, &installed).await;
     client.disconnect().await;
     let available = result?;
+    for package in &installed {
+        if let Some(reason) = installed_revocation_reason(package, &revocations) {
+            println!(
+                "{} {} {}: {reason}",
+                red("[REVOKED]"),
+                installed_package_reference(package),
+                package.version
+            );
+        }
+    }
     if available > 0 {
         println!("{available} update(s) {}.", yellow("available"));
     } else {
         println!("Everything is {}.", green("up to date"));
+    }
+    Ok(())
+}
+
+/// A desktop notification about updates or revocations.
+#[derive(Debug, PartialEq, Eq)]
+struct UpdateNotice {
+    title: String,
+    body: String,
+    urgent: bool,
+}
+
+/// One line per thing worth telling the user about, e.g. `update hello 1.0.0 -> 1.1.0`.
+fn update_items(statuses: &[UpdateStatus]) -> Vec<String> {
+    let mut items = Vec::new();
+    for status in statuses {
+        if status.revoked.is_some() {
+            items.push(format!(
+                "revoked {} {}",
+                status.reference, status.current_version
+            ));
+        }
+        if let Some(available) = &status.available_version {
+            items.push(format!(
+                "update {} {} -> {available}",
+                status.reference, status.current_version
+            ));
+        }
+    }
+    items.sort();
+    items
+}
+
+/// What to tell the user, given what was already announced last time. Only
+/// something not announced before triggers a notification, so a daily timer
+/// does not repeat itself until the situation changes. Returns the notice (if
+/// any) and the record of what is now outstanding.
+fn update_notice(
+    statuses: &[UpdateStatus],
+    previously_announced: &str,
+) -> (Option<UpdateNotice>, String) {
+    let items = update_items(statuses);
+    let record = items.join("\n");
+    let seen: HashSet<&str> = previously_announced.lines().collect();
+    if items.iter().all(|item| seen.contains(item.as_str())) {
+        return (None, record);
+    }
+    let revoked: Vec<&UpdateStatus> = statuses.iter().filter(|s| s.revoked.is_some()).collect();
+    let updates: Vec<&UpdateStatus> = statuses
+        .iter()
+        .filter(|s| s.available_version.is_some())
+        .collect();
+    let name = |reference: &str| reference.rsplit('/').next().unwrap_or(reference).to_owned();
+    let mut lines = Vec::new();
+    for status in &revoked {
+        lines.push(format!(
+            "{} {} was revoked by its publisher: {}",
+            name(&status.reference),
+            status.current_version,
+            status.revoked.as_deref().unwrap_or("revoked")
+        ));
+    }
+    for status in &updates {
+        lines.push(format!(
+            "{} {} -> {}",
+            name(&status.reference),
+            status.current_version,
+            status.available_version.as_deref().unwrap_or("?")
+        ));
+    }
+    let extra = lines.len().saturating_sub(8);
+    lines.truncate(8);
+    if extra > 0 {
+        lines.push(format!("and {extra} more"));
+    }
+    let title = if revoked.is_empty() {
+        format!("{} software update(s) available", updates.len())
+    } else {
+        format!(
+            "{} installed package(s) revoked by their publisher",
+            revoked.len()
+        )
+    };
+    (
+        Some(UpdateNotice {
+            title,
+            body: lines.join("\n"),
+            urgent: !revoked.is_empty(),
+        }),
+        record,
+    )
+}
+
+/// Escapes the markup notification daemons interpret in message bodies.
+fn escape_notification_markup(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn send_desktop_notification(notice: &UpdateNotice) -> Result<()> {
+    let status = std::process::Command::new("notify-send")
+        .arg("--app-name=npack")
+        .arg("--icon=system-software-update")
+        .arg(if notice.urgent {
+            "--urgency=critical"
+        } else {
+            "--urgency=normal"
+        })
+        .arg("--")
+        .arg(escape_notification_markup(&notice.title))
+        .arg(escape_notification_markup(&notice.body))
+        .status()
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                anyhow!("notify-send not found; install libnotify (libnotify-bin) for desktop notifications")
+            } else {
+                anyhow!("running notify-send: {error}")
+            }
+        })?;
+    if !status.success() {
+        bail!("notify-send exited with {status}");
+    }
+    Ok(())
+}
+
+/// `npack update --check --notify`: check for updates and revocations and, if
+/// there is something not already announced, send a desktop notification.
+/// Meant to be run by a timer (see `packaging/npack-update-check.timer`).
+async fn notify_updates_command(
+    package: Option<String>,
+    relays: Vec<String>,
+    store: Option<PathBuf>,
+    user: bool,
+    system: bool,
+    config: &Config,
+) -> Result<()> {
+    let store = store.or_else(|| system.then(default_system_store));
+    let use_user = user || (!system && config.install.user);
+    let root = install_paths(store.as_deref(), use_user).0;
+    let statuses = check_updates_core(
+        config,
+        CheckUpdatesParams {
+            package,
+            relay: relays,
+            user: use_user,
+            store,
+            ..CheckUpdatesParams::default()
+        },
+    )
+    .await?;
+    for status in &statuses {
+        if let Some(reason) = &status.revoked {
+            println!(
+                "{} {} {}: {reason}",
+                red("[REVOKED]"),
+                status.reference,
+                status.current_version
+            );
+        }
+        if let Some(available) = &status.available_version {
+            println!(
+                "{} {} -> {available} {}",
+                status.reference,
+                status.current_version,
+                yellow("available")
+            );
+        }
+    }
+    let record_path = root.join("update-notified.txt");
+    let previous = fs::read_to_string(&record_path).unwrap_or_default();
+    let (notice, record) = update_notice(&statuses, &previous);
+    if let Some(notice) = notice {
+        send_desktop_notification(&notice)?;
+    }
+    // Only recorded once the notification went out, so a failure retries.
+    if record != previous {
+        fs::create_dir_all(&root)?;
+        fs::write(&record_path, record)?;
     }
     Ok(())
 }
@@ -2958,6 +3443,7 @@ async fn finish_resolved_release(
         || trusted_publishers
             .iter()
             .any(|trusted| trusted == &release.pubkey.to_hex());
+    let app = Some(AppListing::from_app(&manifest.app)).filter(|listing| !listing.is_empty());
     Ok(ResolvedRelease {
         publisher: manifest.publisher,
         name: manifest.name,
@@ -2976,6 +3462,7 @@ async fn finish_resolved_release(
         install_inputs: manifest.app.install_inputs,
         release_event_id: release.id.to_hex(),
         artifact_event_id: artifact_event.id.to_hex(),
+        app,
         verification: VerificationResult {
             release_signature_valid: true,
             artifact_event_signature_valid: true,
@@ -3616,8 +4103,24 @@ fn parse_fork_reference(reference: &str) -> Result<ForkOf> {
 
 fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result<Manifest> {
     for kind in [
-        "d", "name", "version", "os", "arch", "format", "x", "artifact", "repo", "commit", "kind",
+        "d",
+        "name",
+        "version",
+        "os",
+        "arch",
+        "format",
+        "x",
+        "artifact",
+        "repo",
+        "commit",
+        "kind",
         "fork-of",
+        "summary",
+        "description",
+        "homepage",
+        "license",
+        "release-date",
+        "icon",
     ] {
         let count = event.tags.iter().filter(|tag| tag.kind() == kind).count();
         if count > 1 {
@@ -3735,7 +4238,7 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
     Ok(Manifest {
         app: AppMetadata {
             install_inputs,
-            ..AppMetadata::default()
+            ..app_metadata_from_event(event)
         },
         publisher: event.pubkey.to_hex(),
         name: tag_value(event, "name")
@@ -4005,6 +4508,16 @@ struct SearchResult {
     content: String,
     kind: Option<String>,
     fork_of: Option<ForkOf>,
+    /// Store-listing metadata (summary, categories, icon, ...), already
+    /// sanitised; absent when the release published none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app: Option<AppListing>,
+    /// When the release event was published (Unix seconds), for "recently
+    /// updated" views. Publisher-set, so ordering by it is a convenience, not
+    /// a guarantee.
+    published_at: u64,
+    /// Whether this release's os/arch tags fit the machine npack runs on.
+    compatible: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4016,9 +4529,10 @@ async fn search_releases(
     refresh: bool,
     no_cache: bool,
     kind: Option<&str>,
+    options: &SearchOptions,
     root: &Path,
 ) -> Result<()> {
-    for result in search_matching_releases(
+    let matched: Vec<SearchResult> = search_matching_releases(
         query,
         relays,
         trusted_publishers,
@@ -4030,7 +4544,8 @@ async fn search_releases(
     .await?
     .into_iter()
     .filter(|result| kind.is_none_or(|kind| result.kind.as_deref().unwrap_or("package") == kind))
-    {
+    .collect();
+    for result in apply_search_options(matched, options) {
         let mut line = format!(
             "{} {} {}",
             result.release_event_id,
@@ -4113,7 +4628,18 @@ async fn search_matching_releases(
                     .content()
                     .map(|name| name.to_ascii_lowercase().contains(&query))
                     .unwrap_or(false)
-        });
+        }) || {
+            // Also match what the store listing says, so searching "editor"
+            // or "photo" finds apps by what they do, not just their name.
+            let app = app_metadata_from_event(&event);
+            app.summary
+                .as_deref()
+                .is_some_and(|summary| summary.to_ascii_lowercase().contains(&query))
+                || app
+                    .categories
+                    .iter()
+                    .any(|category| category.to_ascii_lowercase().contains(&query))
+        };
         if !name_matches || event.verify().is_err() || !release_event_is_v1(&event) {
             continue;
         }
@@ -4152,6 +4678,10 @@ async fn search_matching_releases(
                 content: event.content.clone(),
                 kind: tag_value(&event, "kind").map(str::to_owned),
                 fork_of: parse_fork_of(&event).ok().flatten(),
+                app: Some(AppListing::from_app(&app_metadata_from_event(&event)))
+                    .filter(|listing| !listing.is_empty()),
+                published_at: event.created_at.as_secs(),
+                compatible: release_matches_target(&event, OS, ARCH),
             });
         }
     }
@@ -4187,6 +4717,64 @@ struct DaemonResponse {
     result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Stable machine-readable category for `error` (additive; `error` keeps
+    /// the full human text). See `daemon_error_code`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<&'static str>,
+}
+
+/// Maps an error message to a stable, documented category so a GUI can show
+/// its own friendly wording and offer the right action (retry, open
+/// settings, trust the publisher) instead of printing a raw error string.
+fn daemon_error_code(message: &str) -> &'static str {
+    let message = message.to_lowercase();
+    let has = |needle: &str| message.contains(needle);
+    if message.starts_with("unknown method") {
+        "unknown_method"
+    } else if message.starts_with("invalid ") && has(" params") {
+        "invalid_params"
+    } else if has("nip-05 lookup failed") {
+        "nip05_failed"
+    } else if has("invalid publisher key")
+        || has("invalid relay ")
+        || has("invalid blossom server ")
+    {
+        "invalid_input"
+    } else if has("not authorized") || has("cannot authorize") {
+        "not_authorized"
+    } else if has("no relays configured") {
+        "no_relays"
+    } else if has("no blossom servers configured") {
+        "no_blossom_servers"
+    } else if has("timed out connecting") {
+        "relay_unreachable"
+    } else if has("another npack operation is already in progress") {
+        "store_busy"
+    } else if has("untrusted publisher") || has("not in the trusted publisher list") {
+        "publisher_untrusted"
+    } else if has("returned the expected sha-256") {
+        "download_failed"
+    } else if has("installation cancelled") || has("update cancelled") {
+        "cancelled"
+    } else if has("no local catalogue found") {
+        "no_catalogue"
+    } else if has("invalid sort") {
+        "invalid_input"
+    } else if has("is recorded to roll back to") {
+        "no_rollback"
+    } else if has("cannot roll back")
+        || has("refusing to roll back")
+        || has("cannot be verified offline")
+        || has("stored archive")
+    {
+        "rollback_blocked"
+    } else if has("has no store icon") {
+        "no_icon"
+    } else if has("is not installed") || has("no release named") || has("no verified release") {
+        "not_found"
+    } else {
+        "internal"
+    }
 }
 
 impl DaemonResponse {
@@ -4195,14 +4783,17 @@ impl DaemonResponse {
             id,
             result: Some(result),
             error: None,
+            error_code: None,
         }
     }
 
     fn err(id: u64, error: impl std::fmt::Display) -> Self {
+        let message = error.to_string();
         Self {
             id,
             result: None,
-            error: Some(error.to_string()),
+            error_code: Some(daemon_error_code(&message)),
+            error: Some(message),
         }
     }
 }
@@ -4244,6 +4835,13 @@ fn polkit_action_for_method(method: &str) -> Option<&'static str> {
         "Install" => Some("io.npack.install"),
         "Remove" => Some("io.npack.remove"),
         "Update" => Some("io.npack.update"),
+        // Switching to another stored version is a package change like an update.
+        "Rollback" => Some("io.npack.update"),
+        // Editing trust or network settings on the system daemon changes what
+        // root will install, so it is gated like a mutation.
+        "AddTrustedPublisher" | "RemoveTrustedPublisher" | "SaveConfig" => {
+            Some("io.npack.configure")
+        }
         _ => None,
     }
 }
@@ -4290,8 +4888,13 @@ async fn authorize_system_action(action_id: &str, pid: Option<u32>) -> Result<()
 #[serde(tag = "status", rename_all = "lowercase")]
 enum TransactionStatus {
     Running,
-    Succeeded { result: serde_json::Value },
-    Failed { error: String },
+    Succeeded {
+        result: serde_json::Value,
+    },
+    Failed {
+        error: String,
+        error_code: &'static str,
+    },
     Cancelled,
 }
 
@@ -4354,8 +4957,29 @@ struct TransactionEntry {
     control: Arc<TransactionControl>,
 }
 
+/// (when it ran, which request it answered, its findings)
+type DoctorCacheEntry = (
+    std::time::Instant,
+    (bool, bool, Option<PathBuf>),
+    Vec<Finding>,
+);
+
 struct DaemonState {
-    config: Config,
+    /// Live config. Trust and network settings edited over RPC are written
+    /// back to `config_path` and swapped in here, so later requests see them
+    /// without a daemon restart.
+    config: std::sync::RwLock<Config>,
+    config_path: Option<PathBuf>,
+    /// Modification time of `config_path` as last read or written by the
+    /// daemon, so edits made elsewhere (`npack trust`, a text editor) are
+    /// picked up on the next request instead of being missed or overwritten.
+    config_mtime: std::sync::Mutex<Option<std::time::SystemTime>>,
+    /// Verified publisher names (NIP-05) looked up recently, so a GUI listing
+    /// the same publishers repeatedly does not re-query relays and domains.
+    identities: std::sync::Mutex<HashMap<String, (std::time::Instant, PublisherIdentity)>>,
+    /// Serialises `RunDoctor` and holds its last result for a few seconds.
+    doctor_gate: tokio::sync::Mutex<()>,
+    doctor_cache: std::sync::Mutex<Option<DoctorCacheEntry>>,
     role: DaemonRole,
     transactions: std::sync::Mutex<HashMap<u64, TransactionEntry>>,
     next_transaction_id: AtomicU64,
@@ -4363,12 +4987,70 @@ struct DaemonState {
 
 impl DaemonState {
     fn new(config: Config, role: DaemonRole) -> Self {
+        Self::with_config_path(config, role, config_file_path())
+    }
+
+    fn with_config_path(config: Config, role: DaemonRole, config_path: Option<PathBuf>) -> Self {
+        let config_mtime = std::sync::Mutex::new(config_modified(config_path.as_deref()));
         Self {
-            config,
+            config: std::sync::RwLock::new(config),
+            config_path,
+            config_mtime,
+            identities: std::sync::Mutex::new(HashMap::new()),
+            doctor_gate: tokio::sync::Mutex::new(()),
+            doctor_cache: std::sync::Mutex::new(None),
             role,
             transactions: std::sync::Mutex::new(HashMap::new()),
             next_transaction_id: AtomicU64::new(1),
         }
+    }
+
+    /// Re-reads `config.toml` if something else changed it since the daemon
+    /// last looked. A file that no longer parses (mid-edit) keeps the
+    /// previous config rather than dropping the trust list.
+    fn reload_config_if_changed(&self) {
+        let Some(path) = &self.config_path else {
+            return;
+        };
+        let modified = config_modified(Some(path));
+        let (Ok(mut seen), Some(_)) = (self.config_mtime.lock(), modified) else {
+            return;
+        };
+        if *seen == modified {
+            return;
+        }
+        if let Ok(reloaded) = load_config_from(Some(path))
+            && let Ok(mut config) = self.config.write()
+        {
+            *config = reloaded;
+            *seen = modified;
+        }
+    }
+
+    /// Records that the daemon itself just wrote the config file.
+    fn note_config_written(&self) {
+        if let Ok(mut seen) = self.config_mtime.lock() {
+            *seen = config_modified(self.config_path.as_deref());
+        }
+    }
+
+    /// A snapshot of the current config; handlers work on the snapshot so no
+    /// lock is held across an await.
+    fn config(&self) -> Config {
+        self.reload_config_if_changed();
+        let mut config = self
+            .config
+            .read()
+            .map(|config| config.clone())
+            .unwrap_or_default();
+        // npackd-user runs as one person and serves that person's own prefix
+        // (`~/.local`). Without this it would fall back to the system store,
+        // which a normal user cannot write, unless their config said
+        // `[install].user = true`.
+        if self.role == DaemonRole::User {
+            config.install.user = true;
+        }
+        config
     }
 
     /// Registers a new transaction and spawns `make_work` (given a fresh
@@ -4395,6 +5077,7 @@ impl DaemonState {
                 Ok(result) => TransactionStatus::Succeeded { result },
                 Err(error) if is_cancellation_error(&error) => TransactionStatus::Cancelled,
                 Err(error) => TransactionStatus::Failed {
+                    error_code: daemon_error_code(&error.to_string()),
                     error: error.to_string(),
                 },
             };
@@ -4471,6 +5154,7 @@ async fn handle_daemon_connection(
                 id: 0,
                 result: None,
                 error: Some(format!("invalid request: {error}")),
+                error_code: Some("invalid_request"),
             },
         };
         let mut serialized = serde_json::to_string(&response)?;
@@ -4504,21 +5188,1121 @@ async fn dispatch_daemon_request(
         None => {}
     }
     match request.method.as_str() {
-        "Search" => daemon_search(&state.config, request.params).await,
-        "GetPackage" => daemon_get_package(&state.config, request.params).await,
-        "ListInstalled" => daemon_list_installed(&state.config, request.params),
+        "Search" => daemon_search(&state.config(), request.params).await,
+        "GetPackage" => daemon_get_package(&state.config(), request.params).await,
+        "ListInstalled" => daemon_list_installed(&state.config(), request.params),
         "Install" => daemon_install(state, request.params).await,
-        "Remove" => daemon_remove(&state.config, request.params),
+        "Remove" => daemon_remove(&state.config(), request.params),
         "Update" => daemon_update(state, request.params).await,
-        "CheckUpdates" => daemon_check_updates(&state.config, request.params).await,
+        "CheckUpdates" => daemon_check_updates(&state.config(), request.params).await,
+        "GetConfig" => daemon_get_config(state),
+        "ListTrustedPublishers" => daemon_list_trusted_publishers(state),
+        "GetIcon" => daemon_get_icon(request.params).await,
+        "RunDoctor" => daemon_run_doctor(state, request.params).await,
+        "ListCategories" => daemon_list_categories(&state.config(), request.params).await,
+        "GetHistory" => daemon_get_history(&state.config(), request.params),
+        "ListRollbacks" => daemon_list_rollbacks(&state.config(), request.params),
+        "Rollback" => daemon_rollback(&state.config(), request.params),
+        "ResolvePublisher" => daemon_resolve_publisher(state, request.params).await,
+        "GetPublisherProfiles" => daemon_get_publisher_profiles(state, request.params).await,
+        "AddTrustedPublisher" => daemon_add_trusted_publisher(state, request.params).await,
+        "RemoveTrustedPublisher" => daemon_remove_trusted_publisher(state, request.params),
+        "SaveConfig" => daemon_save_config(state, request.params),
         "GetTransaction" => daemon_get_transaction(state, request.params),
         "CancelTransaction" => daemon_cancel_transaction(state, request.params),
         other => bail!("unknown method {other}"),
     }
 }
 
+/// Whether `publisher` (hex or npub) is in the configured trust list. This is
+/// the daemon-side notion shown to GUIs as `"trust": "trusted" | "unknown"`:
+/// with an empty list nobody is "trusted" yet, even though the CLI's filter
+/// treats an empty list as "accept any publisher".
+fn trust_status(config: &Config, publisher: &str) -> &'static str {
+    let hex = normalize_publisher_reference(publisher);
+    let trusted = config
+        .trust
+        .publishers
+        .iter()
+        .any(|entry| normalize_publisher_reference(entry) == hex);
+    if trusted { "trusted" } else { "unknown" }
+}
+
+fn publisher_json(entry: &str) -> serde_json::Value {
+    serde_json::json!({
+        "publisher": normalize_publisher_reference(entry),
+        "npub": display_publisher(entry),
+    })
+}
+
+fn daemon_get_config(state: &Arc<DaemonState>) -> Result<serde_json::Value> {
+    let config = state.config();
+    Ok(serde_json::json!({
+        "first_run": config.first_run,
+        "config_path": state.config_path,
+        "relays": config.network.relays,
+        "blossom": config.storage.blossom,
+        "relays_defaulted": config.relays_defaulted,
+        "blossom_defaulted": config.blossom_defaulted,
+        "trusted_publishers": config.trust.publishers.iter().map(|p| publisher_json(p)).collect::<Vec<_>>(),
+    }))
+}
+
+fn daemon_list_trusted_publishers(state: &Arc<DaemonState>) -> Result<serde_json::Value> {
+    let config = state.config();
+    Ok(serde_json::Value::Array(
+        config
+            .trust
+            .publishers
+            .iter()
+            .map(|publisher| publisher_json(publisher))
+            .collect(),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct PublisherParams {
+    publisher: String,
+}
+
+fn config_write_path(state: &DaemonState) -> Result<&Path> {
+    state
+        .config_path
+        .as_deref()
+        .context("no config directory available to save settings")
+}
+
+async fn daemon_add_trusted_publisher(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: PublisherParams =
+        serde_json::from_value(params).context("invalid AddTrustedPublisher params")?;
+    let (hex, name) = resolve_publisher_input(&params.publisher).await?;
+    let path = config_write_path(state)?;
+    state.reload_config_if_changed();
+    let mut config = state
+        .config
+        .write()
+        .map_err(|_| anyhow!("config lock poisoned"))?;
+    if let Some(publishers) = trust_list_with(&config.trust.publishers, &hex) {
+        persist_trust_list(path, &publishers)?;
+        config.trust.publishers = publishers;
+    }
+    config.first_run = false;
+    state.note_config_written();
+    let mut value = publisher_json(&hex);
+    if let (Some(name), Some(object)) = (name, value.as_object_mut()) {
+        object.insert("nip05".into(), name.display().into());
+        object.insert("label".into(), name.display().into());
+    }
+    Ok(value)
+}
+
+fn daemon_remove_trusted_publisher(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: PublisherParams =
+        serde_json::from_value(params).context("invalid RemoveTrustedPublisher params")?;
+    let hex = normalize_publisher_reference(params.publisher.trim());
+    let path = config_write_path(state)?;
+    state.reload_config_if_changed();
+    let mut config = state
+        .config
+        .write()
+        .map_err(|_| anyhow!("config lock poisoned"))?;
+    let removed = match trust_list_without(&config.trust.publishers, &hex) {
+        Some(publishers) => {
+            persist_trust_list(path, &publishers)?;
+            config.trust.publishers = publishers;
+            true
+        }
+        None => false,
+    };
+    drop(config);
+    state.note_config_written();
+    Ok(serde_json::json!({ "removed": removed, "publisher": hex }))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct SaveConfigParams {
+    #[serde(default)]
+    relays: Option<Vec<String>>,
+    #[serde(default)]
+    blossom: Option<Vec<String>>,
+}
+
+fn clean_endpoints(values: Vec<String>, schemes: &[&str], what: &str) -> Result<Vec<String>> {
+    let mut cleaned = Vec::new();
+    for value in values {
+        let value = value.trim().trim_end_matches('/').to_owned();
+        if value.is_empty() {
+            continue;
+        }
+        if !schemes.iter().any(|scheme| value.starts_with(scheme)) {
+            bail!(
+                "invalid {what} {value}: expected a URL starting with {}",
+                schemes.join(" or ")
+            );
+        }
+        if !cleaned.contains(&value) {
+            cleaned.push(value);
+        }
+    }
+    Ok(cleaned)
+}
+
+/// Writes the relays / Blossom servers to `config.toml` (the effective ones
+/// when a field is omitted, which is how a first-run "use recommended
+/// settings" persists the built-in defaults). An explicitly empty list reverts
+/// that setting to the built-in defaults.
+fn daemon_save_config(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: SaveConfigParams =
+        serde_json::from_value(params).context("invalid SaveConfig params")?;
+    let path = config_write_path(state)?;
+    state.reload_config_if_changed();
+    let mut config = state
+        .config
+        .write()
+        .map_err(|_| anyhow!("config lock poisoned"))?;
+    let mut updated = config.clone();
+    if let Some(relays) = params.relays {
+        updated.network.relays = clean_endpoints(relays, &["ws://", "wss://"], "relay")?;
+        updated.relays_defaulted = false;
+    }
+    if let Some(blossom) = params.blossom {
+        updated.storage.blossom =
+            clean_endpoints(blossom, &["http://", "https://"], "Blossom server")?;
+        updated.blossom_defaulted = false;
+    }
+    let (relays, blossom) = (
+        updated.network.relays.clone(),
+        updated.storage.blossom.clone(),
+    );
+    update_config_file(path, |table| {
+        // Only persist non-empty lists; an empty list means "use defaults".
+        if !relays.is_empty() {
+            config_section(table, "network").insert("relays".into(), string_array(&relays));
+        } else {
+            config_section(table, "network").remove("relays");
+        }
+        if !blossom.is_empty() {
+            config_section(table, "storage").insert("blossom".into(), string_array(&blossom));
+        } else {
+            config_section(table, "storage").remove("blossom");
+        }
+    })?;
+    updated.first_run = false;
+    updated.apply_defaults();
+    *config = updated;
+    drop(config);
+    state.note_config_written();
+    daemon_get_config(state)
+}
+
+// ---------------------------------------------------------------------------
+// Trust list editing, shared by `npack trust` and the daemon
+// ---------------------------------------------------------------------------
+
+/// `list` plus `hex` (stored as an npub, which is what people recognise), or
+/// `None` when that publisher is already in the list.
+fn trust_list_with(list: &[String], hex: &str) -> Option<Vec<String>> {
+    if list
+        .iter()
+        .any(|entry| normalize_publisher_reference(entry) == hex)
+    {
+        return None;
+    }
+    let mut updated = list.to_vec();
+    updated.push(display_publisher(hex));
+    Some(updated)
+}
+
+/// `list` without `hex`, or `None` when it was not in the list.
+fn trust_list_without(list: &[String], hex: &str) -> Option<Vec<String>> {
+    let updated: Vec<String> = list
+        .iter()
+        .filter(|entry| normalize_publisher_reference(entry) != hex)
+        .cloned()
+        .collect();
+    (updated.len() != list.len()).then_some(updated)
+}
+
+fn persist_trust_list(path: &Path, publishers: &[String]) -> Result<()> {
+    update_config_file(path, |table| {
+        config_section(table, "trust").insert("publishers".into(), string_array(publishers));
+    })
+}
+
+/// The trust list as stored on disk (an absent file means no one is trusted).
+fn trusted_publishers_at(path: &Path) -> Result<Vec<String>> {
+    Ok(load_config_from(Some(path))?.trust.publishers)
+}
+
+/// Whether to go ahead: `--yes` always does; otherwise the user must answer
+/// at a terminal. Piped or scripted input never counts as consent.
+fn confirmation_decision(
+    yes: bool,
+    interactive: bool,
+    answer: impl FnOnce() -> io::Result<String>,
+) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    if !interactive {
+        bail!("refusing to change the trust list without confirmation; pass --yes to confirm");
+    }
+    Ok(matches!(
+        answer()?.trim().to_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn ask_on_terminal(question: &str) -> io::Result<String> {
+    eprint!("{question} ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(answer)
+}
+
+fn print_identity(identity: &PublisherIdentity) {
+    println!("  key       {}", identity.npub);
+    if let Some(label) = &identity.label {
+        println!("  name      {label} ({})", green("verified by its domain"));
+    } else {
+        if let Some(nip05) = &identity.nip05 {
+            println!(
+                "  claims    {nip05} ({})",
+                yellow("unverified: its domain does not confirm this key")
+            );
+        }
+        if let Some(name) = &identity.claimed_name {
+            println!("  profile   \"{name}\" ({})", yellow("self-reported"));
+        }
+    }
+}
+
+async fn trust_command(action: TrustAction, config: &Config) -> Result<()> {
+    let path = config_file_path().context("no config directory available")?;
+    match action {
+        TrustAction::Add {
+            publisher,
+            yes,
+            relay,
+        } => {
+            let (hex, name) = resolve_publisher_input(&publisher).await?;
+            let mut identity = PublisherIdentity::bare(&hex);
+            if let Some(name) = &name {
+                // The domain vouched for this key just now.
+                identity.label = Some(name.display());
+                identity.nip05 = Some(name.display());
+                identity.nip05_verified = true;
+            } else {
+                let relays = normalize_relays(relay, config);
+                eprintln!("Looking up profile...");
+                if let Ok(found) = lookup_identities(&relays, &[PublicKey::from_hex(&hex)?]).await
+                    && let Some(found) = found.into_iter().next()
+                {
+                    identity = found;
+                }
+            }
+            if trusted_publishers_at(&path)?
+                .iter()
+                .any(|entry| normalize_publisher_reference(entry) == hex)
+            {
+                println!("Already trusted: {}", identity.npub);
+                return Ok(());
+            }
+            println!("Trust this publisher?");
+            print_identity(&identity);
+            if !confirmation_decision(yes, io::stdin().is_terminal(), || {
+                ask_on_terminal("Trust them? [y/N]")
+            })? {
+                println!("Not trusted.");
+                return Ok(());
+            }
+            if let Some(updated) = trust_list_with(&trusted_publishers_at(&path)?, &hex) {
+                persist_trust_list(&path, &updated)?;
+            }
+            println!("{} {}", green("trusted"), identity.npub);
+        }
+        TrustAction::Remove { publisher } => {
+            let (hex, _) = resolve_publisher_input(&publisher).await.map_err(|error| {
+                anyhow!("{error:#}\nuse `npack trust list` to find the publisher's npub")
+            })?;
+            let Some(updated) = trust_list_without(&trusted_publishers_at(&path)?, &hex) else {
+                bail!(
+                    "{} is not in the trusted publisher list",
+                    display_publisher(&hex)
+                );
+            };
+            persist_trust_list(&path, &updated)?;
+            println!(
+                "{} {}",
+                yellow("no longer trusted"),
+                display_publisher(&hex)
+            );
+        }
+        TrustAction::List { names, relay } => {
+            let publishers = trusted_publishers_at(&path)?;
+            if publishers.is_empty() {
+                println!("No trusted publishers. Any publisher is accepted until you add one.");
+                return Ok(());
+            }
+            let keys = publishers
+                .iter()
+                .map(|entry| {
+                    PublicKey::parse(entry)
+                        .with_context(|| format!("invalid trusted publisher key: {entry}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let identities = if names {
+                let relays = normalize_relays(relay, config);
+                eprintln!("Looking up names...");
+                lookup_identities(&relays, &keys).await?
+            } else {
+                keys.iter()
+                    .map(|key| PublisherIdentity::bare(&key.to_hex()))
+                    .collect()
+            };
+            for identity in identities {
+                match (&identity.label, names) {
+                    (Some(label), _) => println!("{}  {label}", identity.npub),
+                    (None, true) => println!("{}  (no verified name)", identity.npub),
+                    (None, false) => println!("{}", identity.npub),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Store icons
+//
+// A release's icon is a stand-alone Blossom blob whose SHA-256 the publisher
+// signed. The daemon fetches it on behalf of a GUI, but only the URL from a
+// release already in its own catalogue, never one a caller supplies, so it is
+// not a general "fetch this URL" service. Fetches are HTTPS to a public domain
+// name, follow no redirects, are size-capped, must match the signed hash and
+// must look like a PNG or SVG. Verified icons are cached by hash.
+// ---------------------------------------------------------------------------
+
+/// Downloads and checks an icon. `secure` is the production setting (https to
+/// a public DNS name); tests turn it off to talk to a loopback server.
+async fn fetch_icon_bytes(icon: &IconBlob, secure: bool) -> Result<Vec<u8>> {
+    let url = Url::parse(&icon.url).context("icon URL is not valid")?;
+    if secure {
+        let public_domain = match url.host() {
+            Some(url::Host::Domain(domain)) => is_public_dns_name(&domain.to_lowercase()),
+            _ => false,
+        };
+        if url.scheme() != "https" || !public_domain || url.port().is_some() {
+            bail!("icon URL must be https to a public domain name");
+        }
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(NETWORK_TIMEOUT_SECS))
+        .https_only(secure)
+        .build()?;
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .context("could not reach the icon server")?;
+    if !response.status().is_success() {
+        bail!(
+            "the icon server answered HTTP {}",
+            response.status().as_u16()
+        );
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("reading the icon")? {
+        if bytes.len() + chunk.len() > MAX_ICON_BYTES {
+            bail!("the icon is larger than {MAX_ICON_BYTES} bytes");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    verify_icon_bytes(&bytes, &icon.sha256)?;
+    Ok(bytes)
+}
+
+/// The signed hash must match and the bytes must really be a PNG or SVG.
+fn verify_icon_bytes(bytes: &[u8], sha256: &str) -> Result<&'static str> {
+    if hex::encode(Sha256::digest(bytes)) != sha256.to_ascii_lowercase() {
+        bail!("icon does not match its signed SHA-256");
+    }
+    icon_media_type(bytes)
+}
+
+#[derive(Debug, Deserialize)]
+struct GetIconParams {
+    release_event_id: String,
+    #[serde(default)]
+    store: Option<PathBuf>,
+}
+
+async fn daemon_get_icon(params: serde_json::Value) -> Result<serde_json::Value> {
+    let params: GetIconParams = serde_json::from_value(params).context("invalid GetIcon params")?;
+    let root = params.store.unwrap_or_else(default_store);
+    get_icon_at(&root, &params.release_event_id, true).await
+}
+
+async fn get_icon_at(
+    root: &Path,
+    release_event_id: &str,
+    secure: bool,
+) -> Result<serde_json::Value> {
+    use base64::Engine;
+    let catalogue =
+        load_catalogue(root)?.context("no local catalogue found; run `npack refresh` first")?;
+    let event = catalogue
+        .releases
+        .iter()
+        .find(|event| event.id.to_hex() == release_event_id)
+        .filter(|event| event.verify().is_ok() && release_event_is_v1(event))
+        .with_context(|| {
+            format!("no release named {release_event_id} found in the local catalogue; try `npack refresh`")
+        })?;
+    let icon = app_metadata_from_event(event)
+        .icon_blob
+        .context("this release has no store icon")?;
+    let sha256 = icon.sha256.to_ascii_lowercase();
+    let cached = root.join("icons").join(&sha256);
+    // A cached file is trusted only after its hash is checked again.
+    let cached_bytes = fs::read(&cached)
+        .ok()
+        .filter(|bytes| verify_icon_bytes(bytes, &sha256).is_ok());
+    let bytes = match cached_bytes {
+        Some(bytes) => bytes,
+        None => {
+            let bytes = fetch_icon_bytes(&icon, secure).await?;
+            if let Some(parent) = cached.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let temporary = cached.with_extension("tmp");
+            fs::write(&temporary, &bytes)?;
+            fs::rename(&temporary, &cached)?;
+            bytes
+        }
+    };
+    let media_type = icon_media_type(&bytes)?;
+    Ok(serde_json::json!({
+        "sha256": sha256,
+        "media_type": media_type,
+        "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Publisher names (NIP-05)
+//
+// A publisher is a pubkey; a NIP-05 name (`alice@example.com`) is a readable
+// pointer to one. Names are only ever a convenience: the key is what gets
+// trusted and stored, a name is shown as verified only when its domain maps it
+// back to the same key, and a self-reported profile name is always labelled as
+// unverified because anyone can claim any name.
+// ---------------------------------------------------------------------------
+
+const NIP05_MAX_BYTES: usize = 64 * 1024;
+const NIP05_TIMEOUT_SECS: u64 = 10;
+const IDENTITY_CACHE_SECS: u64 = 3600;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Nip05Identifier {
+    name: String,
+    domain: String,
+}
+
+impl Nip05Identifier {
+    /// `_@domain` is displayed as just `domain`, per NIP-05.
+    fn display(&self) -> String {
+        if self.name == "_" {
+            self.domain.clone()
+        } else {
+            format!("{}@{}", self.name, self.domain)
+        }
+    }
+}
+
+/// Parses `name@domain` (or a bare `domain`, meaning `_@domain`). Returns
+/// `None` for anything that is not a plausible public NIP-05 identifier --
+/// including IP literals, ports, and local-only domains, which the daemon
+/// refuses to query.
+fn parse_nip05(input: &str) -> Option<Nip05Identifier> {
+    let input = input.trim().to_lowercase();
+    let (name, domain) = input.split_once('@').unwrap_or(("_", input.as_str()));
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
+        || !is_public_dns_name(domain)
+    {
+        return None;
+    }
+    Some(Nip05Identifier {
+        name: name.to_owned(),
+        domain: domain.to_owned(),
+    })
+}
+
+fn is_public_dns_name(domain: &str) -> bool {
+    if domain.len() > 253 {
+        return false;
+    }
+    let labels: Vec<&str> = domain.split('.').collect();
+    if labels.len() < 2 {
+        return false;
+    }
+    let well_formed = labels.iter().all(|label| {
+        (1..=63).contains(&label.len())
+            && label
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    });
+    let tld = labels[labels.len() - 1];
+    // An all-numeric last label is an IPv4 address, not a name.
+    well_formed
+        && !tld.chars().all(|c| c.is_ascii_digit())
+        && !matches!(
+            tld,
+            "local" | "localhost" | "internal" | "lan" | "home" | "corp"
+        )
+}
+
+/// Looks `identifier` up under `base` (`https://domain` in production) and
+/// returns the lowercase hex pubkey it maps to. Redirects are not followed
+/// (NIP-05 forbids it), the body is size-capped, and with `https_only` a
+/// plain-http `base` is refused.
+async fn fetch_nip05_pubkey_at(
+    base: &str,
+    identifier: &Nip05Identifier,
+    https_only: bool,
+) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(NIP05_TIMEOUT_SECS))
+        .https_only(https_only)
+        .build()?;
+    let mut response = client
+        .get(format!("{base}/.well-known/nostr.json"))
+        .query(&[("name", identifier.name.as_str())])
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .context("could not reach the domain")?;
+    if !response.status().is_success() {
+        bail!("the domain answered HTTP {}", response.status().as_u16());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("reading the response")? {
+        if body.len() + chunk.len() > NIP05_MAX_BYTES {
+            bail!("the response was larger than {NIP05_MAX_BYTES} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let document: serde_json::Value =
+        serde_json::from_slice(&body).context("the response was not valid JSON")?;
+    let key = document
+        .get("names")
+        .and_then(|names| names.get(&identifier.name))
+        .and_then(serde_json::Value::as_str)
+        .with_context(|| format!("the domain has no entry for {}", identifier.name))?;
+    // NIP-05 specifies hex keys; npub here would be a spec violation.
+    if key.len() != 64 {
+        bail!("the domain returned a key that is not 64-character hex");
+    }
+    Ok(PublicKey::from_hex(key)
+        .context("the domain returned an invalid public key")?
+        .to_hex())
+}
+
+async fn resolve_nip05(identifier: &Nip05Identifier) -> Result<String> {
+    fetch_nip05_pubkey_at(&format!("https://{}", identifier.domain), identifier, true)
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "NIP-05 lookup failed for {}: {error:#}",
+                identifier.display()
+            )
+        })
+}
+
+/// Turns user input -- an npub, a hex key, or a NIP-05 name -- into a hex
+/// pubkey, plus the verified name when the input was one.
+async fn resolve_publisher_input(input: &str) -> Result<(String, Option<Nip05Identifier>)> {
+    let input = input.trim();
+    if let Ok(key) = PublicKey::parse(input) {
+        return Ok((key.to_hex(), None));
+    }
+    match parse_nip05(input) {
+        Some(identifier) => Ok((resolve_nip05(&identifier).await?, Some(identifier))),
+        None => bail!("invalid publisher key: {input} (expected an npub, hex key or name@domain)"),
+    }
+}
+
+/// Strips control and bidirectional-override characters from text a stranger
+/// controls (profile names), and caps its length, before it is shown.
+fn sanitize_display_text(text: &str) -> Option<String> {
+    let cleaned: String = text
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(*c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .take(64)
+        .collect();
+    let cleaned = cleaned.trim().to_owned();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PublisherIdentity {
+    publisher: String,
+    npub: String,
+    /// Set only when the publisher's claimed NIP-05 name was confirmed by its
+    /// domain. This is the one name a frontend may present as verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    /// The NIP-05 name the profile claims, verified or not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nip05: Option<String>,
+    nip05_verified: bool,
+    /// Self-reported profile name. Unverified: anyone can claim any name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claimed_name: Option<String>,
+}
+
+impl PublisherIdentity {
+    fn bare(hex: &str) -> Self {
+        Self {
+            publisher: hex.to_owned(),
+            npub: display_publisher(hex),
+            label: None,
+            nip05: None,
+            nip05_verified: false,
+            claimed_name: None,
+        }
+    }
+}
+
+/// Fetches the newest signed kind-0 profile for each author from `relays`.
+async fn fetch_profile_claims(
+    relays: &[String],
+    authors: &[PublicKey],
+) -> Result<HashMap<String, serde_json::Value>> {
+    if relays.is_empty() || authors.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let client = Client::default();
+    for relay in relays {
+        client.add_relay(relay).await?;
+    }
+    connect_with_timeout(&client).await?;
+    let events = client
+        .fetch_events(
+            Filter::new()
+                .kind(Kind::Metadata)
+                .authors(authors.iter().copied())
+                .limit(authors.len() * 4),
+        )
+        .timeout(std::time::Duration::from_secs(10))
+        .await;
+    client.disconnect().await;
+    let mut newest: HashMap<String, (u64, serde_json::Value)> = HashMap::new();
+    for event in events? {
+        if event.verify().is_err() {
+            continue;
+        }
+        let Ok(profile) = serde_json::from_str::<serde_json::Value>(&event.content) else {
+            continue;
+        };
+        let created = event.created_at.as_secs();
+        let author = event.pubkey.to_hex();
+        if newest.get(&author).is_none_or(|(seen, _)| created > *seen) {
+            newest.insert(author, (created, profile));
+        }
+    }
+    Ok(newest
+        .into_iter()
+        .map(|(author, (_, profile))| (author, profile))
+        .collect())
+}
+
+/// Builds a publisher's identity from its (unverified) profile claims,
+/// confirming any claimed NIP-05 name against its domain.
+async fn build_identity(hex: &str, claims: Option<&serde_json::Value>) -> PublisherIdentity {
+    let mut identity = PublisherIdentity::bare(hex);
+    let Some(claims) = claims else {
+        return identity;
+    };
+    let text = |field: &str| {
+        claims
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .and_then(sanitize_display_text)
+    };
+    identity.claimed_name = text("display_name").or_else(|| text("name"));
+    if let Some(claimed) = claims
+        .get("nip05")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_nip05)
+    {
+        identity.nip05 = Some(claimed.display());
+        if resolve_nip05(&claimed)
+            .await
+            .is_ok_and(|resolved| resolved == hex)
+        {
+            identity.nip05_verified = true;
+            identity.label = Some(claimed.display());
+        }
+    }
+    identity
+}
+
+/// Looks up each key's identity: profile claims from `relays`, then each
+/// claimed NIP-05 name confirmed against its domain. Fails if no relay could
+/// be queried.
+async fn lookup_identities(
+    relays: &[String],
+    keys: &[PublicKey],
+) -> Result<Vec<PublisherIdentity>> {
+    let claims = fetch_profile_claims(relays, keys).await?;
+    Ok(build_identities(keys, &claims).await)
+}
+
+/// Like `lookup_identities`, but a relay failure yields bare identities and
+/// `reached == false` instead of an error.
+async fn lookup_identities_lenient(
+    relays: &[String],
+    keys: &[PublicKey],
+) -> (Vec<PublisherIdentity>, bool) {
+    let claims = fetch_profile_claims(relays, keys).await;
+    let reached = claims.is_ok();
+    let claims = claims.unwrap_or_default();
+    (build_identities(keys, &claims).await, reached)
+}
+
+async fn build_identities(
+    keys: &[PublicKey],
+    claims: &HashMap<String, serde_json::Value>,
+) -> Vec<PublisherIdentity> {
+    futures_util::future::join_all(keys.iter().map(|key| {
+        let hex = key.to_hex();
+        let claim = claims.get(&hex);
+        async move { build_identity(&hex, claim).await }
+    }))
+    .await
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ProfilesParams {
+    #[serde(default)]
+    publishers: Vec<String>,
+    #[serde(default)]
+    relay: Vec<String>,
+    /// Bypass the one-hour identity cache.
+    #[serde(default)]
+    refresh: bool,
+}
+
+/// Looks up readable identities for `publishers` (hex or npub), best effort:
+/// a relay or domain that cannot be reached yields a bare identity rather
+/// than an error, and such results are not cached so the next call retries.
+async fn daemon_get_publisher_profiles(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: ProfilesParams =
+        serde_json::from_value(params).context("invalid GetPublisherProfiles params")?;
+    let config = state.config();
+    let keys = params
+        .publishers
+        .iter()
+        .map(|publisher| {
+            PublicKey::parse(publisher.trim())
+                .with_context(|| format!("invalid publisher key: {publisher}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ttl = std::time::Duration::from_secs(IDENTITY_CACHE_SECS);
+    let cached = |hex: &str| -> Option<PublisherIdentity> {
+        if params.refresh {
+            return None;
+        }
+        let cache = state.identities.lock().ok()?;
+        let (stored, identity) = cache.get(hex)?;
+        (stored.elapsed() < ttl).then(|| identity.clone())
+    };
+    let missing: Vec<PublicKey> = keys
+        .iter()
+        .filter(|key| cached(&key.to_hex()).is_none())
+        .copied()
+        .collect();
+    let mut fresh: HashMap<String, PublisherIdentity> = HashMap::new();
+    if !missing.is_empty() {
+        let relays = normalize_relays(params.relay, &config);
+        let (built, reached) = lookup_identities_lenient(&relays, &missing).await;
+        for identity in built {
+            if reached && let Ok(mut cache) = state.identities.lock() {
+                cache.insert(
+                    identity.publisher.clone(),
+                    (std::time::Instant::now(), identity.clone()),
+                );
+            }
+            fresh.insert(identity.publisher.clone(), identity);
+        }
+    }
+    let identities: Vec<PublisherIdentity> = keys
+        .iter()
+        .map(|key| {
+            let hex = key.to_hex();
+            cached(&hex)
+                .or_else(|| fresh.get(&hex).cloned())
+                .unwrap_or_else(|| PublisherIdentity::bare(&hex))
+        })
+        .collect();
+    Ok(serde_json::to_value(identities)?)
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolvePublisherParams {
+    query: String,
+    #[serde(default)]
+    relay: Vec<String>,
+}
+
+/// Resolves what a user typed -- npub, hex key, or `name@domain` -- to one
+/// publisher identity, so a frontend can show who it is before trusting them.
+async fn daemon_resolve_publisher(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: ResolvePublisherParams =
+        serde_json::from_value(params).context("invalid ResolvePublisher params")?;
+    let (hex, name) = resolve_publisher_input(&params.query).await?;
+    if let Some(name) = name {
+        // The domain vouched for this key just now, so the name is verified.
+        let mut identity = PublisherIdentity::bare(&hex);
+        identity.nip05 = Some(name.display());
+        identity.label = Some(name.display());
+        identity.nip05_verified = true;
+        return Ok(serde_json::to_value(identity)?);
+    }
+    let profiles = daemon_get_publisher_profiles(
+        state,
+        serde_json::json!({ "publishers": [hex], "relay": params.relay }),
+    )
+    .await?;
+    Ok(profiles
+        .as_array()
+        .and_then(|items| items.first().cloned())
+        .unwrap_or_else(|| serde_json::to_value(PublisherIdentity::bare(&hex)).unwrap_or_default()))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct HistoryParams {
+    #[serde(default)]
+    package: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    user: bool,
+    #[serde(default)]
+    store: Option<PathBuf>,
+}
+
+/// Newest-first change history, each entry with a display `reference`.
+fn daemon_get_history(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
+    let params: HistoryParams =
+        serde_json::from_value(params).context("invalid GetHistory params")?;
+    let root = install_paths(params.store.as_deref(), params.user || config.install.user).0;
+    let filter = params
+        .package
+        .as_deref()
+        .map(split_package_reference)
+        .transpose()?;
+    let entries: Vec<serde_json::Value> = load_history(&root)
+        .into_iter()
+        .rev()
+        .filter(|entry| {
+            filter.as_ref().is_none_or(|(publisher, name)| {
+                &entry.publisher == publisher && &entry.name == name
+            })
+        })
+        .take(params.limit.unwrap_or(100))
+        .map(|entry| {
+            let mut value = serde_json::to_value(&entry).unwrap_or_default();
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "reference".into(),
+                    format!("{}/{}", display_publisher(&entry.publisher), entry.name).into(),
+                );
+            }
+            value
+        })
+        .collect();
+    Ok(serde_json::Value::Array(entries))
+}
+
+/// The installed packages that can be switched back right now, and to what.
+fn daemon_list_rollbacks(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
+    let params: HistoryParams =
+        serde_json::from_value(params).context("invalid ListRollbacks params")?;
+    let root = install_paths(params.store.as_deref(), params.user || config.install.user).0;
+    Ok(serde_json::Value::Array(
+        available_rollbacks(&root)?
+            .into_iter()
+            .map(|(installed, target)| {
+                serde_json::json!({
+                    "reference": installed_package_reference(&installed),
+                    "current_version": installed.version,
+                    "previous_version": target.version,
+                })
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct RollbackParams {
+    package: String,
+    #[serde(default)]
+    allow_capability: Vec<String>,
+    #[serde(default)]
+    user: bool,
+    #[serde(default)]
+    store: Option<PathBuf>,
+}
+
+fn daemon_rollback(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
+    let params: RollbackParams =
+        serde_json::from_value(params).context("invalid Rollback params")?;
+    let (from, to) = rollback_package_at(
+        &params.package,
+        params.store.as_deref(),
+        params.user || config.install.user,
+        &params.allow_capability,
+    )?;
+    Ok(serde_json::json!({
+        "package": params.package,
+        "from_version": from.version,
+        "to_version": to.version,
+    }))
+}
+
+/// How to order browse/search results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SearchSort {
+    /// The catalogue's own order (the historical behaviour).
+    #[default]
+    Catalogue,
+    Name,
+    /// Most recently published first.
+    Recent,
+}
+
+impl SearchSort {
+    fn parse(value: Option<&str>) -> Result<Self> {
+        match value {
+            None | Some("") | Some("catalogue") => Ok(Self::Catalogue),
+            Some("name") => Ok(Self::Name),
+            Some("recent") => Ok(Self::Recent),
+            Some(other) => bail!("invalid sort {other}: expected name or recent"),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SearchOptions {
+    /// Case-insensitive; matches any of a release's listed categories.
+    category: Option<String>,
+    sort: SearchSort,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+/// Narrows, orders and pages already-matched results. Pure, so the CLI and
+/// the daemon share one behaviour.
+fn apply_search_options(
+    mut results: Vec<SearchResult>,
+    options: &SearchOptions,
+) -> Vec<SearchResult> {
+    if let Some(wanted) = options.category.as_deref().map(str::to_lowercase) {
+        results.retain(|result| {
+            result.app.as_ref().is_some_and(|app| {
+                app.categories
+                    .iter()
+                    .any(|category| category.to_lowercase() == wanted)
+            })
+        });
+    }
+    match options.sort {
+        SearchSort::Catalogue => {}
+        SearchSort::Name => results.sort_by_key(|r| (r.name.to_lowercase(), r.publisher.clone())),
+        SearchSort::Recent => results.sort_by(|a, b| {
+            b.published_at
+                .cmp(&a.published_at)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        }),
+    }
+    results
+        .into_iter()
+        .skip(options.offset)
+        .take(options.limit.unwrap_or(usize::MAX))
+        .collect()
+}
+
+/// Every listed category with how many distinct packages carry it, most
+/// populous first. Spelling variants ("Utility", "utility") are one category,
+/// shown in its most common spelling (ties go to the capitalised one, since
+/// uppercase sorts first), so the label does not depend on catalogue order.
+fn category_counts(results: &[SearchResult]) -> Vec<(String, usize)> {
+    #[derive(Default)]
+    struct Entry {
+        spellings: HashMap<String, usize>,
+        packages: HashSet<(String, String)>,
+    }
+    let mut seen: HashMap<String, Entry> = HashMap::new();
+    for result in results {
+        for category in result.app.iter().flat_map(|app| &app.categories) {
+            let entry = seen.entry(category.to_lowercase()).or_default();
+            *entry.spellings.entry(category.clone()).or_default() += 1;
+            entry
+                .packages
+                .insert((result.publisher.clone(), result.name.clone()));
+        }
+    }
+    let mut counts: Vec<(String, usize)> = seen
+        .into_values()
+        .filter_map(|entry| {
+            let display = entry
+                .spellings
+                .into_iter()
+                .min_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)))?
+                .0;
+            Some((display, entry.packages.len()))
+        })
+        .collect();
+    counts.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+    });
+    counts
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct SearchParams {
+    /// Empty (or omitted) matches everything, which is how a browse view
+    /// lists the whole catalogue.
+    #[serde(default)]
     query: String,
     #[serde(default)]
     relay: Vec<String>,
@@ -4532,15 +6316,49 @@ struct SearchParams {
     no_cache: bool,
     #[serde(default)]
     store: Option<PathBuf>,
+    /// Also return publishers outside the trust list, each annotated with
+    /// `"trust": "unknown"`, so a GUI can ask before trusting them. Without
+    /// it the configured list filters results exactly as the CLI does.
+    #[serde(default)]
+    include_untrusted: bool,
+    /// Only packages listing this category (case-insensitive).
+    #[serde(default)]
+    category: Option<String>,
+    /// `name` or `recent`; omitted keeps the catalogue order.
+    #[serde(default)]
+    sort: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: usize,
+    /// Only publishers in the daemon's trust list (an empty list trusts no
+    /// one here, matching the `trust` field).
+    #[serde(default)]
+    only_trusted: bool,
+    /// Only releases whose os/arch fit this machine.
+    #[serde(default)]
+    host_only: bool,
 }
 
-async fn daemon_search(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
-    let params: SearchParams = serde_json::from_value(params).context("invalid Search params")?;
-    let relays = normalize_relays(params.relay, config);
-    let trusted_publishers = configured_publishers(params.trusted_publisher, config)?;
-    let pubkey = params.pubkey.or_else(|| config.identity.pubkey.clone());
-    let root = params.store.unwrap_or_else(default_store);
-    let results = search_matching_releases(
+/// Runs the catalogue search and the trust/host filters. Category, order and
+/// paging are applied afterwards by the caller, so a category list can be built
+/// from the same set the browse view draws from.
+async fn daemon_search_results(
+    config: &Config,
+    params: &SearchParams,
+) -> Result<Vec<SearchResult>> {
+    let relays = normalize_relays(params.relay.clone(), config);
+    let trusted_publishers = if params.include_untrusted {
+        Vec::new()
+    } else {
+        configured_publishers(params.trusted_publisher.clone(), config)?
+    };
+    let pubkey = params
+        .pubkey
+        .clone()
+        .or_else(|| config.identity.pubkey.clone());
+    let root = params.store.clone().unwrap_or_else(default_store);
+    let mut results = search_matching_releases(
         &params.query,
         &relays,
         &trusted_publishers,
@@ -4550,7 +6368,60 @@ async fn daemon_search(config: &Config, params: serde_json::Value) -> Result<ser
         &root,
     )
     .await?;
-    Ok(serde_json::to_value(results)?)
+    if params.only_trusted {
+        results.retain(|result| trust_status(config, &result.publisher) == "trusted");
+    }
+    if params.host_only {
+        results.retain(|result| result.compatible);
+    }
+    Ok(results)
+}
+
+async fn daemon_search(config: &Config, params: serde_json::Value) -> Result<serde_json::Value> {
+    let params: SearchParams = serde_json::from_value(params).context("invalid Search params")?;
+    let options = SearchOptions {
+        category: params.category.clone(),
+        sort: SearchSort::parse(params.sort.as_deref())?,
+        limit: params.limit,
+        offset: params.offset,
+    };
+    let results = apply_search_options(daemon_search_results(config, &params).await?, &options);
+    let mut value = serde_json::to_value(results)?;
+    for item in value.as_array_mut().into_iter().flatten() {
+        let status = item
+            .get("publisher")
+            .and_then(serde_json::Value::as_str)
+            .map(|publisher| trust_status(config, publisher));
+        let npub = item
+            .get("publisher")
+            .and_then(serde_json::Value::as_str)
+            .map(display_publisher);
+        if let (Some(status), Some(object)) = (status, item.as_object_mut()) {
+            object.insert("trust".into(), status.into());
+            if let Some(npub) = npub {
+                object.insert("npub".into(), npub.into());
+            }
+        }
+    }
+    Ok(value)
+}
+
+/// `ListCategories`: the categories present in the catalogue, with how many
+/// packages carry each. Takes the same filters as `Search` (trust, host,
+/// refresh), so counts match what a browse view would then show.
+async fn daemon_list_categories(
+    config: &Config,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: SearchParams =
+        serde_json::from_value(params).context("invalid ListCategories params")?;
+    let results = daemon_search_results(config, &params).await?;
+    Ok(serde_json::Value::Array(
+        category_counts(&results)
+            .into_iter()
+            .map(|(category, count)| serde_json::json!({ "category": category, "count": count }))
+            .collect(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -4570,6 +6441,10 @@ struct GetPackageParams {
     store: Option<PathBuf>,
     #[serde(default)]
     user: bool,
+    /// Resolve even when the publisher is outside the trust list; the result
+    /// carries `"trust": "unknown"` instead of the request failing.
+    #[serde(default)]
+    include_untrusted: bool,
 }
 
 async fn daemon_get_package(
@@ -4579,7 +6454,11 @@ async fn daemon_get_package(
     let params: GetPackageParams =
         serde_json::from_value(params).context("invalid GetPackage params")?;
     let relays = configured_relays(params.relay, config)?;
-    let trusted_publishers = configured_publishers(params.trusted_publisher, config)?;
+    let trusted_publishers = if params.include_untrusted {
+        Vec::new()
+    } else {
+        configured_publishers(params.trusted_publisher, config)?
+    };
     let (publisher, name) = params
         .package
         .split_once('/')
@@ -4606,7 +6485,30 @@ async fn daemon_get_package(
     )
     .await;
     client.disconnect().await;
-    Ok(serde_json::to_value(resolved?)?)
+    let mut value = serde_json::to_value(resolved?)?;
+    let status = value
+        .get("publisher")
+        .and_then(serde_json::Value::as_str)
+        .map(|publisher| trust_status(config, publisher));
+    let npub = value
+        .get("publisher")
+        .and_then(serde_json::Value::as_str)
+        .map(display_publisher);
+    if let (Some(status), Some(object)) = (status, value.as_object_mut()) {
+        object.insert("trust".into(), status.into());
+        if let Some(npub) = npub {
+            object.insert("npub".into(), npub.into());
+        }
+        if let Some(verification) = object
+            .get_mut("verification")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            // The resolver treats an empty list as "trust anyone"; report the
+            // daemon's stricter notion so a GUI never shows a false "trusted".
+            verification.insert("publisher_trusted".into(), (status == "trusted").into());
+        }
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -4622,7 +6524,18 @@ fn daemon_list_installed(config: &Config, params: serde_json::Value) -> Result<s
         serde_json::from_value(params).context("invalid ListInstalled params")?;
     let use_user = params.user || config.install.user;
     let root = install_paths(params.store.as_deref(), use_user).0;
-    Ok(serde_json::to_value(installed_packages(Some(&root))?)?)
+    let mut value = serde_json::to_value(installed_packages(Some(&root))?)?;
+    // Add the npub people recognise next to the hex key, as Search does.
+    for item in value.as_array_mut().into_iter().flatten() {
+        let npub = item
+            .get("publisher")
+            .and_then(serde_json::Value::as_str)
+            .map(display_publisher);
+        if let (Some(npub), Some(object)) = (npub, item.as_object_mut()) {
+            object.insert("npub".into(), npub.into());
+        }
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4640,6 +6553,10 @@ struct InstallParams {
     store: Option<PathBuf>,
     #[serde(default)]
     allow_capability: Vec<String>,
+    /// Publishers (hex or npub) the user approved for this install only,
+    /// without adding them to the trust list.
+    #[serde(default)]
+    trust_once: Vec<String>,
     /// Per-install values keyed by install-input id. Kept only in memory.
     #[serde(default)]
     install_values: serde_json::Map<String, serde_json::Value>,
@@ -4657,11 +6574,11 @@ async fn daemon_install(
     if params.background {
         let daemon_state = state.clone();
         let id = state.start_transaction(move |cancel| async move {
-            daemon_install_sync(&daemon_state.config, params, Some(cancel)).await
+            daemon_install_sync(&daemon_state.config(), params, Some(cancel)).await
         });
         return Ok(serde_json::json!({ "transaction_id": id }));
     }
-    daemon_install_sync(&state.config, params, None).await
+    daemon_install_sync(&state.config(), params, None).await
 }
 
 async fn daemon_install_sync(
@@ -4670,6 +6587,14 @@ async fn daemon_install_sync(
     control: Option<Arc<TransactionControl>>,
 ) -> Result<serde_json::Value> {
     let package = params.package.clone();
+    let mut config = config.clone();
+    if !config.trust.publishers.is_empty() {
+        config
+            .trust
+            .publishers
+            .extend(params.trust_once.iter().cloned());
+    }
+    let config = &config;
     let input_metadata = daemon_get_package(
         config,
         serde_json::json!({
@@ -4777,11 +6702,11 @@ async fn daemon_update(
     if params.background {
         let daemon_state = state.clone();
         let id = state.start_transaction(move |cancel| async move {
-            daemon_update_sync(&daemon_state.config, params, Some(cancel)).await
+            daemon_update_sync(&daemon_state.config(), params, Some(cancel)).await
         });
         return Ok(serde_json::json!({ "transaction_id": id }));
     }
-    daemon_update_sync(&state.config, params, None).await
+    daemon_update_sync(&state.config(), params, None).await
 }
 
 async fn daemon_update_sync(
@@ -4916,6 +6841,10 @@ struct UpdateStatus {
     reference: String,
     current_version: String,
     available_version: Option<String>,
+    /// Set when the installed release has been revoked by its publisher; the
+    /// text is the publisher's stated reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revoked: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -4938,6 +6867,18 @@ async fn daemon_check_updates(
 ) -> Result<serde_json::Value> {
     let params: CheckUpdatesParams =
         serde_json::from_value(params).context("invalid CheckUpdates params")?;
+    Ok(serde_json::to_value(
+        check_updates_core(config, params).await?,
+    )?)
+}
+
+/// Looks up the newest release of each installed package (or one package) and
+/// whether the installed release has been revoked. Silent: callers decide how
+/// to present it.
+async fn check_updates_core(
+    config: &Config,
+    params: CheckUpdatesParams,
+) -> Result<Vec<UpdateStatus>> {
     let relays = configured_relays(params.relay, config)?;
     let trusted_publishers = configured_publishers(params.trusted_publisher, config)?;
     let use_user = params.user || config.install.user;
@@ -4996,10 +6937,62 @@ async fn daemon_check_updates(
             reference: installed_package_reference(package),
             current_version: package.version.clone(),
             available_version: available,
+            revoked: None,
         });
     }
+    // Best effort: failing to read revocations must not hide the update list.
+    let revocations = fetch_revocation_events(&client, &installed).await;
     client.disconnect().await;
-    Ok(serde_json::to_value(statuses)?)
+    for (status, package) in statuses.iter_mut().zip(&installed) {
+        status.revoked = installed_revocation_reason(package, &revocations);
+    }
+    Ok(statuses)
+}
+
+/// The revocation events (kind 9901) published by the authors of the
+/// installed packages. Returns nothing rather than failing when relays can't
+/// be queried.
+async fn fetch_revocation_events(client: &Client, installed: &[InstalledPackage]) -> Vec<Event> {
+    let authors: Vec<PublicKey> = installed
+        .iter()
+        .filter_map(|package| PublicKey::parse(&package.publisher).ok())
+        .collect();
+    if authors.is_empty() {
+        return Vec::new();
+    }
+    client
+        .fetch_events(
+            Filter::new()
+                .kind(Kind::Custom(REVOCATION_KIND))
+                .authors(authors)
+                .limit(500),
+        )
+        .timeout(std::time::Duration::from_secs(10))
+        .await
+        .map(|events| events.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Why the installed release was revoked, if its publisher revoked it. A
+/// revocation counts only when it is a valid signed v1 event from the
+/// package's own publisher naming this exact name, version and artifact hash.
+fn installed_revocation_reason(
+    package: &InstalledPackage,
+    revocations: &[Event],
+) -> Option<String> {
+    revocations
+        .iter()
+        .filter(|event| {
+            event.pubkey.to_hex() == package.publisher
+                && revocation_event_is_v1(event)
+                && event.verify().is_ok()
+                && tag_value(event, "name") == Some(package.name.as_str())
+                && tag_value(event, "version") == Some(package.version.as_str())
+                && tag_value(event, "x")
+                    .is_some_and(|hash| hash.eq_ignore_ascii_case(&package.sha256))
+        })
+        .find_map(|event| tag_value(event, "reason"))
+        .map(|reason| clean_listing_text(reason, 200, false).unwrap_or_else(|| "revoked".into()))
 }
 
 fn verify_release_event(event: &Event, manifest: &Manifest) -> Result<()> {
@@ -5060,6 +7053,13 @@ fn verify_release_event(event: &Event, manifest: &Manifest) -> Result<()> {
     {
         bail!("release event metadata does not match the package manifest");
     }
+    // Events published before store-listing tags existed carry none; only an
+    // event that does carry them must agree with the manifest.
+    if event_has_app_tags(event)
+        && AppListing::from_app(&event_manifest.app) != AppListing::from_app(&manifest.app)
+    {
+        bail!("release event app listing does not match the package manifest");
+    }
     Ok(())
 }
 
@@ -5068,8 +7068,25 @@ fn release_event_is_v1(event: &Event) -> bool {
         return false;
     }
     if [
-        "d", "v", "name", "version", "os", "arch", "format", "x", "artifact", "repo", "commit",
-        "kind", "fork-of",
+        "d",
+        "v",
+        "name",
+        "version",
+        "os",
+        "arch",
+        "format",
+        "x",
+        "artifact",
+        "repo",
+        "commit",
+        "kind",
+        "fork-of",
+        "summary",
+        "description",
+        "homepage",
+        "license",
+        "release-date",
+        "icon",
     ]
     .iter()
     .any(|kind| event.tags.iter().filter(|tag| tag.kind() == *kind).count() > 1)
@@ -5216,6 +7233,7 @@ fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) ->
     for input in &manifest.app.install_inputs {
         tags.push(vec!["install-input".into(), serde_json::to_string(input)?]);
     }
+    tags.extend(AppListing::from_app(&manifest.app).tags());
     let content = format!(
         "npack release {}/{} {}",
         manifest.publisher, manifest.name, manifest.version
@@ -5229,6 +7247,85 @@ fn sign_release_event(manifest: &Manifest, secret_hex: &str, created_at: u64) ->
         .custom_created_at(Timestamp::from(created_at))
         .finalize(&keys)
         .map_err(Into::into)
+}
+
+/// Uploads `bytes` to the first Blossom server that accepts them and returns
+/// the blob's URL and SHA-256, insisting the server reports the hash we expect.
+async fn upload_to_blossom(
+    servers: &[String],
+    bytes: &[u8],
+    mime: &str,
+    keys: &Keys,
+    what: &str,
+) -> Result<(String, String)> {
+    let expected = Sha256Hash::hash(bytes);
+    let mut failures = Vec::new();
+    for server in servers {
+        let upload = tokio::time::timeout(
+            std::time::Duration::from_secs(NETWORK_TIMEOUT_SECS),
+            BlossomClient::new(Url::parse(server)?).upload_blob(
+                bytes.to_vec(),
+                Some(mime.into()),
+                None,
+                Some(keys),
+            ),
+        )
+        .await;
+        match upload {
+            Ok(Ok(candidate)) if candidate.sha256 == expected => {
+                return Ok((candidate.url.to_string(), expected.to_string()));
+            }
+            Ok(Ok(candidate)) => failures.push(format!(
+                "{server}: returned hash {} instead of {}",
+                candidate.sha256, expected
+            )),
+            Ok(Err(error)) => failures.push(format!("{server}: {error}")),
+            Err(_) => failures.push(format!("{server}: timed out")),
+        }
+    }
+    bail!(
+        "no Blossom server accepted {what}; attempts: {}",
+        failures.join("; ")
+    )
+}
+
+/// Reads one regular file out of an `.npk`, refusing anything over `max_bytes`.
+fn read_npk_file(archive_path: &Path, wanted: &Path, max_bytes: usize) -> Result<Vec<u8>> {
+    let decoder = zstd::Decoder::new(fs::File::open(archive_path)?)?;
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        if path.components().ne(wanted.components()) {
+            continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            bail!("{} is not a regular file in the package", wanted.display());
+        }
+        if entry.size() > max_bytes as u64 {
+            bail!(
+                "{} is {} bytes; the limit is {max_bytes}",
+                wanted.display(),
+                entry.size()
+            );
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes)?;
+        return Ok(bytes);
+    }
+    bail!("{} not found in the package", wanted.display())
+}
+
+async fn publish_icon(
+    archive_path: &Path,
+    icon_path: &Path,
+    servers: &[String],
+    keys: &Keys,
+) -> Result<IconBlob> {
+    let bytes = read_npk_file(archive_path, icon_path, MAX_ICON_BYTES)?;
+    let mime = icon_media_type(&bytes)?;
+    let (url, sha256) = upload_to_blossom(servers, &bytes, mime, keys, "the icon").await?;
+    Ok(IconBlob { url, sha256 })
 }
 
 async fn publish_release(
@@ -5246,44 +7343,22 @@ async fn publish_release(
     if keys.public_key() != publisher {
         bail!("publish signer does not match manifest publisher");
     }
-    let bytes = fs::read(artifact_path(&manifest, manifest_path))?;
-    let expected = Sha256Hash::hash(&bytes);
-    let mut descriptor = None;
-    let mut failures = Vec::new();
-    for server in servers {
-        let upload = tokio::time::timeout(
-            std::time::Duration::from_secs(NETWORK_TIMEOUT_SECS),
-            BlossomClient::new(Url::parse(server)?).upload_blob(
-                bytes.clone(),
-                Some("application/zstd".into()),
-                None,
-                Some(&keys),
-            ),
-        )
-        .await;
-        match upload {
-            Ok(Ok(candidate)) if candidate.sha256 == expected => {
-                descriptor = Some(candidate);
-                break;
-            }
-            Ok(Ok(candidate)) => failures.push(format!(
-                "{server}: returned hash {} instead of {}",
-                candidate.sha256, expected
-            )),
-            Ok(Err(error)) => failures.push(format!("{server}: {error}")),
-            Err(_) => failures.push(format!("{server}: timed out")),
-        }
-    }
-    let descriptor = descriptor.with_context(|| {
-        format!(
-            "no Blossom server accepted the artifact upload; attempts: {}",
-            failures.join("; ")
-        )
-    })?;
-    let artifact_event =
-        sign_artifact_event(&manifest, descriptor.url.as_ref(), bytes.len(), &keys)?;
+    let artifact_path = artifact_path(&manifest, manifest_path);
+    let bytes = fs::read(&artifact_path)?;
+    let (artifact_url, _) =
+        upload_to_blossom(servers, &bytes, "application/zstd", &keys, "the artifact").await?;
+    let artifact_event = sign_artifact_event(&manifest, &artifact_url, bytes.len(), &keys)?;
     let mut release_manifest = manifest.clone();
     release_manifest.artifact_event = Some(artifact_event.id.to_hex());
+    if let Some(icon_path) = &manifest.app.icon {
+        // The icon is also published on its own so a store can show it before
+        // the package is downloaded. A failure here costs the listing its
+        // icon, not the release, so it warns instead of aborting.
+        match publish_icon(&artifact_path, icon_path, servers, &keys).await {
+            Ok(icon) => release_manifest.app.icon_blob = Some(icon),
+            Err(error) => eprintln!("warning: release published without a store icon: {error:#}"),
+        }
+    }
     let created_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let release_event = sign_release_event(&release_manifest, secret_hex, created_at)?;
 
@@ -5534,6 +7609,238 @@ fn is_safe_relative_path(path: &Path) -> bool {
             .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
+const MAX_SUMMARY_CHARS: usize = 140;
+const MAX_DESCRIPTION_CHARS: usize = 4000;
+const MAX_LICENSE_CHARS: usize = 128;
+const MAX_CATEGORIES: usize = 8;
+const MAX_CATEGORY_CHARS: usize = 32;
+const MAX_SCREENSHOTS: usize = 6;
+const MAX_URL_CHARS: usize = 2048;
+/// Largest icon `npack publish` will upload and `GetIcon` will fetch.
+const MAX_ICON_BYTES: usize = 256 * 1024;
+
+/// An icon published as its own Blossom blob. The hash is signed with the
+/// release, so whoever fetches `url` can check the bytes before trusting them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct IconBlob {
+    url: String,
+    sha256: String,
+}
+
+fn is_http_url(value: &str) -> bool {
+    value.len() <= MAX_URL_CHARS
+        && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+        && Url::parse(value)
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+}
+
+fn is_valid_release_date(value: &str) -> bool {
+    value.len() == 10
+        && value.as_bytes()[4] == b'-'
+        && value.as_bytes()[7] == b'-'
+        && value
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| matches!(i, 4 | 7) || b.is_ascii_digit())
+}
+
+/// Cleans text a publisher (a stranger) controls before it is shown: drops
+/// control and bidirectional-override characters (newlines are kept only when
+/// `multiline`), collapses nothing else, trims, and caps the length.
+fn clean_listing_text(text: &str, max_chars: usize, multiline: bool) -> Option<String> {
+    let cleaned: String = text
+        .chars()
+        .filter(|c| {
+            (!c.is_control() || (multiline && *c == '\n'))
+                && !matches!(*c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .take(max_chars)
+        .collect();
+    let cleaned = cleaned.trim().to_owned();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// The store-listing part of a release: what a software centre shows before
+/// anything is installed. Always built through `from_app`, so every value has
+/// been cleaned and bounded no matter where it came from.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+struct AppListing {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    homepage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    license: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    categories: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    screenshots: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon: Option<IconBlob>,
+}
+
+impl AppListing {
+    fn from_app(app: &AppMetadata) -> Self {
+        Self {
+            summary: app
+                .summary
+                .as_deref()
+                .and_then(|text| clean_listing_text(text, MAX_SUMMARY_CHARS, false)),
+            description: app
+                .description
+                .as_deref()
+                .and_then(|text| clean_listing_text(text, MAX_DESCRIPTION_CHARS, true)),
+            homepage: app.homepage.clone().filter(|url| is_http_url(url)),
+            license: app
+                .license
+                .as_deref()
+                .and_then(|text| clean_listing_text(text, MAX_LICENSE_CHARS, false)),
+            categories: app
+                .categories
+                .iter()
+                .filter_map(|category| clean_listing_text(category, MAX_CATEGORY_CHARS, false))
+                .filter(|category| !category.chars().any(char::is_whitespace))
+                .take(MAX_CATEGORIES)
+                .collect(),
+            screenshots: app
+                .screenshots
+                .iter()
+                .filter(|url| is_http_url(url))
+                .take(MAX_SCREENSHOTS)
+                .cloned()
+                .collect(),
+            release_date: app
+                .release_date
+                .clone()
+                .filter(|date| is_valid_release_date(date)),
+            icon: app
+                .icon_blob
+                .clone()
+                .filter(|icon| is_http_url(&icon.url) && is_sha256_hex(&icon.sha256)),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The release-event tags carrying this listing.
+    fn tags(&self) -> Vec<Vec<String>> {
+        let mut tags = Vec::new();
+        for (name, value) in [
+            ("summary", &self.summary),
+            ("description", &self.description),
+            ("homepage", &self.homepage),
+            ("license", &self.license),
+            ("release-date", &self.release_date),
+        ] {
+            if let Some(value) = value {
+                tags.push(vec![name.to_owned(), value.clone()]);
+            }
+        }
+        for category in &self.categories {
+            tags.push(vec!["category".into(), category.clone()]);
+        }
+        for screenshot in &self.screenshots {
+            tags.push(vec!["screenshot".into(), screenshot.clone()]);
+        }
+        if let Some(icon) = &self.icon {
+            tags.push(vec!["icon".into(), icon.url.clone(), icon.sha256.clone()]);
+        }
+        tags
+    }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+const APP_LISTING_TAGS: [&str; 8] = [
+    "summary",
+    "description",
+    "homepage",
+    "license",
+    "release-date",
+    "category",
+    "screenshot",
+    "icon",
+];
+
+fn event_has_app_tags(event: &Event) -> bool {
+    event
+        .tags
+        .iter()
+        .any(|tag| APP_LISTING_TAGS.contains(&tag.kind().to_string().as_str()))
+}
+
+/// Reads the store-listing tags of a release event. Lenient by design: a
+/// malformed or oversized listing tag in someone else's event is cleaned or
+/// dropped, never an error, so it cannot make a release uninstallable.
+fn app_metadata_from_event(event: &Event) -> AppMetadata {
+    let values = |kind: &str| -> Vec<String> {
+        event
+            .tags
+            .iter()
+            .filter(|tag| tag.kind() == kind)
+            .filter_map(Tag::content)
+            .map(str::to_owned)
+            .collect()
+    };
+    let icon_blob = event
+        .tags
+        .iter()
+        .find(|tag| tag.kind() == "icon")
+        .map(|tag| tag.clone().to_vec())
+        .filter(|parts| parts.len() == 3)
+        .map(|parts| IconBlob {
+            url: parts[1].clone(),
+            sha256: parts[2].to_ascii_lowercase(),
+        });
+    let raw = AppMetadata {
+        summary: tag_value(event, "summary").map(str::to_owned),
+        description: tag_value(event, "description").map(str::to_owned),
+        homepage: tag_value(event, "homepage").map(str::to_owned),
+        license: tag_value(event, "license").map(str::to_owned),
+        categories: values("category"),
+        screenshots: values("screenshot"),
+        release_date: tag_value(event, "release-date").map(str::to_owned),
+        icon_blob,
+        ..AppMetadata::default()
+    };
+    let listing = AppListing::from_app(&raw);
+    AppMetadata {
+        summary: listing.summary,
+        description: listing.description,
+        homepage: listing.homepage,
+        license: listing.license,
+        categories: listing.categories,
+        screenshots: listing.screenshots,
+        release_date: listing.release_date,
+        icon_blob: listing.icon,
+        ..AppMetadata::default()
+    }
+}
+
+/// Identifies an icon's media type from its bytes (never from its name or a
+/// server's say-so). Only PNG and SVG are accepted.
+fn icon_media_type(bytes: &[u8]) -> Result<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Ok("image/png");
+    }
+    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(2048)]);
+    let head = text.trim_start_matches('\u{feff}').trim_start();
+    if (head.starts_with("<?xml") || head.starts_with("<svg") || head.starts_with("<!--"))
+        && text.contains("<svg")
+    {
+        return Ok("image/svg+xml");
+    }
+    bail!("icon must be a PNG or SVG image")
+}
+
 fn validate_app_metadata(app: &AppMetadata) -> Result<()> {
     validate_install_inputs(&app.install_inputs)?;
     if let Some(icon) = &app.icon
@@ -5549,32 +7856,58 @@ fn validate_app_metadata(app: &AppMetadata) -> Result<()> {
             bail!("manifest app.desktop_file must have a .desktop extension");
         }
     }
+    if let Some(summary) = &app.summary
+        && (summary.chars().count() > MAX_SUMMARY_CHARS || summary.chars().any(char::is_control))
+    {
+        bail!("manifest app.summary must be one line of at most {MAX_SUMMARY_CHARS} characters");
+    }
+    if let Some(description) = &app.description
+        && description.chars().count() > MAX_DESCRIPTION_CHARS
+    {
+        bail!("manifest app.description must be at most {MAX_DESCRIPTION_CHARS} characters");
+    }
+    if let Some(license) = &app.license
+        && (license.chars().count() > MAX_LICENSE_CHARS || license.chars().any(char::is_control))
+    {
+        bail!("manifest app.license must be one line of at most {MAX_LICENSE_CHARS} characters");
+    }
+    if app.categories.len() > MAX_CATEGORIES {
+        bail!("manifest app.categories may list at most {MAX_CATEGORIES} entries");
+    }
     for category in &app.categories {
-        if category.is_empty() || category.chars().any(char::is_whitespace) {
-            bail!("manifest app.categories entries must be non-empty and whitespace-free");
+        if category.is_empty()
+            || category
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+            || category.chars().count() > MAX_CATEGORY_CHARS
+        {
+            bail!(
+                "manifest app.categories entries must be non-empty, whitespace-free and at most {MAX_CATEGORY_CHARS} characters"
+            );
         }
     }
+    if app.screenshots.len() > MAX_SCREENSHOTS {
+        bail!("manifest app.screenshots may list at most {MAX_SCREENSHOTS} entries");
+    }
     for screenshot in &app.screenshots {
-        if Url::parse(screenshot).is_err() {
-            bail!("manifest app.screenshots entries must be valid URLs");
+        if !is_http_url(screenshot) {
+            bail!("manifest app.screenshots entries must be http(s) URLs");
         }
     }
     if let Some(homepage) = &app.homepage
-        && Url::parse(homepage).is_err()
+        && !is_http_url(homepage)
     {
-        bail!("manifest app.homepage must be a valid URL");
+        bail!("manifest app.homepage must be an http(s) URL");
     }
-    if let Some(release_date) = &app.release_date {
-        let valid = release_date.len() == 10
-            && release_date.as_bytes()[4] == b'-'
-            && release_date.as_bytes()[7] == b'-'
-            && release_date
-                .bytes()
-                .enumerate()
-                .all(|(i, b)| matches!(i, 4 | 7) || b.is_ascii_digit());
-        if !valid {
-            bail!("manifest app.release_date must be a YYYY-MM-DD date");
-        }
+    if let Some(icon) = &app.icon_blob
+        && (!is_http_url(&icon.url) || !is_sha256_hex(&icon.sha256))
+    {
+        bail!("manifest app.icon_blob must have an http(s) URL and a SHA-256");
+    }
+    if let Some(release_date) = &app.release_date
+        && !is_valid_release_date(release_date)
+    {
+        bail!("manifest app.release_date must be a YYYY-MM-DD date");
     }
     Ok(())
 }
@@ -5820,17 +8153,93 @@ fn default_store() -> PathBuf {
         .join("npack")
 }
 
+fn config_file_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("npack/config.toml"))
+}
+
 fn load_config() -> Result<Config> {
-    let Some(config_dir) = dirs::config_dir() else {
-        return Ok(Config::default());
+    load_config_from(config_file_path().as_deref())
+}
+
+/// Loads the config at `path` (or an empty one when the file or directory is
+/// missing), then fills in the built-in relays / Blossom servers for any list
+/// the user left empty.
+fn load_config_from(path: Option<&Path>) -> Result<Config> {
+    let mut config = match path {
+        Some(path) if path.exists() => {
+            let contents = fs::read_to_string(path)
+                .with_context(|| format!("reading npack config {}", path.display()))?;
+            toml::from_str(&contents)
+                .with_context(|| format!("parsing npack config {}", path.display()))?
+        }
+        _ => Config {
+            first_run: true,
+            ..Config::default()
+        },
     };
-    let path = config_dir.join("npack/config.toml");
-    if !path.exists() {
-        return Ok(Config::default());
+    config.apply_defaults();
+    Ok(config)
+}
+
+impl Config {
+    fn apply_defaults(&mut self) {
+        if self.network.relays.is_empty() {
+            self.network.relays = DEFAULT_RELAYS
+                .iter()
+                .map(|relay| (*relay).to_owned())
+                .collect();
+            self.relays_defaulted = true;
+        }
+        if self.storage.blossom.is_empty() {
+            self.storage.blossom = DEFAULT_BLOSSOM_SERVERS
+                .iter()
+                .map(|server| (*server).to_owned())
+                .collect();
+            self.blossom_defaulted = true;
+        }
     }
-    let contents = fs::read_to_string(&path)
-        .with_context(|| format!("reading npack config {}", path.display()))?;
-    toml::from_str(&contents).with_context(|| format!("parsing npack config {}", path.display()))
+}
+
+/// Read-modify-writes the config file as a generic TOML table so keys npack
+/// does not know about survive (comments do not). Refuses to touch a file
+/// that does not parse, rather than overwriting what the user wrote. The new
+/// contents are written to a sibling temp file and renamed into place.
+fn update_config_file(path: &Path, edit: impl FnOnce(&mut toml::Table)) -> Result<()> {
+    let mut table = if path.exists() {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("reading npack config {}", path.display()))?;
+        toml::from_str::<toml::Table>(&contents)
+            .with_context(|| format!("parsing npack config {}", path.display()))?
+    } else {
+        toml::Table::new()
+    };
+    edit(&mut table);
+    let rendered = toml::to_string_pretty(&table).context("serializing npack config")?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let temporary = path.with_extension("toml.tmp");
+    fs::write(&temporary, rendered).with_context(|| format!("writing {}", temporary.display()))?;
+    fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
+}
+
+fn config_modified(path: Option<&Path>) -> Option<std::time::SystemTime> {
+    fs::metadata(path?).and_then(|meta| meta.modified()).ok()
+}
+
+fn config_section<'a>(table: &'a mut toml::Table, name: &str) -> &'a mut toml::Table {
+    let entry = table
+        .entry(name.to_owned())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if !entry.is_table() {
+        *entry = toml::Value::Table(toml::Table::new());
+    }
+    entry.as_table_mut().expect("section was just made a table")
+}
+
+fn string_array(values: &[String]) -> toml::Value {
+    toml::Value::Array(values.iter().cloned().map(toml::Value::String).collect())
 }
 
 /// Merges CLI-supplied relays with `[network].relays`, normalizing and
@@ -6125,6 +8534,28 @@ fn install_with_capabilities_at(
     user: bool,
     allowed_capabilities: &[String],
 ) -> Result<InstalledPackage> {
+    install_with_history_at(
+        manifest,
+        manifest_path,
+        store,
+        prefix_override,
+        user,
+        allowed_capabilities,
+        None,
+    )
+}
+
+/// Installs a package and records the change in the store's history.
+/// `action` overrides the recorded action (a rollback is not "downgrade").
+fn install_with_history_at(
+    manifest: &Manifest,
+    manifest_path: &Path,
+    store: Option<&Path>,
+    prefix_override: Option<&Path>,
+    user: bool,
+    allowed_capabilities: &[String],
+    action: Option<&str>,
+) -> Result<InstalledPackage> {
     ensure_installable_kind(manifest)?;
     let (root, default_prefix) = install_paths(store, user);
     let prefix = prefix_override.unwrap_or(&default_prefix);
@@ -6140,6 +8571,14 @@ fn install_with_capabilities_at(
         &format!("{}/{}", manifest.publisher, manifest.name),
         &package_dir,
     )?;
+    // Read under the store lock so the "from" version cannot be stale.
+    let previous = installed_packages(Some(&root))?
+        .into_iter()
+        .find(|package| package.publisher == manifest.publisher && package.name == manifest.name)
+        .map(|package| HistoryVersion {
+            version: package.version,
+            sha256: package.sha256,
+        });
     let installed = install_locked(
         manifest,
         manifest_path,
@@ -6150,6 +8589,23 @@ fn install_with_capabilities_at(
         allowed_capabilities,
     )?;
     transaction.commit()?;
+    let to = HistoryVersion {
+        version: installed.version.clone(),
+        sha256: installed.sha256.clone(),
+    };
+    append_history(
+        &root,
+        &HistoryEntry {
+            at: now_unix(),
+            action: action
+                .unwrap_or_else(|| history_action(previous.as_ref(), &to))
+                .to_owned(),
+            publisher: installed.publisher.clone(),
+            name: installed.name.clone(),
+            from: previous,
+            to: Some(to),
+        },
+    );
     Ok(installed)
 }
 
@@ -6867,8 +9323,29 @@ fn remove_package_at(package: &str, store: Option<&Path>, user: bool) -> Result<
     let root = install_paths(store, user).0;
     let transaction =
         StoreTransaction::begin(&root, "remove", &format!("{publisher}/{name}"), &root)?;
+    let before: Vec<HistoryVersion> = installed_packages(Some(&root))?
+        .into_iter()
+        .filter(|installed| installed.publisher == publisher && installed.name == name)
+        .map(|installed| HistoryVersion {
+            version: installed.version,
+            sha256: installed.sha256,
+        })
+        .collect();
     let removed = remove_locked(&publisher, name, package, &root)?;
     transaction.commit()?;
+    for version in before {
+        append_history(
+            &root,
+            &HistoryEntry {
+                at: now_unix(),
+                action: "remove".into(),
+                publisher: publisher.clone(),
+                name: name.to_owned(),
+                from: Some(version),
+                to: None,
+            },
+        );
+    }
     println!("removed {package} ({removed} version(s))");
     Ok(())
 }
@@ -6963,6 +9440,1086 @@ fn remove_locked(publisher: &str, name: &str, package: &str, root: &Path) -> Res
         serde_json::to_vec_pretty(&remaining)?,
     )?;
     Ok(removed)
+}
+
+// ---------------------------------------------------------------------------
+// npack doctor
+//
+// Diagnoses a setup without changing it. Each check is a small function that
+// takes what it needs and returns `Finding`s, so it can be tested on its own;
+// `doctor_command` only gathers inputs, runs them and prints the result.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Level {
+    Ok,
+    /// Worth knowing, nothing to fix.
+    Info,
+    /// Something is off but npack still works.
+    Warn,
+    /// npack cannot do its job until this is fixed.
+    Fail,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Finding {
+    level: Level,
+    area: &'static str,
+    title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    /// What to do about it, in words a person can act on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fix: Option<String>,
+}
+
+impl Finding {
+    fn new(level: Level, area: &'static str, title: impl Into<String>) -> Self {
+        Self {
+            level,
+            area,
+            title: title.into(),
+            detail: None,
+            fix: None,
+        }
+    }
+
+    fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    fn fix(mut self, fix: impl Into<String>) -> Self {
+        self.fix = Some(fix.into());
+        self
+    }
+}
+
+fn doctor_has_failures(findings: &[Finding]) -> bool {
+    findings.iter().any(|finding| finding.level == Level::Fail)
+}
+
+/// Config file and trust list. Returns the config the other checks should use.
+fn doctor_config(path: Option<&Path>) -> (Vec<Finding>, Config) {
+    let mut findings = Vec::new();
+    let config = match load_config_from(path) {
+        Ok(config) => config,
+        Err(error) => {
+            findings.push(
+                Finding::new(Level::Fail, "Config", "The config file can't be read")
+                    .detail(format!("{error:#}"))
+                    .fix("Fix the TOML syntax in the file above, or move it aside to start fresh."),
+            );
+            let mut fallback = Config::default();
+            fallback.apply_defaults();
+            return (findings, fallback);
+        }
+    };
+    let shown = path.map_or_else(
+        || "(no config directory)".to_owned(),
+        |p| p.display().to_string(),
+    );
+    if config.first_run {
+        findings.push(
+            Finding::new(
+                Level::Info,
+                "Config",
+                "No config file yet, so built-in settings are in use",
+            )
+            .detail(format!(
+                "It will be created at {shown} when you change a setting."
+            )),
+        );
+    } else {
+        findings.push(Finding::new(Level::Ok, "Config", "Config file is valid").detail(shown));
+    }
+    if config.relays_defaulted && !config.first_run {
+        findings.push(
+            Finding::new(Level::Info, "Config", "Using the built-in relays")
+                .detail("[network].relays is empty. Add your own to change them."),
+        );
+    }
+    if config.blossom_defaulted && !config.first_run {
+        findings.push(
+            Finding::new(Level::Info, "Config", "Using the built-in download servers")
+                .detail("[storage].blossom is empty. Add your own to change them."),
+        );
+    }
+    let bad: Vec<&String> = config
+        .trust
+        .publishers
+        .iter()
+        .filter(|entry| PublicKey::parse(entry).is_err())
+        .collect();
+    if !bad.is_empty() {
+        findings.push(
+            Finding::new(
+                Level::Fail,
+                "Trust",
+                format!("{} trusted publisher entr{} can't be understood", bad.len(), if bad.len() == 1 { "y" } else { "ies" }),
+            )
+            .detail(bad.iter().map(|b| b.as_str()).collect::<Vec<_>>().join(", "))
+            .fix("Each entry must be an npub or a 64-character hex key. Remove it with `npack trust remove`, or fix the file."),
+        );
+    } else if config.trust.publishers.is_empty() {
+        findings.push(
+            Finding::new(Level::Info, "Trust", "No publishers are trusted yet")
+                .detail("The command line accepts any publisher until you trust one; the GUI asks before installing from anyone new.")
+                .fix("Trust a publisher with `npack trust add <name@domain|npub>`."),
+        );
+    } else {
+        findings.push(Finding::new(
+            Level::Ok,
+            "Trust",
+            format!("{} trusted publisher(s)", config.trust.publishers.len()),
+        ));
+    }
+    (findings, config)
+}
+
+/// The package store: permissions, locks, `installed.json` and the files and
+/// archives it describes. Read-only apart from a tiny temporary file used to
+/// test that the directory is writable.
+fn doctor_store(root: &Path) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    if !root.exists() {
+        findings.push(
+            Finding::new(Level::Info, "Store", "Nothing has been installed yet").detail(format!(
+                "The store at {} is created by the first install.",
+                root.display()
+            )),
+        );
+        return findings;
+    }
+    let probe = root.join(format!(".npack-doctor-{}", std::process::id()));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            findings.push(
+                Finding::new(Level::Ok, "Store", "The package store is writable")
+                    .detail(root.display().to_string()),
+            );
+        }
+        Err(error) => findings.push(
+            Finding::new(Level::Fail, "Store", "The package store isn't writable")
+                .detail(format!("{}: {error}", root.display()))
+                .fix("Check the folder's permissions, or use `--user` to work in your own folder."),
+        ),
+    }
+    match fs::read_to_string(store_lock_path(root)) {
+        Ok(contents) => {
+            let pid: u32 = contents.trim().parse().unwrap_or(0);
+            if pid != 0 && process_is_alive(pid) {
+                findings.push(Finding::new(
+                    Level::Info,
+                    "Store",
+                    format!("An npack operation is running (pid {pid})"),
+                ));
+            } else {
+                findings.push(
+                    Finding::new(Level::Warn, "Store", "An earlier npack operation was interrupted")
+                        .detail(format!("Its lock (pid {pid}) is stale."))
+                        .fix("Nothing to do: the next install or remove undoes the half-finished change by itself."),
+                );
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if transaction_journal_path(root).exists() {
+                findings.push(
+                    Finding::new(Level::Warn, "Store", "A transaction record was left behind")
+                        .fix("The next install or remove cleans it up."),
+                );
+            }
+        }
+        Err(_) => {}
+    }
+    let installed_path = root.join("installed.json");
+    match fs::read(&installed_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            findings.push(Finding::new(Level::Info, "Packages", "No packages are installed"));
+        }
+        Err(error) => findings.push(
+            Finding::new(Level::Fail, "Packages", "The list of installed packages can't be read")
+                .detail(format!("{}: {error}", installed_path.display())),
+        ),
+        Ok(bytes) => match serde_json::from_slice::<Vec<InstalledPackage>>(&bytes) {
+            Err(error) => findings.push(
+                Finding::new(Level::Fail, "Packages", "The list of installed packages is damaged")
+                    .detail(format!("{}: {error}", installed_path.display()))
+                    .fix("Restore it from a backup. Package files are untouched, so reinstalling the packages repairs this."),
+            ),
+            Ok(packages) => findings.extend(doctor_installed(&packages)),
+        },
+    }
+    findings
+}
+
+/// Checks every installed package's archive hash and file list, reporting all
+/// problems (unlike `verify-installed`, which stops at the first).
+fn doctor_installed(packages: &[InstalledPackage]) -> Vec<Finding> {
+    let mut problems = Vec::new();
+    for package in packages {
+        let name = format!(
+            "{}/{} {}",
+            display_publisher(&package.publisher),
+            package.name,
+            package.version
+        );
+        match hash_file(&package.artifact) {
+            Ok(hash) if hash.eq_ignore_ascii_case(&package.sha256) => {}
+            Ok(_) => problems.push(format!(
+                "{name}: the stored archive no longer matches its recorded hash"
+            )),
+            Err(_) => problems.push(format!("{name}: the stored archive is missing")),
+        }
+        let missing = package
+            .files
+            .iter()
+            .filter(|file| fs::symlink_metadata(file).is_err())
+            .count();
+        if missing > 0 {
+            problems.push(format!("{name}: {missing} installed file(s) are missing"));
+        }
+    }
+    if packages.is_empty() {
+        return vec![Finding::new(
+            Level::Info,
+            "Packages",
+            "No packages are installed",
+        )];
+    }
+    if problems.is_empty() {
+        return vec![Finding::new(
+            Level::Ok,
+            "Packages",
+            format!("{} installed package(s) are intact", packages.len()),
+        )];
+    }
+    let shown = problems.iter().take(5).cloned().collect::<Vec<_>>();
+    let more = problems.len().saturating_sub(5);
+    let mut detail = shown.join("\n");
+    if more > 0 {
+        detail.push_str(&format!("\nand {more} more"));
+    }
+    vec![
+        Finding::new(
+            Level::Warn,
+            "Packages",
+            format!("{} installed package problem(s) found", problems.len()),
+        )
+        .detail(detail)
+        .fix("Reinstall the affected packages with `npack update <package>`, or remove them."),
+    ]
+}
+
+/// The local catalogue: present, readable, and not stale.
+fn doctor_catalogue(root: &Path, now: u64) -> Vec<Finding> {
+    match load_catalogue(root) {
+        Ok(None) => vec![
+            Finding::new(
+                Level::Info,
+                "Catalogue",
+                "The software catalogue hasn't been downloaded yet",
+            )
+            .fix("Run `npack refresh`. The GUI does this automatically the first time you browse."),
+        ],
+        Err(error) => vec![
+            Finding::new(
+                Level::Warn,
+                "Catalogue",
+                "The local catalogue can't be read",
+            )
+            .detail(format!("{error:#}"))
+            .fix("Run `npack refresh` to rebuild it."),
+        ],
+        Ok(Some(catalogue)) => {
+            let days = now.saturating_sub(catalogue.created_at) / 86_400;
+            let title = format!(
+                "The catalogue lists {} release(s) and is {days} day(s) old",
+                catalogue.releases.len()
+            );
+            if days >= 7 {
+                vec![
+                    Finding::new(Level::Warn, "Catalogue", title)
+                        .fix("Run `npack refresh` to pick up new software."),
+                ]
+            } else {
+                vec![Finding::new(Level::Ok, "Catalogue", title)]
+            }
+        }
+    }
+}
+
+/// Finds an executable on `path` (a `PATH`-style string) without running it.
+fn find_in_path(name: &str, path: &str) -> Option<PathBuf> {
+    path.split(':')
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| Path::new(dir).join(name))
+        .find(|candidate| {
+            fs::metadata(candidate)
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+}
+
+/// Optional helpers some features rely on, and whether the daily update check
+/// is set up.
+fn doctor_tools(path: &str, home: Option<&Path>) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    if find_in_path("notify-send", path).is_some() {
+        findings.push(Finding::new(
+            Level::Ok,
+            "Tools",
+            "Desktop notifications are available (notify-send)",
+        ));
+    } else {
+        findings.push(
+            Finding::new(
+                Level::Info,
+                "Tools",
+                "notify-send isn't installed, so update notifications can't be shown",
+            )
+            .fix("Install libnotify (libnotify-bin on Debian and Ubuntu) if you want them."),
+        );
+    }
+    if find_in_path("pkcheck", path).is_some() {
+        findings.push(Finding::new(
+            Level::Ok,
+            "Tools",
+            "PolicyKit is available (pkcheck)",
+        ));
+    } else {
+        findings.push(
+            Finding::new(Level::Info, "Tools", "PolicyKit (pkcheck) isn't installed")
+                .detail("Only the system-wide service needs it, to ask for an administrator's password.")
+                .fix("Install polkit if you plan to run `npack daemon --system`."),
+        );
+    }
+    let timer = home.map(|home| home.join(".config/systemd/user/npack-update-check.timer"));
+    if timer.as_deref().is_some_and(Path::exists) {
+        findings.push(Finding::new(
+            Level::Ok,
+            "Tools",
+            "The daily update check is installed",
+        ));
+    } else {
+        findings.push(
+            Finding::new(Level::Info, "Tools", "The daily update check isn't set up")
+                .fix("Copy packaging/npack-update-check.{service,timer} to ~/.config/systemd/user/ and run `systemctl --user enable --now npack-update-check.timer`."),
+        );
+    }
+    findings
+}
+
+/// Whether a local npackd answers on `socket`. It is optional, so "not
+/// running" is information, not a problem.
+fn doctor_daemon(label: &str, socket: &Path) -> Finding {
+    use std::io::{BufRead, BufReader};
+    let area = "Service";
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) else {
+        return Finding::new(
+            Level::Info,
+            area,
+            format!("The {label} service isn't running"),
+        )
+        .detail("It's optional: the command line works without it, and the GUI needs it.")
+        .fix(if label == "user" {
+            "Start it with `npack daemon`."
+        } else {
+            "Start it with `systemctl start npackd-system` or `sudo npack daemon --system`."
+        });
+    };
+    let timeout = Some(std::time::Duration::from_secs(3));
+    let _ = stream.set_read_timeout(timeout);
+    let _ = stream.set_write_timeout(timeout);
+    if stream
+        .write_all(b"{\"id\":1,\"method\":\"GetConfig\",\"params\":{}}\n")
+        .is_err()
+    {
+        return Finding::new(
+            Level::Warn,
+            area,
+            format!("The {label} service didn't accept a request"),
+        );
+    }
+    let mut line = String::new();
+    if BufReader::new(stream).read_line(&mut line).is_err() || line.is_empty() {
+        return Finding::new(
+            Level::Warn,
+            area,
+            format!("The {label} service didn't answer"),
+        )
+        .fix("Restart it.");
+    }
+    match serde_json::from_str::<serde_json::Value>(&line) {
+        Ok(reply) if reply.get("error_code").and_then(|c| c.as_str()) == Some("unknown_method") => {
+            Finding::new(
+                Level::Warn,
+                area,
+                format!("The {label} service is older than this npack"),
+            )
+            .fix("Restart it so it runs the installed version.")
+        }
+        Ok(_) => Finding::new(Level::Ok, area, format!("The {label} service is running"))
+            .detail(socket.display().to_string()),
+        Err(_) => Finding::new(
+            Level::Warn,
+            area,
+            format!("The {label} service sent a reply that wasn't understood"),
+        ),
+    }
+}
+
+const DOCTOR_NETWORK_SECS: u64 = 8;
+
+/// Whether a relay accepts a WebSocket connection, and how long that took.
+async fn doctor_relay(url: &str, wait: std::time::Duration) -> Finding {
+    let started = std::time::Instant::now();
+    let client = Client::default();
+    let outcome = async {
+        client.add_relay(url).await.map_err(|e| e.to_string())?;
+        client.connect().await;
+        let relay = client
+            .relay(url)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "the relay address wasn't accepted".to_owned())?;
+        while started.elapsed() < wait {
+            if relay.status() == RelayStatus::Connected {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Err(format!(
+            "no connection within {} seconds",
+            wait.as_secs().max(1)
+        ))
+    }
+    .await;
+    client.disconnect().await;
+    match outcome {
+        Ok(()) => Finding::new(
+            Level::Ok,
+            "Relays",
+            format!("{url} answered in {} ms", started.elapsed().as_millis()),
+        ),
+        Err(error) => {
+            Finding::new(Level::Warn, "Relays", format!("{url} didn't answer")).detail(error)
+        }
+    }
+}
+
+/// Whether a download server answers at all. Blossom servers often return 404
+/// for `/`, which still proves the server is up.
+async fn doctor_blossom(url: &str, wait: std::time::Duration) -> Finding {
+    let started = std::time::Instant::now();
+    let client = match reqwest::Client::builder().timeout(wait).build() {
+        Ok(client) => client,
+        Err(error) => {
+            return Finding::new(
+                Level::Warn,
+                "Downloads",
+                format!("{url} couldn't be checked"),
+            )
+            .detail(error.to_string());
+        }
+    };
+    match client.get(url).send().await {
+        Ok(response) => Finding::new(
+            Level::Ok,
+            "Downloads",
+            format!(
+                "{url} answered in {} ms (HTTP {})",
+                started.elapsed().as_millis(),
+                response.status().as_u16()
+            ),
+        ),
+        Err(error) => Finding::new(Level::Warn, "Downloads", format!("{url} didn't answer"))
+            .detail(error.to_string()),
+    }
+}
+
+/// Checks every relay and download server at once, then says what the results
+/// mean together: one dead relay is a warning, no working relay is a failure.
+async fn doctor_network(
+    relays: &[String],
+    servers: &[String],
+    wait: std::time::Duration,
+) -> Vec<Finding> {
+    let (relay_findings, server_findings) = tokio::join!(
+        futures_util::future::join_all(relays.iter().map(|relay| doctor_relay(relay, wait))),
+        futures_util::future::join_all(servers.iter().map(|server| doctor_blossom(server, wait))),
+    );
+    let mut findings = relay_findings.clone();
+    if !relays.is_empty() && relay_findings.iter().all(|f| f.level != Level::Ok) {
+        findings.push(
+            Finding::new(
+                Level::Fail,
+                "Relays",
+                "No relay is reachable, so browsing and installing won't work",
+            )
+            .fix("Check your internet connection, then your relay list in Settings or [network].relays."),
+        );
+    }
+    findings.extend(server_findings.clone());
+    if !servers.is_empty() && server_findings.iter().all(|f| f.level != Level::Ok) {
+        findings.push(
+            Finding::new(Level::Warn, "Downloads", "No download server is reachable")
+                .detail("Packages can still be fetched from the addresses their publishers list.")
+                .fix("Check your internet connection, then [storage].blossom."),
+        );
+    }
+    findings
+}
+
+/// The report as text, grouped by area in the order each first appears.
+fn render_doctor_report(findings: &[Finding]) -> String {
+    let mut areas: Vec<&'static str> = Vec::new();
+    for finding in findings {
+        if !areas.contains(&finding.area) {
+            areas.push(finding.area);
+        }
+    }
+    let mut out = String::new();
+    for area in areas {
+        out.push_str(&format!("\n{area}\n"));
+        for finding in findings.iter().filter(|f| f.area == area) {
+            let mark = match finding.level {
+                Level::Ok => green("✓"),
+                Level::Info => "·".to_owned(),
+                Level::Warn => yellow("!"),
+                Level::Fail => red("✗"),
+            };
+            out.push_str(&format!("  {mark} {}\n", finding.title));
+            for line in finding.detail.iter().flat_map(|d| d.lines()) {
+                out.push_str(&format!("      {line}\n"));
+            }
+            if let Some(fix) = &finding.fix {
+                out.push_str(&format!("      → {fix}\n"));
+            }
+        }
+    }
+    let count = |level| findings.iter().filter(|f| f.level == level).count();
+    let (failures, warnings) = (count(Level::Fail), count(Level::Warn));
+    out.push('\n');
+    out.push_str(&match (failures, warnings) {
+        (0, 0) => green("Everything looks good."),
+        (0, w) => format!("{} {w} warning(s) to look at.", green("npack is working.")),
+        (f, 0) => format!(
+            "{} {f} problem(s) stop npack working.",
+            red("Needs attention:")
+        ),
+        (f, w) => format!(
+            "{} {f} problem(s) stop npack working, plus {w} warning(s).",
+            red("Needs attention:")
+        ),
+    });
+    out.push('\n');
+    out
+}
+
+/// Everything a doctor run needs to know, so the CLI and the daemon share the
+/// same checks and tests can point them at temporary directories.
+#[derive(Debug, Clone)]
+struct DoctorPlan {
+    config_path: Option<PathBuf>,
+    package_root: PathBuf,
+    catalogue_root: PathBuf,
+    offline: bool,
+    /// Probe the local service sockets. The daemon turns this off: a service
+    /// asking itself whether it is running proves nothing (and would have to
+    /// wait on its own socket).
+    probe_service: bool,
+    path_env: String,
+    home: Option<PathBuf>,
+    wait: std::time::Duration,
+}
+
+impl DoctorPlan {
+    fn new(store: Option<&Path>, user: bool, offline: bool, probe_service: bool) -> Self {
+        Self {
+            config_path: config_file_path(),
+            package_root: install_paths(store, user).0,
+            catalogue_root: store.map_or_else(default_store, Path::to_path_buf),
+            offline,
+            probe_service,
+            path_env: std::env::var("PATH").unwrap_or_default(),
+            home: dirs::home_dir(),
+            wait: std::time::Duration::from_secs(DOCTOR_NETWORK_SECS),
+        }
+    }
+}
+
+/// The checks that only touch the local machine. Synchronous (it hashes
+/// installed archives), so callers on an async runtime run it on a blocking
+/// thread.
+fn doctor_local(plan: &DoctorPlan) -> (Vec<Finding>, Config) {
+    let (mut findings, config) = doctor_config(plan.config_path.as_deref());
+    findings.extend(doctor_store(&plan.package_root));
+    findings.extend(doctor_catalogue(&plan.catalogue_root, now_unix()));
+    if plan.probe_service {
+        findings.push(doctor_daemon(
+            "user",
+            &daemon_socket_path(None, DaemonRole::User),
+        ));
+        let system_socket = daemon_socket_path(None, DaemonRole::System);
+        if system_socket.exists() {
+            findings.push(doctor_daemon("system", &system_socket));
+        }
+    } else {
+        findings.push(Finding::new(
+            Level::Ok,
+            "Service",
+            "This service is running",
+        ));
+    }
+    findings.extend(doctor_tools(&plan.path_env, plan.home.as_deref()));
+    (findings, config)
+}
+
+/// Runs every check and returns the findings in report order.
+async fn doctor_findings(plan: DoctorPlan) -> Vec<Finding> {
+    let local_plan = plan.clone();
+    let (mut findings, config) = tokio::task::spawn_blocking(move || doctor_local(&local_plan))
+        .await
+        .unwrap_or_else(|error| {
+            (
+                vec![
+                    Finding::new(Level::Warn, "Config", "A local check stopped unexpectedly")
+                        .detail(error.to_string()),
+                ],
+                Config::default(),
+            )
+        });
+    if plan.offline {
+        findings.push(Finding::new(
+            Level::Info,
+            "Network",
+            "Skipped the relay and download checks (--offline)",
+        ));
+    } else {
+        findings.extend(
+            doctor_network(&config.network.relays, &config.storage.blossom, plan.wait).await,
+        );
+    }
+    findings
+}
+
+/// `npack doctor`. Returns false if anything that stops npack working was found.
+async fn doctor_command(
+    store: Option<&Path>,
+    user: bool,
+    offline: bool,
+    json: bool,
+) -> Result<bool> {
+    let findings = doctor_findings(DoctorPlan::new(store, user, offline, true)).await;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&findings)?);
+    } else {
+        print!("npack doctor\n{}", render_doctor_report(&findings));
+    }
+    Ok(!doctor_has_failures(&findings))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RunDoctorParams {
+    /// Skip the relay and download-server checks.
+    #[serde(default)]
+    offline: bool,
+    #[serde(default)]
+    user: bool,
+    #[serde(default)]
+    store: Option<PathBuf>,
+}
+
+/// How long a finished health check is reused. Only enough to absorb a burst of
+/// identical requests; a person pressing "Check again" a few seconds after
+/// fixing something gets fresh results.
+const DOCTOR_CACHE_SECS: u64 = 3;
+
+/// `RunDoctor`: the same checks as `npack doctor`, as structured findings.
+/// Read-only and open to any local user, so runs are serialised (one at a time)
+/// and a burst of identical requests shares one result.
+async fn daemon_run_doctor(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: RunDoctorParams =
+        serde_json::from_value(params).context("invalid RunDoctor params")?;
+    let config = state.config();
+    let user = params.user || config.install.user;
+    let key = (params.offline, user, params.store.clone());
+    let _one_at_a_time = state.doctor_gate.lock().await;
+    let reusable = state.doctor_cache.lock().ok().and_then(|cache| {
+        cache
+            .as_ref()
+            .filter(|(at, cached_key, _)| {
+                at.elapsed() < std::time::Duration::from_secs(DOCTOR_CACHE_SECS)
+                    && *cached_key == key
+            })
+            .map(|(_, _, findings)| findings.clone())
+    });
+    let findings = match reusable {
+        Some(findings) => findings,
+        None => {
+            let mut plan = DoctorPlan::new(params.store.as_deref(), user, params.offline, false);
+            plan.config_path = state.config_path.clone();
+            let findings = doctor_findings(plan).await;
+            if let Ok(mut cache) = state.doctor_cache.lock() {
+                *cache = Some((std::time::Instant::now(), key, findings.clone()));
+            }
+            findings
+        }
+    };
+    Ok(serde_json::json!({
+        "healthy": !doctor_has_failures(&findings),
+        "findings": findings,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// History and rollback
+//
+// Every install, upgrade, downgrade, rollback and removal appends one line to
+// `<store>/history.jsonl`. Upgrades leave the old version's archive in its own
+// directory and the signed release event for every resolved version is cached,
+// so rolling back is an ordinary install of the stored archive, re-checked
+// against both its recorded hash and the cached signed metadata, with no
+// network and no separate "restore files" mechanism to go wrong.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HistoryVersion {
+    version: String,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HistoryEntry {
+    /// Unix seconds.
+    at: u64,
+    /// `install`, `upgrade`, `downgrade`, `reinstall`, `rollback` or `remove`.
+    action: String,
+    publisher: String,
+    name: String,
+    #[serde(default)]
+    from: Option<HistoryVersion>,
+    #[serde(default)]
+    to: Option<HistoryVersion>,
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+fn history_path(root: &Path) -> PathBuf {
+    root.join("history.jsonl")
+}
+
+/// Appends one entry. History is a convenience record: failing to write it
+/// warns but never fails (or undoes) the install or removal that succeeded.
+fn append_history(root: &Path, entry: &HistoryEntry) {
+    let write = || -> Result<()> {
+        fs::create_dir_all(root)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(history_path(root))?;
+        let mut line = serde_json::to_string(entry)?;
+        line.push('\n');
+        file.write_all(line.as_bytes())?;
+        Ok(())
+    };
+    if let Err(error) = write() {
+        eprintln!("warning: could not record history: {error:#}");
+    }
+}
+
+/// All entries, oldest first. Lines that do not parse are skipped.
+fn load_history(root: &Path) -> Vec<HistoryEntry> {
+    fs::read_to_string(history_path(root))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+fn history_action(previous: Option<&HistoryVersion>, new: &HistoryVersion) -> &'static str {
+    let Some(previous) = previous else {
+        return "install";
+    };
+    match (
+        Version::parse(&previous.version),
+        Version::parse(&new.version),
+    ) {
+        (Ok(old), Ok(new_version)) if new_version > old => "upgrade",
+        (Ok(old), Ok(new_version)) if new_version < old => "downgrade",
+        _ => "reinstall",
+    }
+}
+
+/// The version `installed` replaced, according to history: the `from` of the
+/// newest entry that produced exactly this version and archive. After a
+/// rollback this is the version rolled back from, so running it again
+/// switches forward.
+fn rollback_target(
+    history: &[HistoryEntry],
+    installed: &InstalledPackage,
+) -> Option<HistoryVersion> {
+    history
+        .iter()
+        .rev()
+        .find(|entry| {
+            entry.publisher == installed.publisher
+                && entry.name == installed.name
+                && entry.to.as_ref().is_some_and(|to| {
+                    to.version == installed.version
+                        && to.sha256.eq_ignore_ascii_case(&installed.sha256)
+                })
+        })
+        .and_then(|entry| entry.from.clone())
+}
+
+/// `YYYY-MM-DD HH:MM` in UTC.
+fn format_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let remainder = secs % 86_400;
+    let (hour, minute) = (remainder / 3600, (remainder % 3600) / 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
+}
+
+fn split_package_reference(package: &str) -> Result<(String, String)> {
+    let (publisher, name) = package
+        .split_once('/')
+        .context("package reference must be publisher/name")?;
+    let publisher = normalize_publisher_reference(publisher);
+    if publisher.is_empty() || name.is_empty() || publisher.contains('/') || name.contains('/') {
+        bail!("package reference must be publisher/name");
+    }
+    Ok((publisher, name.to_owned()))
+}
+
+fn history_command(
+    package: Option<&str>,
+    limit: usize,
+    store: Option<&Path>,
+    user: bool,
+) -> Result<()> {
+    let root = install_paths(store, user).0;
+    let filter = package.map(split_package_reference).transpose()?;
+    let entries: Vec<HistoryEntry> = load_history(&root)
+        .into_iter()
+        .rev()
+        .filter(|entry| {
+            filter.as_ref().is_none_or(|(publisher, name)| {
+                &entry.publisher == publisher && &entry.name == name
+            })
+        })
+        .take(limit)
+        .collect();
+    if entries.is_empty() {
+        println!("No history recorded.");
+        return Ok(());
+    }
+    for entry in entries {
+        let change = match (&entry.from, &entry.to) {
+            (Some(from), Some(to)) => format!("{} -> {}", from.version, to.version),
+            (None, Some(to)) => to.version.clone(),
+            (Some(from), None) => from.version.clone(),
+            (None, None) => String::new(),
+        };
+        println!(
+            "{}  {:<9} {}/{} {change}",
+            format_utc(entry.at),
+            entry.action,
+            display_publisher(&entry.publisher),
+            entry.name
+        );
+    }
+    Ok(())
+}
+
+/// Everything needed to switch an installed package back, already verified.
+struct RollbackPlan {
+    current: HistoryVersion,
+    target: HistoryVersion,
+    artifact: PathBuf,
+    release: Event,
+}
+
+/// Works out, without changing anything, whether `installed` can be switched
+/// back and to what: history names the target; its stored archive must still
+/// hash to the recorded value; and the signed release event cached when it was
+/// first installed must be present and valid.
+fn plan_rollback(root: &Path, installed: &InstalledPackage) -> Result<RollbackPlan> {
+    let reference = format!(
+        "{}/{}",
+        display_publisher(&installed.publisher),
+        installed.name
+    );
+    let target = rollback_target(&load_history(root), installed).with_context(|| {
+        format!("no earlier version of {reference} is recorded to roll back to")
+    })?;
+    let directory = root
+        .join("packages")
+        .join(&installed.publisher)
+        .join(&installed.name)
+        .join(&target.version);
+    // The archive is stored under whatever name the download had, so find it
+    // by what it is: a file in the version's directory with the recorded hash.
+    let files: Vec<PathBuf> = fs::read_dir(&directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect();
+    if files.is_empty() {
+        bail!(
+            "the stored archive for {reference} {} is gone ({} has no archive)",
+            target.version,
+            directory.display()
+        );
+    }
+    let artifact = files
+        .into_iter()
+        .find(|path| hash_file(path).is_ok_and(|hash| hash.eq_ignore_ascii_case(&target.sha256)))
+        .with_context(|| {
+            format!(
+                "the stored archive for {reference} {} no longer matches its recorded SHA-256; refusing to roll back",
+                target.version
+            )
+        })?;
+    let release = load_cached_release(
+        root,
+        &LockedPackage {
+            publisher: installed.publisher.clone(),
+            name: installed.name.clone(),
+            version: target.version.clone(),
+            sha256: target.sha256.to_ascii_lowercase(),
+            dependencies: Vec::new(),
+            conflicts: Vec::new(),
+            runtime_requires: Vec::new(),
+            provides: Vec::new(),
+        },
+    )
+    .with_context(|| {
+        format!(
+            "the signed release metadata for {reference} {} was not cached, so it cannot be verified offline",
+            target.version
+        )
+    })?;
+    Ok(RollbackPlan {
+        current: HistoryVersion {
+            version: installed.version.clone(),
+            sha256: installed.sha256.clone(),
+        },
+        target,
+        artifact,
+        release,
+    })
+}
+
+/// The installed packages that can currently be switched back, with the
+/// version each would switch to.
+fn available_rollbacks(root: &Path) -> Result<Vec<(InstalledPackage, HistoryVersion)>> {
+    Ok(installed_packages(Some(root))?
+        .into_iter()
+        .filter_map(|installed| {
+            let plan = plan_rollback(root, &installed).ok()?;
+            Some((installed, plan.target))
+        })
+        .collect())
+}
+
+/// Switches `package` back to the version it replaced. Returns (from, to).
+fn rollback_package_at(
+    package: &str,
+    store: Option<&Path>,
+    user: bool,
+    allowed_capabilities: &[String],
+) -> Result<(HistoryVersion, HistoryVersion)> {
+    let (publisher, name) = split_package_reference(package)?;
+    let root = install_paths(store, user).0;
+    let installed = installed_packages(Some(&root))?;
+    let current = installed
+        .iter()
+        .find(|candidate| candidate.publisher == publisher && candidate.name == name)
+        .with_context(|| format!("package {package} is not installed"))?;
+    let plan = plan_rollback(&root, current)?;
+    let target_version = Version::parse(&plan.target.version)
+        .with_context(|| format!("recorded version {} is not SemVer", plan.target.version))?;
+    // Never break something that depends on the version being left behind.
+    for other in &installed {
+        for dependency in &other.dependencies {
+            if dependency.name == name
+                && dependency
+                    .publisher
+                    .as_deref()
+                    .is_none_or(|dependency_publisher| dependency_publisher == publisher)
+                && VersionReq::parse(&dependency.requirement)
+                    .is_ok_and(|requirement| !requirement.matches(&target_version))
+            {
+                bail!(
+                    "cannot roll back {package} to {}: {}/{} requires {}",
+                    plan.target.version,
+                    display_publisher(&other.publisher),
+                    other.name,
+                    dependency.requirement
+                );
+            }
+        }
+    }
+    // Install from a private copy: the normal install path copies the archive
+    // into the package directory, which here is where it already lives.
+    let staging = root
+        .join("rollback-staging")
+        .join(std::process::id().to_string());
+    fs::create_dir_all(&staging)?;
+    let result = (|| -> Result<()> {
+        let staged = staging.join(
+            plan.artifact
+                .file_name()
+                .context("archive has no filename")?,
+        );
+        fs::copy(&plan.artifact, &staged)?;
+        let manifest = manifest_from_release(&plan.release, &staged, &plan.target.sha256)?;
+        install_with_history_at(
+            &manifest,
+            &staging.join("manifest.json"),
+            store,
+            None,
+            user,
+            allowed_capabilities,
+            Some("rollback"),
+        )?;
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(&staging);
+    result?;
+    Ok((plan.current, plan.target))
 }
 
 #[cfg(test)]
@@ -7932,6 +11489,7 @@ mod tests {
             install_inputs: vec![],
             release_event_id: "release-id".into(),
             artifact_event_id: "artifact-id".into(),
+            app: None,
             verification: VerificationResult {
                 release_signature_valid: true,
                 artifact_event_signature_valid: true,
@@ -7968,6 +11526,7 @@ mod tests {
             install_inputs: vec![],
             release_event_id: "release-id".into(),
             artifact_event_id: "artifact-id".into(),
+            app: None,
             verification: VerificationResult {
                 release_signature_valid: true,
                 artifact_event_signature_valid: true,
@@ -8438,6 +11997,7 @@ mod tests {
             screenshots: vec!["https://example.com/hello/screenshot.png".into()],
             desktop_file: Some("hello.desktop".into()),
             release_date: Some("2026-01-15".into()),
+            icon_blob: None,
             install_inputs: vec![],
         });
         fs::write(
@@ -8981,6 +12541,34 @@ mod tests {
             Some("io.npack.update")
         );
         assert_eq!(
+            required_authorization(DaemonRole::System, 1000, "Rollback"),
+            Some("io.npack.update"),
+            "switching versions changes installed software"
+        );
+        for method in ["GetHistory", "ListRollbacks"] {
+            assert_eq!(
+                required_authorization(DaemonRole::System, 1000, method),
+                None
+            );
+        }
+        for method in [
+            "AddTrustedPublisher",
+            "RemoveTrustedPublisher",
+            "SaveConfig",
+        ] {
+            assert_eq!(
+                required_authorization(DaemonRole::System, 1000, method),
+                Some("io.npack.configure"),
+                "{method} changes what root will install, so it is gated"
+            );
+        }
+        for method in ["GetConfig", "ListTrustedPublishers"] {
+            assert_eq!(
+                required_authorization(DaemonRole::System, 1000, method),
+                None
+            );
+        }
+        assert_eq!(
             required_authorization(DaemonRole::System, 1000, "ListInstalled"),
             None
         );
@@ -9246,5 +12834,2109 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!("transaction never completed");
+    }
+
+    const TEST_PUBKEY_HEX: &str =
+        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    fn call_daemon(
+        state: &Arc<DaemonState>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        runtime.block_on(dispatch_daemon_request(
+            state,
+            DaemonRequest {
+                id: 1,
+                method: method.to_owned(),
+                params,
+            },
+            None,
+        ))
+    }
+
+    fn state_with_config_file(dir: &Path) -> (Arc<DaemonState>, PathBuf) {
+        let path = dir.join("npack/config.toml");
+        let config = load_config_from(Some(&path)).unwrap();
+        let state = Arc::new(DaemonState::with_config_path(
+            config,
+            DaemonRole::User,
+            Some(path.clone()),
+        ));
+        (state, path)
+    }
+
+    #[test]
+    fn missing_config_means_first_run_with_builtin_defaults() -> Result<()> {
+        let dir = tempdir()?;
+        let config = load_config_from(Some(&dir.path().join("config.toml")))?;
+        assert!(config.first_run);
+        assert!(config.relays_defaulted && config.blossom_defaulted);
+        assert!(!config.network.relays.is_empty());
+        assert!(!config.storage.blossom.is_empty());
+        assert!(
+            config.trust.publishers.is_empty(),
+            "no publisher is pre-trusted"
+        );
+        // The defaults must satisfy the CLI's non-empty requirements.
+        assert!(configured_relays(Vec::new(), &config).is_ok());
+        assert!(configured_servers(Vec::new(), &config).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn user_configured_endpoints_win_over_defaults() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[network]\nrelays = [\"ws://127.0.0.1:1\"]\n[storage]\nblossom = [\"http://127.0.0.1:2\"]\n",
+        )?;
+        let config = load_config_from(Some(&path))?;
+        assert!(!config.first_run && !config.relays_defaulted && !config.blossom_defaulted);
+        assert_eq!(config.network.relays, ["ws://127.0.0.1:1"]);
+        assert_eq!(config.storage.blossom, ["http://127.0.0.1:2"]);
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_publishers_round_trip_through_the_daemon_and_config_file() -> Result<()> {
+        let dir = tempdir()?;
+        let (state, path) = state_with_config_file(dir.path());
+        assert_eq!(
+            call_daemon(&state, "GetConfig", serde_json::json!({}))?["first_run"],
+            true
+        );
+
+        let added = call_daemon(
+            &state,
+            "AddTrustedPublisher",
+            serde_json::json!({ "publisher": TEST_PUBKEY_HEX }),
+        )?;
+        assert_eq!(added["publisher"], TEST_PUBKEY_HEX);
+        assert!(added["npub"].as_str().unwrap().starts_with("npub1"));
+        // Adding twice does not duplicate.
+        call_daemon(
+            &state,
+            "AddTrustedPublisher",
+            serde_json::json!({ "publisher": added["npub"] }),
+        )?;
+        let listed = call_daemon(&state, "ListTrustedPublishers", serde_json::json!({}))?;
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+
+        // Persisted, and a fresh load sees it and is no longer a first run.
+        let reloaded = load_config_from(Some(&path))?;
+        assert!(!reloaded.first_run);
+        assert_eq!(
+            configured_publishers(Vec::new(), &reloaded)?,
+            [TEST_PUBKEY_HEX]
+        );
+        assert_eq!(trust_status(&state.config(), TEST_PUBKEY_HEX), "trusted");
+
+        let removed = call_daemon(
+            &state,
+            "RemoveTrustedPublisher",
+            serde_json::json!({ "publisher": added["npub"] }),
+        )?;
+        assert_eq!(removed["removed"], true);
+        assert_eq!(trust_status(&state.config(), TEST_PUBKEY_HEX), "unknown");
+        assert!(load_config_from(Some(&path))?.trust.publishers.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn editing_trust_keeps_unrelated_config_keys_and_rejects_bad_keys() -> Result<()> {
+        let dir = tempdir()?;
+        let (state, path) = state_with_config_file(dir.path());
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(
+            &path,
+            "[install]\nuser = true\n[identity]\npubkey = \"abc\"\n",
+        )?;
+        call_daemon(
+            &state,
+            "AddTrustedPublisher",
+            serde_json::json!({ "publisher": TEST_PUBKEY_HEX }),
+        )?;
+        let reloaded = load_config_from(Some(&path))?;
+        assert!(reloaded.install.user);
+        assert_eq!(reloaded.identity.pubkey.as_deref(), Some("abc"));
+
+        let error = call_daemon(
+            &state,
+            "AddTrustedPublisher",
+            serde_json::json!({ "publisher": "not-a-key" }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid publisher key"));
+
+        // A config file that does not parse is never overwritten.
+        fs::write(&path, "this is = not [valid")?;
+        // A key that is not yet trusted forces a write attempt.
+        assert!(
+            call_daemon(
+                &state,
+                "AddTrustedPublisher",
+                serde_json::json!({ "publisher": "ee".repeat(32) }),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&path)?, "this is = not [valid");
+        Ok(())
+    }
+
+    #[test]
+    fn save_config_persists_validates_and_ends_first_run() -> Result<()> {
+        let dir = tempdir()?;
+        let (state, path) = state_with_config_file(dir.path());
+        let saved = call_daemon(&state, "SaveConfig", serde_json::json!({}))?;
+        assert_eq!(saved["first_run"], false);
+        let reloaded = load_config_from(Some(&path))?;
+        assert!(!reloaded.first_run && !reloaded.relays_defaulted);
+        assert_eq!(reloaded.network.relays, DEFAULT_RELAYS);
+
+        let saved = call_daemon(
+            &state,
+            "SaveConfig",
+            serde_json::json!({ "relays": [" wss://relay.example/ ", "wss://relay.example"] }),
+        )?;
+        assert_eq!(saved["relays"], serde_json::json!(["wss://relay.example"]));
+
+        let error = call_daemon(
+            &state,
+            "SaveConfig",
+            serde_json::json!({ "relays": ["https://not-a-relay"] }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid relay"));
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_errors_carry_a_stable_code() {
+        for (message, code) in [
+            ("unknown method Bogus", "unknown_method"),
+            ("invalid Search params: missing field", "invalid_params"),
+            (
+                "not authorized for io.npack.install: denied",
+                "not_authorized",
+            ),
+            ("no relays configured; pass --relay", "no_relays"),
+            (
+                "timed out connecting to configured Nostr relays",
+                "relay_unreachable",
+            ),
+            (
+                "another npack operation is already in progress (pid 4)",
+                "store_busy",
+            ),
+            (
+                "publisher is not in the trusted publisher list",
+                "publisher_untrusted",
+            ),
+            ("no verified release found for hello", "not_found"),
+            ("installation cancelled", "cancelled"),
+            ("invalid publisher key: junk", "invalid_input"),
+            ("invalid relay https://x: expected a URL", "invalid_input"),
+            ("something unexpected", "internal"),
+        ] {
+            assert_eq!(daemon_error_code(message), code, "{message}");
+        }
+        let response = DaemonResponse::err(7, "unknown method Bogus");
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["error_code"],
+            "unknown_method"
+        );
+        let ok = serde_json::to_value(DaemonResponse::ok(7, serde_json::json!(1))).unwrap();
+        assert!(
+            ok.get("error_code").is_none(),
+            "success responses are unchanged"
+        );
+    }
+
+    #[test]
+    fn parses_nip05_identifiers_and_rejects_non_public_ones() {
+        let alice = parse_nip05(" Alice@Example.COM ").unwrap();
+        assert_eq!(
+            (alice.name.as_str(), alice.domain.as_str()),
+            ("alice", "example.com")
+        );
+        assert_eq!(alice.display(), "alice@example.com");
+        let root = parse_nip05("example.com").unwrap();
+        assert_eq!(root.name, "_");
+        assert_eq!(root.display(), "example.com");
+        for bad in [
+            "",
+            "alice@",
+            "@example.com",
+            "alice@localhost",
+            "alice@127.0.0.1",
+            "alice@[::1]",
+            "alice@example.com:8080",
+            "alice@printer.local",
+            "alice@intranet.internal",
+            "alice@-bad.example.com",
+            "ali ce@example.com",
+            "alice@exa mple.com",
+            "npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d",
+            TEST_PUBKEY_HEX,
+        ] {
+            assert!(parse_nip05(bad).is_none(), "{bad:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn profile_text_from_strangers_is_sanitised() {
+        assert_eq!(
+            sanitize_display_text("  Alice\u{202e}evil  ").as_deref(),
+            Some("Aliceevil")
+        );
+        assert_eq!(sanitize_display_text("a\nb\u{0}c").as_deref(), Some("abc"));
+        assert_eq!(sanitize_display_text("   "), None);
+        assert_eq!(sanitize_display_text(&"x".repeat(200)).unwrap().len(), 64);
+    }
+
+    /// Serves one canned HTTP response on a loopback port and returns its base URL.
+    async fn serve_http_once(response: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = [0u8; 2048];
+                let _ = stream.read(&mut buffer).await;
+                let _ = stream.write_all(&response).await;
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn http_ok(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn nip05_lookup_returns_the_mapped_key() -> Result<()> {
+        let id = parse_nip05("alice@example.com").unwrap();
+        let base = serve_http_once(http_ok(&format!(
+            r#"{{"names":{{"alice":"{}"}}}}"#,
+            TEST_PUBKEY_HEX.to_uppercase()
+        )))
+        .await;
+        assert_eq!(
+            fetch_nip05_pubkey_at(&base, &id, false).await?,
+            TEST_PUBKEY_HEX
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nip05_lookup_rejects_bad_answers() {
+        let id = parse_nip05("alice@example.com").unwrap();
+        let missing = serve_http_once(http_ok(r#"{"names":{"bob":"00"}}"#)).await;
+        assert!(fetch_nip05_pubkey_at(&missing, &id, false).await.is_err());
+
+        let not_hex = serve_http_once(http_ok(
+            r#"{"names":{"alice":"npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d"}}"#,
+        ))
+        .await;
+        assert!(fetch_nip05_pubkey_at(&not_hex, &id, false).await.is_err());
+
+        let garbage = serve_http_once(http_ok("not json")).await;
+        assert!(fetch_nip05_pubkey_at(&garbage, &id, false).await.is_err());
+
+        let redirect = serve_http_once(
+            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        )
+        .await;
+        let error = fetch_nip05_pubkey_at(&redirect, &id, false)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("302"),
+            "redirects are not followed: {error}"
+        );
+
+        let huge = serve_http_once(http_ok(&" ".repeat(NIP05_MAX_BYTES + 10))).await;
+        let error = fetch_nip05_pubkey_at(&huge, &id, false).await.unwrap_err();
+        assert!(error.to_string().contains("larger than"));
+
+        // Production refuses plain http outright.
+        let plain = serve_http_once(http_ok(r#"{"names":{}}"#)).await;
+        assert!(fetch_nip05_pubkey_at(&plain, &id, true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn publisher_input_accepts_keys_and_rejects_junk_without_network() -> Result<()> {
+        let (hex, name) = resolve_publisher_input(TEST_PUBKEY_HEX).await?;
+        assert_eq!(hex, TEST_PUBKEY_HEX);
+        assert!(name.is_none());
+        let error = resolve_publisher_input("localhost").await.unwrap_err();
+        assert!(error.to_string().contains("invalid publisher key"));
+        assert_eq!(daemon_error_code(&error.to_string()), "invalid_input");
+        assert_eq!(
+            daemon_error_code(
+                "NIP-05 lookup failed for alice@example.com: the domain answered HTTP 404"
+            ),
+            "nip05_failed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identity_without_a_profile_is_bare_and_never_verified() {
+        let identity = build_identity(TEST_PUBKEY_HEX, None).await;
+        assert!(identity.label.is_none() && !identity.nip05_verified);
+        assert!(identity.npub.starts_with("npub1"));
+        // A claimed name that cannot be a public NIP-05 identifier is kept as
+        // an unverified claim only; no network lookup happens for it.
+        let claims = serde_json::json!({"name": "Linus", "nip05": "linus@localhost"});
+        let identity = build_identity(TEST_PUBKEY_HEX, Some(&claims)).await;
+        assert_eq!(identity.claimed_name.as_deref(), Some("Linus"));
+        assert!(identity.nip05.is_none() && identity.label.is_none());
+    }
+
+    #[test]
+    fn trust_list_helpers_add_and_remove_by_key_regardless_of_spelling() {
+        let npub = display_publisher(TEST_PUBKEY_HEX);
+        assert_eq!(
+            trust_list_with(&[], TEST_PUBKEY_HEX),
+            Some(vec![npub.clone()]),
+            "stored as an npub"
+        );
+        assert_eq!(
+            trust_list_with(std::slice::from_ref(&npub), TEST_PUBKEY_HEX),
+            None
+        );
+        assert_eq!(
+            trust_list_with(&[TEST_PUBKEY_HEX.to_owned()], TEST_PUBKEY_HEX),
+            None,
+            "hex and npub spellings are the same publisher"
+        );
+        assert_eq!(
+            trust_list_without(&[npub, "other".into()], TEST_PUBKEY_HEX),
+            Some(vec!["other".to_owned()])
+        );
+        assert_eq!(trust_list_without(&[], TEST_PUBKEY_HEX), None);
+    }
+
+    #[test]
+    fn trust_edits_on_disk_round_trip_and_keep_other_keys() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("npack/config.toml");
+        assert!(
+            trusted_publishers_at(&path)?.is_empty(),
+            "absent file = nobody"
+        );
+        persist_trust_list(&path, &[display_publisher(TEST_PUBKEY_HEX)])?;
+        assert_eq!(
+            configured_publishers(Vec::new(), &load_config_from(Some(&path))?)?,
+            [TEST_PUBKEY_HEX]
+        );
+        fs::write(
+            &path,
+            format!("[install]\nuser = true\n[trust]\npublishers = [\"{TEST_PUBKEY_HEX}\"]\n"),
+        )?;
+        persist_trust_list(&path, &[])?;
+        let reloaded = load_config_from(Some(&path))?;
+        assert!(reloaded.install.user && reloaded.trust.publishers.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn trust_changes_need_explicit_consent() -> Result<()> {
+        let never = || -> io::Result<String> { panic!("must not prompt") };
+        assert!(confirmation_decision(true, false, never)?, "--yes wins");
+        assert!(
+            confirmation_decision(false, false, never).is_err(),
+            "piped input is never consent"
+        );
+        assert!(confirmation_decision(false, true, || Ok("y\n".into()))?);
+        assert!(confirmation_decision(false, true, || Ok("YES".into()))?);
+        for no in ["", "n", "no", "yep", "sure"] {
+            assert!(
+                !confirmation_decision(false, true, || Ok(no.into()))?,
+                "{no:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_picks_up_trust_edits_made_outside_it_and_does_not_clobber_them() -> Result<()> {
+        let dir = tempdir()?;
+        let (state, path) = state_with_config_file(dir.path());
+        let other = "ee".repeat(32);
+        call_daemon(
+            &state,
+            "AddTrustedPublisher",
+            serde_json::json!({ "publisher": TEST_PUBKEY_HEX }),
+        )?;
+
+        // Simulate `npack trust add` run from a shell while the daemon is up.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut list = trusted_publishers_at(&path)?;
+        list.extend(trust_list_with(&list, &other).unwrap().pop());
+        persist_trust_list(&path, &list)?;
+
+        let seen = call_daemon(&state, "ListTrustedPublishers", serde_json::json!({}))?;
+        assert_eq!(
+            seen.as_array().unwrap().len(),
+            2,
+            "external edit is visible"
+        );
+
+        // A later daemon edit must keep the externally added publisher.
+        call_daemon(
+            &state,
+            "RemoveTrustedPublisher",
+            serde_json::json!({ "publisher": TEST_PUBKEY_HEX }),
+        )?;
+        let remaining = trusted_publishers_at(&path)?;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(normalize_publisher_reference(&remaining[0]), other);
+        Ok(())
+    }
+
+    #[test]
+    fn a_config_file_that_stops_parsing_keeps_the_previous_trust_list() -> Result<()> {
+        let dir = tempdir()?;
+        let (state, path) = state_with_config_file(dir.path());
+        call_daemon(
+            &state,
+            "AddTrustedPublisher",
+            serde_json::json!({ "publisher": TEST_PUBKEY_HEX }),
+        )?;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&path, "[trust\npublishers = broken")?;
+        assert_eq!(state.config().trust.publishers.len(), 1);
+        Ok(())
+    }
+
+    fn listed_app() -> AppMetadata {
+        AppMetadata {
+            summary: Some("A friendly greeting".into()),
+            description: Some("Prints a greeting.\nTwo lines.".into()),
+            homepage: Some("https://example.com/hello".into()),
+            license: Some("MIT OR Apache-2.0".into()),
+            categories: vec!["Utility".into(), "Education".into()],
+            screenshots: vec!["https://example.com/shot.png".into()],
+            release_date: Some("2026-01-15".into()),
+            icon_blob: Some(IconBlob {
+                url: "https://cdn.example.com/abc".into(),
+                sha256: "ab".repeat(32),
+            }),
+            ..AppMetadata::default()
+        }
+    }
+
+    fn signed_release_with_app(app: AppMetadata) -> Result<(Event, Manifest)> {
+        let keys = Keys::generate();
+        let mut manifest = sample_manifest_with_app(app);
+        manifest.publisher = keys.public_key().to_hex();
+        manifest.sha256 = "ab".repeat(32);
+        manifest.artifact_event = Some("11".repeat(32));
+        let event =
+            sign_release_event(&manifest, &keys.secret_key().to_secret_hex(), 1_700_000_000)?;
+        Ok((event, manifest))
+    }
+
+    #[test]
+    fn app_listing_round_trips_through_a_signed_release_event() -> Result<()> {
+        let (event, manifest) = signed_release_with_app(listed_app())?;
+        assert!(release_event_is_v1(&event));
+        verify_release_event(&event, &manifest)?;
+        let app = app_metadata_from_event(&event);
+        assert_eq!(app.summary.as_deref(), Some("A friendly greeting"));
+        assert_eq!(
+            app.description.as_deref(),
+            Some("Prints a greeting.\nTwo lines.")
+        );
+        assert_eq!(app.categories, ["Utility", "Education"]);
+        assert_eq!(app.icon_blob, listed_app().icon_blob);
+        assert_eq!(
+            AppListing::from_app(
+                &manifest_from_release(&event, Path::new("a.npk"), &manifest.sha256)?.app
+            ),
+            AppListing::from_app(&listed_app())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_manifest_without_a_listing_publishes_no_listing_tags() -> Result<()> {
+        let (event, _) = signed_release_with_app(AppMetadata::default())?;
+        assert!(!event_has_app_tags(&event));
+        assert!(AppListing::from_app(&app_metadata_from_event(&event)).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn old_events_without_listing_tags_still_verify_against_a_newer_manifest() -> Result<()> {
+        let (event, mut manifest) = signed_release_with_app(AppMetadata::default())?;
+        manifest.app = listed_app();
+        verify_release_event(&event, &manifest)?;
+        // But an event that does carry a listing must agree with the manifest.
+        let (event, mut manifest) = signed_release_with_app(listed_app())?;
+        manifest.app.summary = Some("Something else".into());
+        assert!(verify_release_event(&event, &manifest).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn hostile_listing_tags_are_cleaned_or_dropped_never_fatal() -> Result<()> {
+        let keys = Keys::generate();
+        let tag =
+            |parts: &[&str]| Tag::parse(parts.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+        let event = EventBuilder::new(Kind::Custom(RELEASE_KIND), "x")
+            .tags([
+                tag(&["d", "hello/1.0.0/any"])?,
+                tag(&["v", PROTOCOL_VERSION])?,
+                tag(&["name", "hello"])?,
+                tag(&["version", "1.0.0"])?,
+                tag(&["os", "any"])?,
+                tag(&["arch", "any"])?,
+                tag(&["format", "npk"])?,
+                tag(&["x", &"cd".repeat(32)])?,
+                tag(&["artifact", &"11".repeat(32)])?,
+                tag(&["summary", "Totally\u{202e}safe\u{0}\u{1b}[31m app"])?,
+                tag(&["description", &"d".repeat(MAX_DESCRIPTION_CHARS * 2)])?,
+                tag(&["homepage", "javascript:alert(1)"])?,
+                tag(&["screenshot", "file:///etc/passwd"])?,
+                tag(&["screenshot", "https://ok.example/x.png"])?,
+                tag(&["category", "has space"])?,
+                tag(&["category", "Fine"])?,
+                tag(&["release-date", "yesterday"])?,
+                tag(&["icon", "http://x/y", "nothex"])?,
+            ])
+            .finalize(&keys)?;
+        assert!(release_event_is_v1(&event));
+        let app = app_metadata_from_event(&event);
+        assert_eq!(app.summary.as_deref(), Some("Totallysafe[31m app"));
+        assert_eq!(
+            app.description.unwrap().chars().count(),
+            MAX_DESCRIPTION_CHARS
+        );
+        assert_eq!(app.homepage, None, "non-http URLs are dropped");
+        assert_eq!(app.screenshots, ["https://ok.example/x.png"]);
+        assert_eq!(app.categories, ["Fine"]);
+        assert_eq!(app.release_date, None);
+        assert_eq!(app.icon_blob, None, "an icon with a bad hash is dropped");
+        // The release is still perfectly installable metadata.
+        manifest_from_release(&event, Path::new("a.npk"), &"cd".repeat(32))?;
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_singleton_listing_tags_make_a_release_invalid() -> Result<()> {
+        let keys = Keys::generate();
+        let (event, _) = signed_release_with_app(listed_app())?;
+        let mut tags: Vec<Tag> = event.tags.iter().cloned().collect();
+        tags.push(Tag::parse(["summary", "second summary"])?);
+        let doubled = EventBuilder::new(Kind::Custom(RELEASE_KIND), "x")
+            .tags(tags)
+            .finalize(&keys)?;
+        assert!(!release_event_is_v1(&doubled));
+        assert!(manifest_from_release(&doubled, Path::new("a.npk"), &"ab".repeat(32)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn publishing_rejects_unsafe_or_oversized_listings() {
+        let bad = |edit: fn(&mut AppMetadata)| {
+            let mut app = listed_app();
+            edit(&mut app);
+            validate_app_metadata(&app).is_err()
+        };
+        assert!(!bad(|_| {}));
+        assert!(bad(|a| a.homepage = Some("javascript:alert(1)".into())));
+        assert!(bad(|a| a.screenshots = vec!["file:///etc/passwd".into()]));
+        assert!(bad(|a| a.summary = Some("two\nlines".into())));
+        assert!(bad(|a| a.summary = Some("x".repeat(MAX_SUMMARY_CHARS + 1))));
+        assert!(bad(
+            |a| a.description = Some("x".repeat(MAX_DESCRIPTION_CHARS + 1))
+        ));
+        assert!(bad(|a| a.categories = vec!["c".into(); MAX_CATEGORIES + 1]));
+        assert!(bad(
+            |a| a.categories = vec!["a".repeat(MAX_CATEGORY_CHARS + 1)]
+        ));
+        assert!(bad(
+            |a| a.screenshots = vec!["https://e.com/s.png".into(); MAX_SCREENSHOTS + 1]
+        ));
+        assert!(bad(|a| a.icon_blob = Some(IconBlob {
+            url: "https://e.com/i".into(),
+            sha256: "zz".into()
+        })));
+    }
+
+    #[test]
+    fn icons_are_identified_by_their_bytes() {
+        assert_eq!(
+            icon_media_type(b"\x89PNG\r\n\x1a\nrest").unwrap(),
+            "image/png"
+        );
+        assert_eq!(
+            icon_media_type(b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"/>")
+                .unwrap(),
+            "image/svg+xml"
+        );
+        assert_eq!(icon_media_type(b"  <svg/>").unwrap(), "image/svg+xml");
+        for bad in [&b"GIF89a"[..], b"<html><svg>", b"#!/bin/sh", b""] {
+            assert!(icon_media_type(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_icon_can_be_read_out_of_a_packed_npk_within_the_size_limit() -> Result<()> {
+        let dir = tempdir()?;
+        let source = dir.path().join("src");
+        fs::create_dir_all(source.join("share/icons"))?;
+        fs::write(source.join("share/icons/hello.png"), b"\x89PNG\r\n\x1a\nxx")?;
+        fs::write(source.join("big.png"), vec![0u8; 4096])?;
+        let npk = dir.path().join("hello.npk");
+        pack_npk(&source, &npk)?;
+        assert_eq!(
+            read_npk_file(&npk, Path::new("share/icons/hello.png"), MAX_ICON_BYTES)?,
+            b"\x89PNG\r\n\x1a\nxx"
+        );
+        assert!(
+            read_npk_file(&npk, Path::new("big.png"), 100)
+                .unwrap_err()
+                .to_string()
+                .contains("limit")
+        );
+        assert!(read_npk_file(&npk, Path::new("missing.png"), 100).is_err());
+        assert!(
+            read_npk_file(&npk, Path::new("share"), 100).is_err(),
+            "directories are refused"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn search_finds_apps_by_summary_and_category_and_returns_the_listing() -> Result<()> {
+        let dir = tempdir()?;
+        let (event, _) = signed_release_with_app(listed_app())?;
+        save_catalogue(
+            dir.path(),
+            &Catalogue {
+                created_at: 1,
+                releases: vec![event],
+                revocations: vec![],
+            },
+        )?;
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        let search = |query: &str| {
+            runtime.block_on(search_matching_releases(
+                query,
+                &[],
+                &[],
+                None,
+                false,
+                false,
+                dir.path(),
+            ))
+        };
+        for query in ["hello", "greeting", "educat"] {
+            let results = search(query)?;
+            assert_eq!(results.len(), 1, "{query}");
+            let listing = results[0].app.as_ref().unwrap();
+            assert_eq!(listing.summary.as_deref(), Some("A friendly greeting"));
+            assert_eq!(
+                listing.icon.as_ref().unwrap().url,
+                "https://cdn.example.com/abc"
+            );
+        }
+        assert!(search("nomatch")?.is_empty());
+        let json = serde_json::to_value(&search("hello")?)?;
+        assert_eq!(
+            json[0]["app"]["categories"],
+            serde_json::json!(["Utility", "Education"])
+        );
+        Ok(())
+    }
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nFAKEICON";
+
+    fn http_bytes(body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn icon_for(base: &str, bytes: &[u8]) -> IconBlob {
+        IconBlob {
+            url: format!("{base}/blob"),
+            sha256: hex::encode(Sha256::digest(bytes)),
+        }
+    }
+
+    #[tokio::test]
+    async fn icon_fetch_accepts_only_bytes_matching_the_signed_hash() -> Result<()> {
+        let base = serve_http_once(http_bytes(PNG)).await;
+        assert_eq!(fetch_icon_bytes(&icon_for(&base, PNG), false).await?, PNG);
+
+        let base = serve_http_once(http_bytes(PNG)).await;
+        let mut wrong = icon_for(&base, PNG);
+        wrong.sha256 = "00".repeat(32);
+        let error = fetch_icon_bytes(&wrong, false).await.unwrap_err();
+        assert!(error.to_string().contains("signed SHA-256"), "{error}");
+
+        // Right hash but not an image: still refused.
+        let html = b"<html><script>alert(1)</script></html>";
+        let base = serve_http_once(http_bytes(html)).await;
+        assert!(
+            fetch_icon_bytes(&icon_for(&base, html), false)
+                .await
+                .is_err()
+        );
+
+        let big = vec![b'a'; MAX_ICON_BYTES + 1];
+        let base = serve_http_once(http_bytes(&big)).await;
+        let error = fetch_icon_bytes(&icon_for(&base, &big), false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("larger than"));
+
+        let base = serve_http_once(
+            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        )
+        .await;
+        let error = fetch_icon_bytes(&icon_for(&base, PNG), false)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("302"),
+            "redirects are not followed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn secure_icon_fetch_refuses_non_public_or_non_https_urls() {
+        let icon = |url: &str| IconBlob {
+            url: url.into(),
+            sha256: "ab".repeat(32),
+        };
+        for url in [
+            "http://cdn.example.com/blob",
+            "https://127.0.0.1/blob",
+            "https://[::1]/blob",
+            "https://localhost/blob",
+            "https://printer.local/blob",
+            "https://cdn.example.com:8443/blob",
+            "https://169.254.169.254/latest/meta-data",
+        ] {
+            let error = fetch_icon_bytes(&icon(url), true).await.unwrap_err();
+            assert!(
+                error.to_string().contains("public domain"),
+                "{url}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_icon_serves_a_verified_cache_entry_and_ignores_a_tampered_one() -> Result<()> {
+        use base64::Engine;
+        let dir = tempdir()?;
+        let mut app = listed_app();
+        app.icon_blob = Some(IconBlob {
+            url: "https://cdn.example.com/blob".into(),
+            sha256: hex::encode(Sha256::digest(PNG)),
+        });
+        let (event, _) = signed_release_with_app(app)?;
+        let id = event.id.to_hex();
+        save_catalogue(
+            dir.path(),
+            &Catalogue {
+                created_at: 1,
+                releases: vec![event],
+                revocations: vec![],
+            },
+        )?;
+        let cache = dir
+            .path()
+            .join("icons")
+            .join(hex::encode(Sha256::digest(PNG)));
+        fs::create_dir_all(cache.parent().unwrap())?;
+        fs::write(&cache, PNG)?;
+
+        let reply = get_icon_at(dir.path(), &id, true).await?;
+        assert_eq!(reply["media_type"], "image/png");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.decode(reply["data"].as_str().unwrap())?,
+            PNG
+        );
+
+        // A corrupted cache file is not served; with no network it just fails.
+        fs::write(&cache, b"\x89PNG\r\n\x1a\nTAMPERED")?;
+        assert!(get_icon_at(dir.path(), &id, true).await.is_err());
+
+        let error = get_icon_at(dir.path(), &"00".repeat(32), true)
+            .await
+            .unwrap_err();
+        assert_eq!(daemon_error_code(&error.to_string()), "not_found");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_icon_reports_a_release_without_an_icon() -> Result<()> {
+        let dir = tempdir()?;
+        let (event, _) = signed_release_with_app(AppMetadata::default())?;
+        let id = event.id.to_hex();
+        save_catalogue(
+            dir.path(),
+            &Catalogue {
+                created_at: 1,
+                releases: vec![event],
+                revocations: vec![],
+            },
+        )?;
+        let error = get_icon_at(dir.path(), &id, true).await.unwrap_err();
+        assert_eq!(daemon_error_code(&error.to_string()), "no_icon");
+        Ok(())
+    }
+
+    fn status(
+        reference: &str,
+        current: &str,
+        available: Option<&str>,
+        revoked: Option<&str>,
+    ) -> UpdateStatus {
+        UpdateStatus {
+            reference: reference.into(),
+            current_version: current.into(),
+            available_version: available.map(str::to_owned),
+            revoked: revoked.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn nothing_to_report_means_no_notification_and_a_cleared_record() {
+        let (notice, record) = update_notice(
+            &[status("npub1x/hello", "1.0.0", None, None)],
+            "update old 1 -> 2",
+        );
+        assert_eq!(notice, None);
+        assert_eq!(
+            record, "",
+            "the record is cleared so a later update announces again"
+        );
+    }
+
+    #[test]
+    fn a_new_update_is_announced_once_until_something_changes() {
+        let updates = [status("npub1x/hello", "1.0.0", Some("1.1.0"), None)];
+        let (notice, record) = update_notice(&updates, "");
+        let notice = notice.expect("first sighting notifies");
+        assert_eq!(notice.title, "1 software update(s) available");
+        assert_eq!(notice.body, "hello 1.0.0 -> 1.1.0");
+        assert!(!notice.urgent);
+
+        let (again, same) = update_notice(&updates, &record);
+        assert_eq!(again, None, "the timer must not repeat itself");
+        assert_eq!(same, record);
+
+        // One of two updates gets installed: nothing new, so stay quiet.
+        let two = [
+            status("npub1x/hello", "1.0.0", Some("1.1.0"), None),
+            status("npub1x/world", "2.0.0", Some("2.1.0"), None),
+        ];
+        let (_, two_record) = update_notice(&two, "");
+        assert_eq!(update_notice(&updates, &two_record).0, None);
+        // A further update appears: announce again.
+        assert!(update_notice(&two, &record).0.is_some());
+    }
+
+    #[test]
+    fn a_revoked_install_is_urgent_and_explains_why() {
+        let statuses = [
+            status(
+                "npub1x/hello",
+                "1.0.0",
+                Some("1.0.1"),
+                Some("signing key leaked"),
+            ),
+            status("npub1x/world", "2.0.0", Some("2.1.0"), None),
+        ];
+        let notice = update_notice(&statuses, "").0.unwrap();
+        assert!(notice.urgent);
+        assert_eq!(
+            notice.title,
+            "1 installed package(s) revoked by their publisher"
+        );
+        assert!(
+            notice
+                .body
+                .contains("hello 1.0.0 was revoked by its publisher: signing key leaked")
+        );
+        assert!(notice.body.contains("world 2.0.0 -> 2.1.0"));
+    }
+
+    #[test]
+    fn long_notifications_are_truncated_and_markup_is_escaped() {
+        let many: Vec<UpdateStatus> = (0..12)
+            .map(|i| status(&format!("npub1x/pkg{i}"), "1.0.0", Some("2.0.0"), None))
+            .collect();
+        let notice = update_notice(&many, "").0.unwrap();
+        assert_eq!(notice.body.lines().count(), 9);
+        assert!(notice.body.ends_with("and 4 more"));
+        assert_eq!(
+            escape_notification_markup("<b>x</b> & y"),
+            "&lt;b&gt;x&lt;/b&gt; &amp; y"
+        );
+    }
+
+    #[test]
+    fn only_the_publishers_own_exact_revocation_marks_an_install_revoked() -> Result<()> {
+        let keys = Keys::generate();
+        let secret = keys.secret_key().to_secret_hex();
+        let mut manifest = sample_manifest_with_app(AppMetadata::default());
+        manifest.publisher = keys.public_key().to_hex();
+        manifest.sha256 = "ab".repeat(32);
+        manifest.artifact_event = Some("11".repeat(32));
+        let release = sign_release_event(&manifest, &secret, 1_700_000_000)?;
+        let revocation = sign_revocation_event(&release, &secret, "security issue", 1_700_000_001)?;
+        let installed = InstalledPackage {
+            publisher: manifest.publisher.clone(),
+            name: manifest.name.clone(),
+            version: manifest.version.clone(),
+            sha256: manifest.sha256.clone(),
+            artifact: "a.npk".into(),
+            dependencies: vec![],
+            conflicts: vec![],
+            files: vec![],
+            runtime_requires: vec![],
+            provides: vec![],
+        };
+        assert_eq!(
+            installed_revocation_reason(&installed, std::slice::from_ref(&revocation)).as_deref(),
+            Some("security issue")
+        );
+        // A different version, artifact hash or package is not revoked.
+        for edit in [
+            (|p: &mut InstalledPackage| p.version = "9.9.9".into()) as fn(&mut InstalledPackage),
+            |p| p.sha256 = "cd".repeat(32),
+            |p| p.name = "other".into(),
+        ] {
+            let mut other = installed.clone();
+            edit(&mut other);
+            assert_eq!(
+                installed_revocation_reason(&other, std::slice::from_ref(&revocation)),
+                None
+            );
+        }
+        // A revocation signed by someone else never counts.
+        let stranger = Keys::generate();
+        let mut impostor = installed.clone();
+        impostor.publisher = stranger.public_key().to_hex();
+        assert_eq!(installed_revocation_reason(&impostor, &[revocation]), None);
+        Ok(())
+    }
+
+    /// Packs and installs one version of a signed test package into `root`,
+    /// the way a remote install would: archive stored as `artifact`, the
+    /// signed release event cached.
+    fn install_test_version(
+        dir: &Path,
+        root: &Path,
+        keys: &Keys,
+        version: &str,
+    ) -> Result<Manifest> {
+        let source = dir.join(format!("src-{version}"));
+        fs::create_dir_all(source.join("bin"))?;
+        fs::write(source.join("bin/app"), format!("app {version}"))?;
+        let download = dir.join(format!("download-{version}"));
+        fs::create_dir_all(&download)?;
+        pack_npk(&source, &download.join("artifact"))?;
+        let mut manifest = sample_manifest_with_app(AppMetadata::default());
+        manifest.publisher = keys.public_key().to_hex();
+        manifest.name = "app".into();
+        manifest.version = version.into();
+        manifest.artifact = "artifact".into();
+        manifest.sha256 = hash_file(&download.join("artifact"))?;
+        manifest.artifact_event = Some("11".repeat(32));
+        let event =
+            sign_release_event(&manifest, &keys.secret_key().to_secret_hex(), 1_700_000_000)?;
+        cache_release(root, &event)?;
+        install_with_capabilities_at(
+            &manifest,
+            &download.join("manifest.json"),
+            Some(root),
+            None,
+            false,
+            &[],
+        )?;
+        Ok(manifest)
+    }
+
+    fn installed_version(root: &Path) -> Result<String> {
+        Ok(installed_packages(Some(root))?
+            .first()
+            .context("nothing installed")?
+            .version
+            .clone())
+    }
+
+    fn app_file(root: &Path) -> Result<String> {
+        Ok(fs::read_to_string(root.join("packages/bin/app"))?)
+    }
+
+    #[test]
+    fn upgrades_are_recorded_and_can_be_rolled_back_and_forward_offline() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("store");
+        let keys = Keys::generate();
+        let reference = format!("{}/app", keys.public_key().to_hex());
+
+        install_test_version(dir.path(), &root, &keys, "1.0.0")?;
+        install_test_version(dir.path(), &root, &keys, "2.0.0")?;
+        assert_eq!(
+            (installed_version(&root)?, app_file(&root)?),
+            ("2.0.0".into(), "app 2.0.0".into())
+        );
+        let actions: Vec<String> = load_history(&root).into_iter().map(|e| e.action).collect();
+        assert_eq!(actions, ["install", "upgrade"]);
+
+        let (from, to) = rollback_package_at(&reference, Some(&root), false, &[])?;
+        assert_eq!(
+            (from.version.as_str(), to.version.as_str()),
+            ("2.0.0", "1.0.0")
+        );
+        assert_eq!(
+            (installed_version(&root)?, app_file(&root)?),
+            ("1.0.0".into(), "app 1.0.0".into())
+        );
+        assert_eq!(load_history(&root).last().unwrap().action, "rollback");
+        assert!(
+            !root
+                .join("rollback-staging")
+                .join(std::process::id().to_string())
+                .exists()
+        );
+
+        // Running it again switches forward.
+        rollback_package_at(&reference, Some(&root), false, &[])?;
+        assert_eq!(
+            (installed_version(&root)?, app_file(&root)?),
+            ("2.0.0".into(), "app 2.0.0".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_refuses_when_there_is_nothing_to_go_back_to() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("store");
+        let keys = Keys::generate();
+        let reference = format!("{}/app", keys.public_key().to_hex());
+        install_test_version(dir.path(), &root, &keys, "1.0.0")?;
+        let error = rollback_package_at(&reference, Some(&root), false, &[]).unwrap_err();
+        assert_eq!(
+            daemon_error_code(&error.to_string()),
+            "no_rollback",
+            "{error}"
+        );
+        let error = rollback_package_at("nobody/else", Some(&root), false, &[]).unwrap_err();
+        assert!(error.to_string().contains("is not installed"));
+        assert_eq!(installed_version(&root)?, "1.0.0");
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_leaves_the_install_alone_if_the_stored_archive_or_metadata_is_bad() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("store");
+        let keys = Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let reference = format!("{hex}/app");
+        install_test_version(dir.path(), &root, &keys, "1.0.0")?;
+        install_test_version(dir.path(), &root, &keys, "2.0.0")?;
+        let stored = root.join("packages").join(&hex).join("app/1.0.0/artifact");
+
+        let good = fs::read(&stored)?;
+        fs::write(&stored, b"tampered")?;
+        let error = rollback_package_at(&reference, Some(&root), false, &[]).unwrap_err();
+        assert!(error.to_string().contains("no longer matches"), "{error}");
+        assert_eq!(daemon_error_code(&error.to_string()), "rollback_blocked");
+        fs::remove_file(&stored)?;
+        let error = rollback_package_at(&reference, Some(&root), false, &[]).unwrap_err();
+        assert!(error.to_string().contains("is gone"), "{error}");
+
+        fs::write(&stored, &good)?;
+        fs::remove_dir_all(root.join("metadata"))?;
+        let error = rollback_package_at(&reference, Some(&root), false, &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot be verified offline"),
+            "{error}"
+        );
+        assert!(
+            available_rollbacks(&root)?.is_empty(),
+            "the GUI is not offered a rollback that cannot work"
+        );
+        assert_eq!(
+            (installed_version(&root)?, app_file(&root)?),
+            ("2.0.0".into(), "app 2.0.0".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_will_not_break_a_package_that_depends_on_the_newer_version() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("store");
+        let keys = Keys::generate();
+        let hex = keys.public_key().to_hex();
+        install_test_version(dir.path(), &root, &keys, "1.0.0")?;
+        install_test_version(dir.path(), &root, &keys, "2.0.0")?;
+        let mut packages = installed_packages(Some(&root))?;
+        packages.push(InstalledPackage {
+            publisher: "someone".into(),
+            name: "needs-new-app".into(),
+            version: "1.0.0".into(),
+            sha256: "00".repeat(32),
+            artifact: "x".into(),
+            dependencies: vec![Dependency {
+                publisher: Some(hex.clone()),
+                name: "app".into(),
+                requirement: ">=2.0.0".into(),
+            }],
+            conflicts: vec![],
+            files: vec![],
+            runtime_requires: vec![],
+            provides: vec![],
+        });
+        fs::write(root.join("installed.json"), serde_json::to_vec(&packages)?)?;
+        let error =
+            rollback_package_at(&format!("{hex}/app"), Some(&root), false, &[]).unwrap_err();
+        assert!(error.to_string().contains("cannot roll back"), "{error}");
+        assert_eq!(
+            installed_packages(Some(&root))?
+                .iter()
+                .find(|p| p.name == "app")
+                .unwrap()
+                .version,
+            "2.0.0"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removal_is_recorded_in_history() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("store");
+        let keys = Keys::generate();
+        let hex = keys.public_key().to_hex();
+        install_test_version(dir.path(), &root, &keys, "1.0.0")?;
+        remove_package_at(&format!("{hex}/app"), Some(&root), false)?;
+        let last = load_history(&root).pop().unwrap();
+        assert_eq!(last.action, "remove");
+        assert_eq!(last.from.unwrap().version, "1.0.0");
+        assert!(last.to.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn history_helpers_classify_changes_and_pick_the_replaced_version() {
+        let v = |version: &str, hash: &str| HistoryVersion {
+            version: version.into(),
+            sha256: hash.repeat(32),
+        };
+        assert_eq!(history_action(None, &v("1.0.0", "aa")), "install");
+        assert_eq!(
+            history_action(Some(&v("1.0.0", "aa")), &v("1.1.0", "bb")),
+            "upgrade"
+        );
+        assert_eq!(
+            history_action(Some(&v("1.1.0", "bb")), &v("1.0.0", "aa")),
+            "downgrade"
+        );
+        assert_eq!(
+            history_action(Some(&v("1.0.0", "aa")), &v("1.0.0", "bb")),
+            "reinstall"
+        );
+
+        let entry = |from: Option<HistoryVersion>, to: HistoryVersion| HistoryEntry {
+            at: 1,
+            action: "x".into(),
+            publisher: "p".into(),
+            name: "n".into(),
+            from,
+            to: Some(to),
+        };
+        let installed = |version: &str, hash: &str| InstalledPackage {
+            publisher: "p".into(),
+            name: "n".into(),
+            version: version.into(),
+            sha256: hash.repeat(32),
+            artifact: "a".into(),
+            dependencies: vec![],
+            conflicts: vec![],
+            files: vec![],
+            runtime_requires: vec![],
+            provides: vec![],
+        };
+        let history = vec![
+            entry(None, v("1.0.0", "aa")),
+            entry(Some(v("1.0.0", "aa")), v("2.0.0", "bb")),
+        ];
+        assert_eq!(
+            rollback_target(&history, &installed("2.0.0", "bb")),
+            Some(v("1.0.0", "aa"))
+        );
+        assert_eq!(
+            rollback_target(&history, &installed("1.0.0", "aa")),
+            None,
+            "a fresh install has nothing before it"
+        );
+        assert_eq!(
+            rollback_target(&history, &installed("2.0.0", "cc")),
+            None,
+            "a different archive is not that entry"
+        );
+    }
+
+    #[test]
+    fn history_survives_garbage_lines_and_formats_utc_dates() -> Result<()> {
+        let dir = tempdir()?;
+        let entry = HistoryEntry {
+            at: 1_700_000_000,
+            action: "install".into(),
+            publisher: "p".into(),
+            name: "n".into(),
+            from: None,
+            to: Some(HistoryVersion {
+                version: "1.0.0".into(),
+                sha256: "aa".repeat(32),
+            }),
+        };
+        append_history(dir.path(), &entry);
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(history_path(dir.path()))?;
+        writeln!(file, "not json")?;
+        drop(file);
+        append_history(dir.path(), &entry);
+        assert_eq!(load_history(dir.path()), vec![entry.clone(), entry]);
+        assert_eq!(format_utc(0), "1970-01-01 00:00");
+        assert_eq!(format_utc(1_700_000_000), "2023-11-14 22:13");
+        assert_eq!(format_utc(951_782_400), "2000-02-29 00:00");
+        Ok(())
+    }
+
+    fn browse_release(
+        keys: &Keys,
+        name: &str,
+        categories: &[&str],
+        created_at: u64,
+        os: &str,
+    ) -> Result<Event> {
+        let mut manifest = sample_manifest_with_app(AppMetadata {
+            summary: Some(format!("{name} summary")),
+            categories: categories.iter().map(|c| (*c).to_owned()).collect(),
+            ..AppMetadata::default()
+        });
+        manifest.publisher = keys.public_key().to_hex();
+        manifest.name = name.into();
+        manifest.sha256 = "ab".repeat(32);
+        manifest.artifact_event = Some("11".repeat(32));
+        manifest.os = os.into();
+        sign_release_event(&manifest, &keys.secret_key().to_secret_hex(), created_at)
+    }
+
+    fn browse_catalogue(dir: &Path) -> Result<(Keys, Keys)> {
+        let (alice, bob) = (Keys::generate(), Keys::generate());
+        let releases = vec![
+            browse_release(&alice, "zebra", &["Utility", "Games"], 300, "any")?,
+            browse_release(&alice, "apple", &["utility"], 100, "any")?,
+            browse_release(&bob, "mango", &["Games"], 200, "any")?,
+            browse_release(&bob, "winonly", &["Utility"], 400, "plan9")?,
+            browse_release(&bob, "nolisting", &[], 500, "any")?,
+        ];
+        save_catalogue(
+            dir,
+            &Catalogue {
+                created_at: 1,
+                releases,
+                revocations: vec![],
+            },
+        )?;
+        Ok((alice, bob))
+    }
+
+    fn names(value: &serde_json::Value) -> Vec<String> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["name"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn browse_filters_by_category_case_insensitively_orders_and_pages() -> Result<()> {
+        let dir = tempdir()?;
+        browse_catalogue(dir.path())?;
+        let state = Arc::new(DaemonState::with_config_path(
+            Config::default(),
+            DaemonRole::User,
+            None,
+        ));
+        let search = |extra: serde_json::Value| -> Result<serde_json::Value> {
+            let mut params = serde_json::json!({
+                "query": "", "store": dir.path(), "include_untrusted": true, "host_only": true
+            });
+            params
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            call_daemon(&state, "Search", params)
+        };
+
+        // An empty query lists everything installable on this host.
+        let mut all = names(&search(serde_json::json!({}))?);
+        all.sort();
+        assert_eq!(
+            all,
+            ["apple", "mango", "nolisting", "zebra"],
+            "winonly is for another OS"
+        );
+
+        let utility = search(serde_json::json!({"category": "UTILITY", "sort": "name"}))?;
+        assert_eq!(
+            names(&utility),
+            ["apple", "zebra"],
+            "spelling variants are one category"
+        );
+        assert_eq!(utility[0]["app"]["summary"], "apple summary");
+
+        let recent = search(serde_json::json!({"sort": "recent"}))?;
+        assert_eq!(names(&recent), ["nolisting", "zebra", "mango", "apple"]);
+
+        let page = search(serde_json::json!({"sort": "recent", "limit": 2, "offset": 1}))?;
+        assert_eq!(names(&page), ["zebra", "mango"]);
+        assert!(names(&search(serde_json::json!({"category": "nothing"}))?).is_empty());
+
+        // Not filtering by host shows the other-OS release, flagged as such.
+        let everything = search(serde_json::json!({"host_only": false, "sort": "name"}))?;
+        let winonly = everything
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "winonly")
+            .unwrap();
+        assert_eq!(winonly["compatible"], false);
+        assert!(winonly["published_at"].as_u64().unwrap() == 400);
+
+        let error = search(serde_json::json!({"sort": "sideways"})).unwrap_err();
+        assert_eq!(daemon_error_code(&error.to_string()), "invalid_input");
+        Ok(())
+    }
+
+    #[test]
+    fn only_trusted_uses_the_daemons_trust_list() -> Result<()> {
+        let dir = tempdir()?;
+        let (alice, _) = browse_catalogue(dir.path())?;
+        let mut config = Config::default();
+        config.trust.publishers = vec![alice.public_key().to_hex()];
+        let state = Arc::new(DaemonState::with_config_path(
+            config,
+            DaemonRole::User,
+            None,
+        ));
+        let mut trusted = names(&call_daemon(
+            &state,
+            "Search",
+            serde_json::json!({"store": dir.path(), "include_untrusted": true, "only_trusted": true}),
+        )?);
+        trusted.sort();
+        assert_eq!(trusted, ["apple", "zebra"]);
+
+        // With nobody trusted yet, "only trusted" shows nothing rather than everything.
+        let empty = Arc::new(DaemonState::with_config_path(
+            Config::default(),
+            DaemonRole::User,
+            None,
+        ));
+        assert!(names(&call_daemon(
+            &empty,
+            "Search",
+            serde_json::json!({"store": dir.path(), "include_untrusted": true, "only_trusted": true}),
+        )?)
+        .is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn list_categories_counts_distinct_packages_most_populous_first() -> Result<()> {
+        let dir = tempdir()?;
+        browse_catalogue(dir.path())?;
+        let state = Arc::new(DaemonState::with_config_path(
+            Config::default(),
+            DaemonRole::User,
+            None,
+        ));
+        let categories = call_daemon(
+            &state,
+            "ListCategories",
+            serde_json::json!({"store": dir.path(), "include_untrusted": true, "host_only": true}),
+        )?;
+        let pairs: Vec<(String, u64)> = categories
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["category"].as_str().unwrap().to_owned(),
+                    c["count"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        // Utility: zebra + apple (winonly is another OS). Games: zebra + mango.
+        assert_eq!(pairs, [("Games".to_owned(), 2), ("Utility".to_owned(), 2)]);
+        Ok(())
+    }
+
+    #[test]
+    fn browsing_without_a_catalogue_has_its_own_error_code() {
+        let dir = tempdir().unwrap();
+        let state = Arc::new(DaemonState::with_config_path(
+            Config::default(),
+            DaemonRole::User,
+            None,
+        ));
+        for method in ["Search", "ListCategories"] {
+            let error =
+                call_daemon(&state, method, serde_json::json!({"store": dir.path()})).unwrap_err();
+            assert_eq!(
+                daemon_error_code(&error.to_string()),
+                "no_catalogue",
+                "{method}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn category_counts_ignore_releases_without_a_listing() {
+        let result = |name: &str, categories: &[&str]| SearchResult {
+            release_event_id: String::new(),
+            publisher: "p".into(),
+            name: name.into(),
+            version: "1.0.0".into(),
+            content: String::new(),
+            kind: None,
+            fork_of: None,
+            app: (!categories.is_empty()).then(|| AppListing {
+                categories: categories.iter().map(|c| (*c).to_owned()).collect(),
+                ..AppListing::default()
+            }),
+            published_at: 0,
+            compatible: true,
+        };
+        let counts = category_counts(&[
+            result("a", &["Tools"]),
+            result("a", &["Tools"]),
+            result("b", &[]),
+            result("c", &["tools", "Web"]),
+        ]);
+        assert_eq!(
+            counts,
+            [("Tools".to_owned(), 2), ("Web".to_owned(), 1)],
+            "same package twice counts once"
+        );
+        // A tie between spellings is broken the same way whatever the order.
+        let tie_a = category_counts(&[result("a", &["utility"]), result("b", &["Utility"])]);
+        let tie_b = category_counts(&[result("b", &["Utility"]), result("a", &["utility"])]);
+        assert_eq!(tie_a, [("Utility".to_owned(), 2)]);
+        assert_eq!(tie_a, tie_b);
+    }
+
+    fn levels(findings: &[Finding]) -> Vec<(Level, &'static str)> {
+        findings.iter().map(|f| (f.level, f.area)).collect()
+    }
+
+    #[test]
+    fn doctor_reads_the_config_without_creating_it() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("npack/config.toml");
+        let (findings, config) = doctor_config(Some(&path));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.level == Level::Info && f.title.contains("No config file yet"))
+        );
+        assert!(
+            config.first_run && !config.network.relays.is_empty(),
+            "defaults still apply"
+        );
+        assert!(!path.exists(), "a diagnosis must not create the file");
+
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(
+            &path,
+            format!("[trust]\npublishers = [\"{TEST_PUBKEY_HEX}\"]\n"),
+        )?;
+        let (findings, _) = doctor_config(Some(&path));
+        assert_eq!(
+            levels(&findings),
+            [
+                (Level::Ok, "Config"),
+                (Level::Info, "Config"),
+                (Level::Info, "Config"),
+                (Level::Ok, "Trust")
+            ]
+        );
+        assert!(!doctor_has_failures(&findings));
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_fails_on_a_broken_config_and_leaves_it_alone() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[trust\nbroken")?;
+        let (findings, config) = doctor_config(Some(&path));
+        assert!(doctor_has_failures(&findings));
+        assert!(findings[0].fix.as_deref().unwrap().contains("Fix the TOML"));
+        assert!(
+            !config.network.relays.is_empty(),
+            "later checks still get usable settings"
+        );
+        assert_eq!(fs::read_to_string(&path)?, "[trust\nbroken");
+
+        fs::write(
+            &path,
+            "[trust]\npublishers = [\"not-a-key\", \"also-bad\"]\n",
+        )?;
+        let (findings, _) = doctor_config(Some(&path));
+        let trust = findings.iter().find(|f| f.area == "Trust").unwrap();
+        assert_eq!(trust.level, Level::Fail);
+        assert!(trust.title.starts_with("2 trusted publisher entries"));
+        assert!(trust.detail.as_deref().unwrap().contains("not-a-key"));
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_store_handles_a_store_that_does_not_exist_yet() {
+        let dir = tempdir().unwrap();
+        let findings = doctor_store(&dir.path().join("nope"));
+        assert_eq!(levels(&findings), [(Level::Info, "Store")]);
+        assert!(
+            !dir.path().join("nope").exists(),
+            "it must not create the store"
+        );
+    }
+
+    #[test]
+    fn doctor_store_calls_a_healthy_install_healthy_and_cleans_up_after_itself() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("store");
+        let keys = Keys::generate();
+        install_test_version(dir.path(), &root, &keys, "1.0.0")?;
+        let before: Vec<_> = fs::read_dir(&root)?
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        let findings = doctor_store(&root);
+        assert!(
+            findings.iter().all(|f| f.level <= Level::Info),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.title.contains("1 installed package(s) are intact"))
+        );
+        let after: Vec<_> = fs::read_dir(&root)?
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "the writability probe file is removed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_store_reports_a_stale_lock_without_clearing_it() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("store");
+        fs::create_dir_all(&root)?;
+        // A pid that cannot be running.
+        fs::write(store_lock_path(&root), (u32::MAX - 1).to_string())?;
+        let findings = doctor_store(&root);
+        let stale = findings
+            .iter()
+            .find(|f| f.title.contains("interrupted"))
+            .expect("stale lock noted");
+        assert_eq!(stale.level, Level::Warn);
+        assert!(
+            store_lock_path(&root).exists(),
+            "recovery is the next install's job, not the doctor's"
+        );
+
+        fs::write(store_lock_path(&root), std::process::id().to_string())?;
+        let findings = doctor_store(&root);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.level == Level::Info && f.title.contains("is running"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_store_fails_on_a_damaged_package_list_and_does_not_touch_it() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("store");
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("installed.json"), "{ not json")?;
+        let findings = doctor_store(&root);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.level == Level::Fail && f.area == "Packages")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("installed.json"))?,
+            "{ not json"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_lists_every_installed_problem_not_just_the_first() -> Result<()> {
+        let dir = tempdir()?;
+        let archive = dir.path().join("a.npk");
+        fs::write(&archive, b"changed")?;
+        let package = |name: &str, archive: PathBuf, files: Vec<PathBuf>| InstalledPackage {
+            publisher: "p".into(),
+            name: name.into(),
+            version: "1.0.0".into(),
+            sha256: "00".repeat(32),
+            artifact: archive,
+            dependencies: vec![],
+            conflicts: vec![],
+            files,
+            runtime_requires: vec![],
+            provides: vec![],
+        };
+        let findings = doctor_installed(&[
+            package("tampered", archive, vec![]),
+            package(
+                "gone",
+                dir.path().join("missing.npk"),
+                vec![dir.path().join("no-such-file")],
+            ),
+        ]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].level, Level::Warn);
+        assert!(
+            findings[0]
+                .title
+                .starts_with("3 installed package problem(s)")
+        );
+        let detail = findings[0].detail.as_deref().unwrap();
+        assert!(detail.contains("tampered") && detail.contains("no longer matches"));
+        assert!(
+            detail.contains("gone")
+                && detail.contains("archive is missing")
+                && detail.contains("1 installed file(s)")
+        );
+        assert!(doctor_installed(&[]).iter().all(|f| f.level == Level::Info));
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_catalogue_reports_age_and_absence() -> Result<()> {
+        let dir = tempdir()?;
+        assert_eq!(
+            levels(&doctor_catalogue(dir.path(), 1_000)),
+            [(Level::Info, "Catalogue")]
+        );
+        save_catalogue(
+            dir.path(),
+            &Catalogue {
+                created_at: 1_000,
+                releases: vec![],
+                revocations: vec![],
+            },
+        )?;
+        let fresh = doctor_catalogue(dir.path(), 1_000 + 86_400);
+        assert_eq!(fresh[0].level, Level::Ok);
+        assert!(fresh[0].title.contains("1 day(s) old"));
+        let stale = doctor_catalogue(dir.path(), 1_000 + 10 * 86_400);
+        assert_eq!(stale[0].level, Level::Warn);
+        assert!(stale[0].fix.as_deref().unwrap().contains("npack refresh"));
+        fs::write(catalogue_path(dir.path()), "garbage")?;
+        assert_eq!(doctor_catalogue(dir.path(), 5)[0].level, Level::Warn);
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_finds_tools_by_looking_not_running() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir()?;
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin)?;
+        fs::write(bin.join("notify-send"), "#!/bin/sh\ntouch RAN\n")?;
+        fs::set_permissions(bin.join("notify-send"), fs::Permissions::from_mode(0o755))?;
+        fs::write(bin.join("pkcheck"), "not executable")?;
+        fs::set_permissions(bin.join("pkcheck"), fs::Permissions::from_mode(0o644))?;
+        let path = format!("{}:/nonexistent", bin.display());
+        assert!(find_in_path("notify-send", &path).is_some());
+        assert!(
+            find_in_path("pkcheck", &path).is_none(),
+            "a non-executable file isn't a tool"
+        );
+        assert!(find_in_path("missing", &path).is_none());
+
+        let findings = doctor_tools(&path, Some(dir.path()));
+        assert_eq!(findings[0].level, Level::Ok);
+        assert!(findings[1].title.contains("isn't installed"));
+        assert!(findings[2].title.contains("isn't set up"));
+        assert!(
+            !bin.join("RAN").exists() && !dir.path().join("RAN").exists(),
+            "the tool must not be executed"
+        );
+        assert!(
+            findings.iter().all(|f| f.level <= Level::Info),
+            "missing helpers are never a failure"
+        );
+
+        let timer = dir.path().join(".config/systemd/user");
+        fs::create_dir_all(&timer)?;
+        fs::write(timer.join("npack-update-check.timer"), "")?;
+        assert_eq!(doctor_tools(&path, Some(dir.path()))[2].level, Level::Ok);
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_tells_a_missing_service_from_a_running_or_outdated_one() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = tempdir()?;
+        let socket = dir.path().join("npackd.sock");
+        assert_eq!(
+            doctor_daemon("user", &socket).level,
+            Level::Info,
+            "optional, so not a problem"
+        );
+
+        let serve = |name: &str, reply: &'static str| -> Result<PathBuf> {
+            let path = dir.path().join(format!("{name}.sock"));
+            let listener = std::os::unix::net::UnixListener::bind(&path)?;
+            std::thread::spawn(move || {
+                if let Ok((stream, _)) = listener.accept() {
+                    let mut line = String::new();
+                    let _ = BufReader::new(stream.try_clone().unwrap()).read_line(&mut line);
+                    let mut stream = stream;
+                    let _ = stream.write_all(reply.as_bytes());
+                }
+            });
+            Ok(path)
+        };
+        let running = serve("running", "{\"id\":1,\"result\":{}}\n")?;
+        assert_eq!(doctor_daemon("user", &running).level, Level::Ok);
+        let outdated = serve(
+            "outdated",
+            "{\"id\":1,\"error\":\"unknown method GetConfig\",\"error_code\":\"unknown_method\"}\n",
+        )?;
+        let finding = doctor_daemon("user", &outdated);
+        assert_eq!(finding.level, Level::Warn);
+        assert!(finding.title.contains("older than this npack"));
+        let garbled = serve("garbled", "what\n")?;
+        assert_eq!(doctor_daemon("user", &garbled).level, Level::Warn);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn doctor_network_distinguishes_one_dead_server_from_none_working() {
+        let wait = std::time::Duration::from_secs(1);
+        let up = serve_http_once(http_ok("{}")).await;
+        assert_eq!(doctor_blossom(&up, wait).await.level, Level::Ok);
+        let down = "http://127.0.0.1:1";
+        assert_eq!(doctor_blossom(down, wait).await.level, Level::Warn);
+        assert_eq!(
+            doctor_relay("ws://127.0.0.1:1", wait).await.level,
+            Level::Warn
+        );
+
+        let findings = doctor_network(&["ws://127.0.0.1:1".into()], &[down.into()], wait).await;
+        assert!(
+            doctor_has_failures(&findings),
+            "no working relay stops npack working"
+        );
+        let downloads: Vec<_> = findings.iter().filter(|f| f.area == "Downloads").collect();
+        assert!(
+            downloads.iter().all(|f| f.level == Level::Warn),
+            "no working download server only warns"
+        );
+        assert!(
+            downloads
+                .iter()
+                .any(|f| f.title.contains("No download server is reachable"))
+        );
+
+        // With no relays configured there is nothing to fail on.
+        let none = doctor_network(&[], &[down.into()], wait).await;
+        assert!(!doctor_has_failures(&none));
+    }
+
+    #[test]
+    fn the_report_groups_by_area_shows_fixes_and_summarises() {
+        let findings = vec![
+            Finding::new(Level::Ok, "Config", "Config file is valid"),
+            Finding::new(Level::Warn, "Store", "Something off")
+                .detail("line one\nline two")
+                .fix("Do the thing."),
+            Finding::new(Level::Ok, "Config", "Second config note"),
+        ];
+        let report = render_doctor_report(&findings);
+        let config_at = report.find("\nConfig\n").unwrap();
+        let store_at = report.find("\nStore\n").unwrap();
+        assert!(config_at < store_at);
+        assert!(
+            report[config_at..store_at].contains("Second config note"),
+            "same-area findings are together"
+        );
+        assert!(report.contains("      line one\n      line two\n"));
+        assert!(report.contains("→ Do the thing."));
+        assert!(report.contains("1 warning(s) to look at."));
+
+        assert!(render_doctor_report(&findings[..1]).contains("Everything looks good."));
+        let failing = [Finding::new(Level::Fail, "Relays", "down")];
+        assert!(render_doctor_report(&failing).contains("1 problem(s) stop npack working."));
+        let both = [
+            Finding::new(Level::Fail, "Relays", "down"),
+            Finding::new(Level::Warn, "Store", "hmm"),
+        ];
+        assert!(render_doctor_report(&both).contains("plus 1 warning(s)."));
+    }
+
+    #[test]
+    fn json_findings_use_lowercase_levels_and_omit_empty_fields() {
+        let value = serde_json::to_value([
+            Finding::new(Level::Fail, "Relays", "down").fix("Check the network."),
+            Finding::new(Level::Ok, "Config", "fine"),
+        ])
+        .unwrap();
+        assert_eq!(value[0]["level"], "fail");
+        assert_eq!(value[0]["fix"], "Check the network.");
+        assert!(value[0].get("detail").is_none() && value[1].get("fix").is_none());
+        assert_eq!(value[1]["level"], "ok");
+    }
+
+    fn offline_plan(dir: &Path) -> DoctorPlan {
+        DoctorPlan {
+            config_path: Some(dir.join("config/npack/config.toml")),
+            package_root: dir.join("store"),
+            catalogue_root: dir.join("store"),
+            offline: true,
+            probe_service: false,
+            path_env: String::new(),
+            home: Some(dir.to_path_buf()),
+            wait: std::time::Duration::from_secs(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn doctor_findings_cover_every_area_in_report_order() {
+        let dir = tempdir().unwrap();
+        let findings = doctor_findings(offline_plan(dir.path())).await;
+        let mut areas: Vec<&str> = Vec::new();
+        for finding in &findings {
+            if !areas.contains(&finding.area) {
+                areas.push(finding.area);
+            }
+        }
+        assert_eq!(
+            areas,
+            [
+                "Config",
+                "Trust",
+                "Store",
+                "Catalogue",
+                "Service",
+                "Tools",
+                "Network"
+            ]
+        );
+        assert!(!doctor_has_failures(&findings));
+        // A service never asks itself whether it is running.
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.title == "This service is running")
+        );
+        assert!(!findings.iter().any(|f| f.title.contains("isn't running")));
+    }
+
+    fn doctor_state(dir: &Path) -> Arc<DaemonState> {
+        Arc::new(DaemonState::with_config_path(
+            Config::default(),
+            DaemonRole::User,
+            Some(dir.join("config/npack/config.toml")),
+        ))
+    }
+
+    #[tokio::test]
+    async fn run_doctor_returns_structured_findings_and_a_healthy_flag() -> Result<()> {
+        let dir = tempdir()?;
+        let state = doctor_state(dir.path());
+        let params = serde_json::json!({"offline": true, "store": dir.path().join("store")});
+        let request = |params: serde_json::Value| DaemonRequest {
+            id: 1,
+            method: "RunDoctor".into(),
+            params,
+        };
+        let reply = dispatch_daemon_request(&state, request(params.clone()), None).await?;
+        assert_eq!(reply["healthy"], true);
+        let findings = reply["findings"].as_array().unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f["area"] == "Config" && f["level"] == "info")
+        );
+        assert!(findings.iter().all(|f| f["title"].is_string()));
+
+        // A broken config is reported as a failure, after the cache has lapsed.
+        *state.doctor_cache.lock().unwrap() = None;
+        let config_path = dir.path().join("config/npack/config.toml");
+        fs::create_dir_all(config_path.parent().unwrap())?;
+        fs::write(&config_path, "[trust\nbroken")?;
+        let reply = dispatch_daemon_request(&state, request(params), None).await?;
+        assert_eq!(reply["healthy"], false);
+        assert!(
+            reply["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["level"] == "fail")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_doctor_reuses_a_fresh_result_but_not_a_stale_one() -> Result<()> {
+        let dir = tempdir()?;
+        let state = doctor_state(dir.path());
+        let params = serde_json::json!({"offline": true, "store": dir.path().join("store")});
+        let key = (true, true, Some(dir.path().join("store")));
+        let planted = vec![Finding::new(Level::Warn, "Planted", "from the cache")];
+        let ask = || {
+            dispatch_daemon_request(
+                &state,
+                DaemonRequest {
+                    id: 1,
+                    method: "RunDoctor".into(),
+                    params: params.clone(),
+                },
+                None,
+            )
+        };
+
+        *state.doctor_cache.lock().unwrap() =
+            Some((std::time::Instant::now(), key.clone(), planted.clone()));
+        let reply = ask().await?;
+        assert_eq!(
+            reply["findings"][0]["title"], "from the cache",
+            "a burst shares one result"
+        );
+
+        let long_ago = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(DOCTOR_CACHE_SECS + 5))
+            .unwrap();
+        *state.doctor_cache.lock().unwrap() = Some((long_ago, key, planted.clone()));
+        let reply = ask().await?;
+        assert_ne!(
+            reply["findings"][0]["title"], "from the cache",
+            "an old result is not reused"
+        );
+
+        // A different request (here: not offline) never gets another's result.
+        let other = (false, true, None);
+        *state.doctor_cache.lock().unwrap() = Some((std::time::Instant::now(), other, planted));
+        let reply = ask().await?;
+        assert_ne!(reply["findings"][0]["title"], "from the cache");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_doctor_requests_are_serialised_and_agree() -> Result<()> {
+        let dir = tempdir()?;
+        let state = doctor_state(dir.path());
+        let params = serde_json::json!({"offline": true, "store": dir.path().join("store")});
+        let ask = || {
+            dispatch_daemon_request(
+                &state,
+                DaemonRequest {
+                    id: 1,
+                    method: "RunDoctor".into(),
+                    params: params.clone(),
+                },
+                None,
+            )
+        };
+        let (a, b, c) = tokio::join!(ask(), ask(), ask());
+        let (a, b, c) = (a?, b?, c?);
+        assert_eq!(a, b);
+        assert_eq!(b, c, "later callers get the first run's result");
+        Ok(())
+    }
+
+    #[test]
+    fn run_doctor_is_read_only_so_it_is_not_gated_on_the_system_daemon() {
+        assert_eq!(
+            required_authorization(DaemonRole::System, 1000, "RunDoctor"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_user_daemon_serves_the_users_own_prefix_by_default() {
+        let user = DaemonState::with_config_path(Config::default(), DaemonRole::User, None);
+        assert!(
+            user.config().install.user,
+            "a normal user cannot write the system store"
+        );
+        let system = DaemonState::with_config_path(Config::default(), DaemonRole::System, None);
+        assert!(
+            !system.config().install.user,
+            "the system daemon keeps the system store"
+        );
+        // Without an explicit store, user mode picks the per-user state directory.
+        assert_eq!(install_paths(None, true).0, default_store());
+    }
+
+    #[test]
+    fn list_installed_adds_an_npub_next_to_the_hex_publisher() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("store");
+        let keys = Keys::generate();
+        install_test_version(dir.path(), &root, &keys, "1.0.0")?;
+        let state = Arc::new(DaemonState::with_config_path(
+            Config::default(),
+            DaemonRole::User,
+            None,
+        ));
+        let listed = call_daemon(&state, "ListInstalled", serde_json::json!({"store": root}))?;
+        let item = &listed[0];
+        assert_eq!(item["publisher"], keys.public_key().to_hex());
+        assert_eq!(item["npub"], display_publisher(&keys.public_key().to_hex()));
+        assert!(item["npub"].as_str().unwrap().starts_with("npub1"));
+        Ok(())
     }
 }

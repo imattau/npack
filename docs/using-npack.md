@@ -11,6 +11,42 @@ protocol and is not yet a registered NIP.
 
 ## Install npack
 
+### From a release
+
+Each GitHub release has Debian and RPM packages (and `.npk` archives, which
+npack itself can install). There are three:
+
+| Package | What it is |
+| --- | --- |
+| `npack` | The command line tool, the `npackd` service, the man page, the systemd units and the PolicyKit policy. No graphics libraries, so it installs on servers and containers. |
+| `npack-gui` | The desktop app, with its launcher entry, icon and AppStream description. Needs the matching `npack`. |
+| `npack-desktop` | An empty package that installs the other two. This is the one to pick for a desktop. |
+
+```bash
+# Debian, Ubuntu and derivatives: the command line tool only
+sudo apt install ./npack_0.5.0_amd64.deb
+
+# ...or the desktop as well (give apt all three files together)
+sudo apt install ./npack_0.5.0_amd64.deb ./npack-gui_0.5.0_amd64.deb ./npack-desktop_0.5.0_amd64.deb
+
+# Fedora and other RPM systems
+sudo dnf install ./npack-0.5.0-1.x86_64.rpm ./npack-gui-0.5.0-1.x86_64.rpm ./npack-desktop-0.5.0-1.x86_64.rpm
+```
+
+Open **npack** from your applications menu. The app starts the background
+service itself when it isn't already running, so there is nothing else to set
+up. If you would rather have the service start at login for other tools to use:
+
+```bash
+systemctl --user enable --now npackd.service
+```
+
+The packages declare the libraries the desktop app loads at run time (X11 or
+Wayland, EGL and Vulkan). Software rendering works if your machine has no GPU
+driver, provided Mesa's drivers are installed (the package recommends them).
+
+### From source
+
 Build from source:
 
 ```bash
@@ -336,6 +372,25 @@ npack search myapp --relay wss://relay.example --no-cache  # query relays live f
 If no catalogue exists yet, plain `npack search` fails with a message
 pointing at `npack refresh` rather than silently querying relays.
 
+#### Browsing by category
+
+Releases that publish a store listing can be browsed by category:
+
+```bash
+npack categories                                  # "Utility (12)", most populous first
+npack search "" --category utility --sort name    # an empty query matches everything
+npack search "" --sort recent --limit 20          # newest releases first
+```
+
+`npack categories` lists the categories in the catalogue with the number of
+packages in each, counting only releases that fit this machine (add
+`--all-platforms` to include the rest). Category names are matched without
+regard to case, and spelling variants are one category, shown in their most
+common spelling. `--sort recent` orders by when the release event was
+published, which the publisher sets, so treat it as a convenience rather than
+a guarantee. Search also matches a query against each package's summary and
+categories, not just its name.
+
 Install a publisher-qualified package:
 
 ```bash
@@ -401,6 +456,44 @@ npub1.../otherapp 2.3.0 up to date
 1 update(s) available.
 ```
 
+`--check` also reports installed packages whose release has been **revoked** by
+their publisher, with the publisher's reason:
+
+```text
+[REVOKED] npub1.../myapp 1.0.0: signing key leaked
+```
+
+A revocation counts only when it is a valid signed event from the package's own
+publisher naming that exact name, version and artifact hash. It is a signal to
+update or remove the package, not something npack acts on by itself.
+
+#### Automatic checks and desktop notifications
+
+`npack update --check --notify` does the same check and then sends a desktop
+notification through `notify-send` (install `libnotify`/`libnotify-bin`) when
+something has appeared that it has not already told you about: a new update, or
+a revoked install (which is sent as critical urgency). It remembers what it
+announced in `update-notified.txt` in the store, so running it from a timer does
+not repeat itself until the situation changes. If `notify-send` is missing the
+command fails rather than staying silent.
+
+To check daily, enable the timer. The `npack` package installs the units; from
+a source build, copy them from `packaging/` first:
+
+```bash
+# from a source build only:
+mkdir -p ~/.config/systemd/user
+cp packaging/npack-update-check.service packaging/npack-update-check.timer ~/.config/systemd/user/
+
+systemctl --user enable --now npack-update-check.timer
+```
+
+The service runs `/usr/bin/npack update --check --notify --user`; edit the path or
+flags in the copied unit if npack is installed elsewhere or you use a system
+store. The check is randomised by up to two hours and a missed run happens soon
+after the machine next starts. The GUI also checks once when it opens, and warns
+on every tab while an installed package is revoked.
+
 Search results are reduced to the newest valid SemVer release for each
 publisher/package pair, while retaining all platform artifacts belonging to
 that release; a `--trusted-publisher` filter and NIP-65 identity narrow which
@@ -428,9 +521,9 @@ myapp
     1.1.0 linux/x86_64 895abc98... [REVOKED]
 ```
 
-AppStream-style fields (summary, description, homepage, ...) are not shown:
-release events don't currently carry Phase 1's `app` manifest metadata onto
-Nostr tags, so there is nothing for the catalogue to have captured yet.
+`npack info` does not print store-listing fields. They are published as release
+tags (see [the protocol](package-protocol-v1.md)) and returned by the daemon's
+`Search` and `GetPackage`; `npack search` also matches them.
 
 ## Resolving release metadata for other package managers
 
@@ -607,19 +700,99 @@ Supported methods, mirroring the CLI operations above:
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `Search` | `query`, `relay[]`, `trusted_publisher[]`, `pubkey`, `refresh`, `no_cache` | Array of matching releases. |
-| `GetPackage` | `package`, `relay[]`, `requirement`, `os`, `arch`, `trusted_publisher[]`, `store`, `user` | The same resolved-metadata object as `npack resolve`. |
+| `Search` | `query` (empty matches everything), `relay[]`, `trusted_publisher[]`, `pubkey`, `refresh`, `no_cache`, `include_untrusted`, `category`, `sort` (`name` or `recent`), `limit`, `offset`, `only_trusted`, `host_only` | Array of matching releases, each with `trust` (`"trusted"` or `"unknown"`), `npub`, `published_at` and `compatible` (whether its os/arch fit this machine). With `include_untrusted` the trust list does not filter results. `only_trusted` keeps only publishers in the daemon's trust list (an empty list trusts no one); `host_only` keeps only compatible releases; `category` is case-insensitive. Filters apply before `sort`, `offset` and `limit`. |
+| `ListCategories` | the same filters as `Search` (`category`, `sort`, `limit` and `offset` are ignored) | Array of `{category, count}`, most populous first, over the same set a browse view draws from. |
+| `GetPackage` | `package`, `relay[]`, `requirement`, `os`, `arch`, `trusted_publisher[]`, `store`, `user`, `include_untrusted` | The same resolved-metadata object as `npack resolve`, plus `trust` and `npub`; `verification.publisher_trusted` reflects the trust list even when it is empty. |
 | `ListInstalled` | `user`, `store` | Array of installed packages. |
-| `Install` | `package`, `requirement`, `relay[]`, `server[]`, `user`, `store`, `allow_capability[]`, `install_values{}`, `async` | The installed package's record, or `{"transaction_id": N}` if `async` is true. `install_values` is a per-install object keyed by descriptor id. |
+| `Install` | `package`, `requirement`, `relay[]`, `server[]`, `user`, `store`, `allow_capability[]`, `trust_once[]`, `install_values{}`, `async` | The installed package's record, or `{"transaction_id": N}` if `async` is true. `install_values` is a per-install object keyed by descriptor id. |
 | `Remove` | `package`, `user`, `store` | `{"removed": "<package>"}`. |
 | `Update` | `package` (omit for all), `relay[]`, `server[]`, `user`, `store`, `allow_capability[]`, `async` | Array of per-package update outcomes, or `{"transaction_id": N}` if `async` is true. |
-| `CheckUpdates` | `package` (omit for all), `relay[]`, `trusted_publisher[]`, `user`, `store` | Array of `{reference, current_version, available_version}`. |
+| `CheckUpdates` | `package` (omit for all), `relay[]`, `trusted_publisher[]`, `user`, `store` | Array of `{reference, current_version, available_version}`, plus `revoked` (the publisher's reason) when the installed release has been revoked. |
 | `GetTransaction` | `transaction_id` | `{"status": "running", "progress": {...}}`, `{"status": "succeeded", "result": ...}`, `{"status": "failed", "error": "..."}`, or `{"status": "cancelled"}`. |
 | `CancelTransaction` | `transaction_id` | `{"cancel_requested": true}`. |
+| `GetConfig` | none | `{first_run, config_path, relays[], blossom[], relays_defaulted, blossom_defaulted, trusted_publishers[{publisher, npub}]}`. `first_run` is true when no `config.toml` exists yet. |
+| `ListTrustedPublishers` | none | Array of `{publisher, npub}`. |
+| `AddTrustedPublisher` | `publisher` (npub, hex, or a NIP-05 `name@domain`) | `{publisher, npub}` (plus `nip05`/`label` when a name was given); the resolved key is written to `[trust].publishers` in `config.toml`. |
+| `RunDoctor` | `offline`, `user`, `store` | `{healthy, findings[{level, area, title, detail?, fix?}]}`: the same checks as `npack doctor`, with `level` one of `ok`, `info`, `warn`, `fail` and `healthy` false only if some finding is `fail`. Read-only, so not gated by PolicyKit. It can take up to about eight seconds (the relay and download checks); `offline` skips them. See "Health check" below. |
+| `GetHistory` | `package`, `limit`, `user`, `store` | Array of `{at, action, publisher, name, from?, to?, reference}`, newest first. |
+| `ListRollbacks` | `user`, `store` | Array of `{reference, current_version, previous_version}` for packages that can be switched back right now (archive and metadata verified). |
+| `Rollback` | `package`, `allow_capability[]`, `user`, `store` | `{package, from_version, to_version}`. Gated like `Update` on the system daemon. |
+| `GetIcon` | `release_event_id`, `store` | `{sha256, media_type, data}` where `data` is the base64 icon (PNG or SVG, at most 256 KiB) of a release in the local catalogue. See "Store icons" below. |
+| `ResolvePublisher` | `query` (npub, hex, or `name@domain`), `relay[]` | A publisher identity (below). Use it to show who a typed value is before trusting them. |
+| `GetPublisherProfiles` | `publishers[]` (hex or npub), `relay[]`, `refresh` | One identity per input, in order. Best effort: unreachable relays or domains give a bare identity, not an error. Cached for an hour (successful lookups only). |
+| `RemoveTrustedPublisher` | `publisher` | `{removed, publisher}`. |
+| `SaveConfig` | `relays[]`, `blossom[]` (both optional) | The new `GetConfig` result. Omitted fields keep their effective value (so `{}` saves the built-in defaults and ends first run); an empty list reverts that setting to the built-in defaults. Relays must be `ws://`/`wss://`, servers `http://`/`https://`. |
+
+`Search` results and `GetPackage` include an `app` object when the release
+published a store listing: `summary`, `description`, `homepage`, `license`,
+`categories[]`, `screenshots[]`, `release_date`, and `icon {url, sha256}`. It has
+been cleaned and bounded by npack, but it is still publisher-supplied text:
+show it as text, and do not fetch `screenshots` or `homepage` without a user
+action. `Search` also matches a query against the summary and categories.
 
 An unknown method or a request that fails to deserialize its params returns
-`{"id": ..., "error": "..."}` instead of `result`. Each connection is handled
-concurrently.
+`{"id": ..., "error": "...", "error_code": "..."}` instead of `result`. Each
+connection is handled concurrently.
+
+**Error codes.** `error` is the full human text; `error_code` is a stable
+category a frontend can map to its own wording: `unknown_method`,
+`invalid_params`, `invalid_request`, `invalid_input` (a value such as a
+publisher key or relay URL was rejected), `nip05_failed`, `not_authorized`, `no_relays`,
+`no_blossom_servers`, `relay_unreachable`, `store_busy`, `publisher_untrusted`,
+`download_failed`, `cancelled`, `no_catalogue` (nothing to browse until the catalogue has been fetched: call `Search` with `refresh`), `not_found`, `no_icon`, `no_rollback`, `rollback_blocked`, and `internal` for anything else.
+A `failed` `GetTransaction` status carries `error_code` the same way. The
+field is additive; older daemons omit it.
+
+**Health check.** `RunDoctor` is read-only and open to every local user, so the
+daemon runs one check at a time and reuses a finished result for three seconds,
+which absorbs a burst of identical requests without making "Check again" stale.
+The checks that hash installed archives run on a blocking thread so they do not
+hold up other requests.
+
+**Store icons.** `GetIcon` fetches the icon named by a release already in the
+daemon's local catalogue; a caller cannot supply a URL, so it is not a general
+fetch service. The fetch must be `https` to a public domain name (no IP
+literals, ports or local names), follows no redirects, is capped at 256 KiB,
+must match the SHA-256 the publisher signed, and must be a PNG or SVG by its
+bytes. Verified icons are cached under `<store>/icons/<sha256>` and re-checked
+against their hash each time they are served. Releases published to a local
+`http://` Blossom server (for example `nak serve`) therefore show no icon in a
+GUI; that is deliberate. Error code `no_icon` means the release has none.
+
+**Publisher names (NIP-05).** A publisher is a key; a name like
+`alice@example.com` is only a readable pointer to one, so the key is always what
+is stored and trusted. An identity is `{publisher, npub, label?, nip05?,
+nip05_verified, claimed_name?}`:
+
+- `label` is present only when the publisher's profile (kind 0) claims a NIP-05
+  name **and** that domain's `/.well-known/nostr.json` maps the name back to the
+  same key. It is the one name a frontend may show as verified.
+- `nip05` and `claimed_name` are self-reported by the profile and are not
+  verified: anyone can claim any name. Frontends must label them as such.
+- Typing a `name@domain` into `ResolvePublisher`/`AddTrustedPublisher` resolves
+  it through the domain, which vouches for the key at that moment.
+
+Lookups are HTTPS-only, never follow redirects (as NIP-05 requires), time out
+after 10 seconds, cap the response at 64 KiB, and refuse IP literals, ports and
+local-only domains (`localhost`, `.local`, `.internal`, `.lan`, ...). A failed
+lookup returns `error_code` `nip05_failed`. Lookups tell the domain's operator
+that someone resolved that name, and tell relays which profiles were requested.
+They are read-only and not PolicyKit-gated, so on the system daemon any local
+user can make it fetch a public domain's `nostr.json`.
+
+**Zero-config defaults.** When `[network].relays` or `[storage].blossom` is
+empty or the file is missing, npack uses built-in public relays and Blossom
+servers (`DEFAULT_RELAYS` / `DEFAULT_BLOSSOM_SERVERS` in `npack-cli`) instead
+of failing, for the CLI and the daemon alike. They are only written to
+`config.toml` if the user saves settings. No publisher is trusted by default.
+
+**Trust and `include_untrusted`.** On the CLI, an empty `[trust].publishers`
+list accepts any publisher and a non-empty list hides all others. The daemon
+keeps that behaviour for scripts, and adds `include_untrusted` plus a per-result
+`trust` field so a GUI can show publishers the user has not trusted yet and ask
+first: "Trust and install" (`AddTrustedPublisher`, then `Install`) or "Install
+once" (`Install` with `trust_once`). The confirmation is a frontend policy; the
+daemon's enforcement is still the configured list.
 
 By default `Install` and `Update` run to completion before responding. Pass
 `"async": true` to get `{"transaction_id": N}` back immediately and poll
@@ -675,8 +848,10 @@ credentials read off the socket (`SO_PEERCRED`), not anything the client
 claims. This is the same model PackageKit and other system package
 services use.
 
-The three actions -- `io.npack.install`, `io.npack.remove`, `io.npack.update`
--- are defined in [`packaging/io.npack.policy`](../packaging/io.npack.policy),
+The four actions -- `io.npack.install`, `io.npack.remove`, `io.npack.update`
+and `io.npack.configure` (which gates `AddTrustedPublisher`,
+`RemoveTrustedPublisher` and `SaveConfig`, since they change what root will
+install) -- are defined in [`packaging/io.npack.policy`](../packaging/io.npack.policy),
 which a system package installs to `/usr/share/polkit-1/actions/`. They
 default to `auth_admin`, so a non-root caller normally sees their desktop's
 usual "authenticate as an administrator" prompt (handled by whatever
@@ -692,12 +867,21 @@ Updates, Remove -- purely as a client of the protocol documented above, with
 no dependency on `npack-cli`'s internals:
 
 ```bash
-npack daemon &
 cargo run --release -p npack-gui
 ```
 
-It reads/writes `$XDG_RUNTIME_DIR/npackd.sock` by default; the socket path
-is editable in its top bar for talking to a different instance.
+If nothing is listening on the socket, the app starts `npack daemon` for you
+(found next to the app's own executable, otherwise on `PATH`) in its own
+process group, so closing the window does not stop it. It only ever does this
+when nothing is listening: `npack daemon` replaces an existing socket, so a
+second one would orphan the first. If it cannot start the service it says so and
+offers "Try again".
+
+It reads and writes `$XDG_RUNTIME_DIR/npackd.sock` by default. To talk to a
+different instance, change the socket path under Settings, Advanced.
+
+A daemon started this way (or by plain `npack daemon`) is npackd-user, so it
+installs into your own prefix (`~/.local`), never the system one.
 
 ## Configuration
 
@@ -738,6 +922,36 @@ used to discover publisher Blossom servers through `kind:10063` events.
 Publisher keys may be written as `npub` values. Internally, npack compares
 canonical hexadecimal public keys so equivalent representations cannot create
 separate identities.
+
+### Managing trusted publishers: `npack trust`
+
+You do not have to edit `config.toml` by hand:
+
+```bash
+npack trust add alice@example.com      # or an npub, or a 64-character hex key
+npack trust list [--names]
+npack trust remove npub1...
+```
+
+`add` shows the resolved key and asks before trusting it. A NIP-05 name such
+as `alice@example.com` only helps you find the key: the name is looked up
+through the domain, the resolved `npub` is displayed for you to check, and the
+`npub` is what is stored. For an `npub` or hex key, `add` also looks up the
+publisher's profile and labels any name it finds as verified (the domain
+confirms the key) or unverified (the profile merely claims it). It will not
+change the list without a confirmation: answer `y` at the prompt, or pass
+`--yes`. When stdin is not a terminal, `--yes` is required, so a script cannot
+trust someone by accident.
+
+`list` is offline by default and prints `npub`s; `--names` looks up each
+publisher's verified name (contacting relays and their domains). `remove`
+accepts a name, `npub` or hex key and fails if that publisher was not trusted.
+Only the `[trust].publishers` list is rewritten: other settings are kept, but
+comments in `config.toml` are not, and a config file that does not parse is
+left untouched.
+
+A running `npackd` notices changes to `config.toml` on its next request, so
+`npack trust` and the GUI's Settings tab stay in step without a restart.
 
 ## Trust and security
 
@@ -895,6 +1109,36 @@ npack remove npub1.../myapp --user
 Removal is refused when another installed package depends on the package or
 when removing it would leave a required runtime capability unavailable.
 
+### History and rollback
+
+Every install, upgrade, downgrade, rollback and removal is recorded in
+`history.jsonl` in the store. View it, and switch a package back to the version
+it replaced:
+
+```bash
+npack history [<publisher>/<name>] [--limit 20] [--user]
+npack rollback <publisher>/<name> [--user] [--allow-capability <capability>]
+```
+
+`rollback` works offline. npack keeps each installed version's archive and the
+signed release metadata it cached when it resolved that version, so a rollback
+is an ordinary transactional install of the stored archive, not a separate
+restore mechanism. Before changing anything it checks that:
+
+- history names an earlier version (a fresh install has none);
+- the stored archive still hashes to the SHA-256 recorded for it;
+- the signed release event cached for that version is still present and valid;
+- no installed package depends on a version range the older version fails to
+  satisfy.
+
+If any check fails it says why and leaves the install untouched. Running
+`rollback` again switches forward to the version you just left. It does not
+check whether the older version has since been revoked (that needs the network):
+run `npack update --check`, which reports revoked installs.
+
+Old versions' archives are kept until the package is removed, so they use disk
+space; `remove` deletes all of them.
+
 ### Transaction locking and interrupted-install recovery
 
 Every `install`/`remove` against a given store (system, `--user`, or a
@@ -915,6 +1159,44 @@ proceeds normally. No manual cleanup of the store is needed after an
 interrupted operation.
 
 ## Troubleshooting
+
+### Start with `npack doctor`
+
+```bash
+npack doctor            # a report, grouped by area, with a suggested fix for each finding
+npack doctor --offline  # skip the relay and download-server checks
+npack doctor --json     # the same findings as JSON, for scripts and other tools
+```
+
+`doctor` changes nothing. It checks the config file (and that every trusted
+publisher entry is a valid key), the package store (writable, a stale lock or
+transaction left by an interrupted install, a readable `installed.json`, and
+that every installed package's archive still matches its recorded hash and its
+files are still there), the catalogue (present and how old), whether `npackd` is
+answering, whether helpers such as `notify-send` and PolicyKit are installed and
+the daily update check is set up, and finally whether each configured relay and
+download server answers (all at once, so a dead one costs at most eight
+seconds).
+
+Each finding is one of four kinds: a tick (fine), a dot (just worth knowing),
+`!` (something is off but npack still works) or `✗` (npack can't do its job).
+The command exits with status 1 only when there is a `✗`, so it can be used in
+scripts. A missing relay is a warning; having *no* working relay is a failure.
+A missing optional helper is never more than a note.
+
+The GUI has the same check as a **Health** tab, driven by the daemon's
+`RunDoctor` method. It runs once when the app starts, shows a badge on the tab
+(`Health (2)` for warnings, `Health ✗` when something stops npack working), and
+shows a warning strip on every tab for the latter. "Check again" reruns it. When
+run by the daemon, the "is the service running" check is replaced by "This
+service is running", since a service cannot meaningfully ask itself.
+
+It runs even when the config file is broken, which stops every other command at
+startup, and shows the line the parser objected to. Pass `--user`, `--system` or
+`--store` to choose which package store to inspect, as with other commands. It
+only reads: a stale lock is reported but left for the next install to recover,
+and the one thing it writes is a tiny file it creates and deletes in the store to
+test that the folder is writable.
 
 ### `no verified release found`
 
@@ -972,15 +1254,22 @@ npack manifest <file.npk> --output <manifest.json>
 npack install <file.npk> [--user|--system|--store <path>]
 npack verify <file.npk-or-manifest.json>
 npack refresh [--relay <url>] [--pubkey <hex>] [--store <path>]
-npack search <query> [--refresh] [--no-cache] [--relay <url>] [--store <path>]
+npack search <query> [--refresh] [--no-cache] [--relay <url>] [--category <name>] [--sort name|recent] [--limit <n>] [--store <path>]
+npack categories [--refresh] [--all-platforms] [--relay <url>] [--store <path>]
 npack info [<publisher>/]<name> [--trusted-publisher <hex>] [--store <path>]
+npack trust add <name@domain|npub|hex> [--yes] [--relay <url>]
+npack trust remove <name@domain|npub|hex>
+npack trust list [--names] [--relay <url>]
 npack install <publisher>/<name> [options]
 npack install-ref <publisher>/<name> [options]  # compatibility alias
 npack resolve <publisher>/<name> --relay <url> [options]
 npack update <publisher>/<name> [options]
 npack list [--user|--system]
 npack verify-installed [--user|--system]
+npack doctor [--user|--system] [--store <path>] [--offline] [--json]
 npack remove <publisher>/<name> [--user|--system]
+npack history [<publisher>/<name>] [--limit <n>] [--user|--system]
+npack rollback <publisher>/<name> [--user|--system] [--allow-capability <capability>]
 npack publish <manifest> --secret-key <key> [options]
 npack appstream <file.npk> [--output <metainfo.xml>]
 npack daemon [--socket <path>] [--system]

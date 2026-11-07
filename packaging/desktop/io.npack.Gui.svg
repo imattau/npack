@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5b9bf5"/>
+      <stop offset="1" stop-color="#2d56b8"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+  <!-- An open parcel, drawn as an isometric cube: lit top, shaded sides. -->
+  <polygon points="64,26 98,45 64,64 30,45" fill="#ffffff"/>
+  <polygon points="30,45 64,64 64,104 30,84" fill="#ffffff" fill-opacity="0.72"/>
+  <polygon points="98,45 64,64 64,104 98,84" fill="#ffffff" fill-opacity="0.50"/>
+  <!-- Tape across the top and down the front edge. -->
+  <polygon points="64,26 76,32.7 42,51.7 30,45" fill="#2d56b8" fill-opacity="0.35"/>
+  <polygon points="64,64 76,57.3 76,97.3 64,104" fill="#2d56b8" fill-opacity="0.30"/>
+</svg>

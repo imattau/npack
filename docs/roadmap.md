@@ -234,8 +234,8 @@ metadata (summary, description, icon, ...) is used locally by `npack
 appstream`, but publishing it into Nostr release-event tags was never
 built, so there is currently nothing for a relay-sourced catalogue to
 carry. `npack info` reflects this honestly by not fabricating AppStream
-fields; publishing `app` metadata to Nostr is unstarted future work, likely
-alongside Phase 5's reference GUI once there is a consumer that wants it.
+fields. (Since closed: `app` listing metadata is now published as release
+tags and returned by `Search`/`GetPackage`; see the first-run slice below.)
 
 ## Phase 5: Reference GUI (done)
 
@@ -282,6 +282,56 @@ real daemon's socket (`nc -U`) confirmed the exact response shape
 this was built in, so the actual rendered window was not visually
 inspected as part of this work -- a reasonable next step for whoever picks
 up Phase 6 or 7 is a manual click-through on a normal desktop.
+
+### First-run and trust UX slice (shipped)
+
+A normal desktop user should never need to edit `config.toml`. The daemon now
+works with no config (built-in public relays and Blossom servers), reports
+`first_run`, and exposes `GetConfig`, `AddTrustedPublisher`,
+`RemoveTrustedPublisher` and `SaveConfig`. `Search`/`GetPackage` can return
+publishers outside the trust list (`include_untrusted`) marked `unknown`, and
+responses carry stable `error_code`s. `npack-gui` uses these for a welcome
+screen, a Settings tab, a "trust this publisher?" dialog and plain-language
+errors. `npack trust add|remove|list` gives the CLI the same name lookup and
+confirmation, and a running daemon reloads `config.toml` when it changes.
+Publisher names follow: NIP-05 names can be typed to find a publisher,
+and verified names (confirmed by the publisher's domain) are shown instead of
+npubs, with self-reported names marked unverified. Not yet done: `name@domain`
+in package references, curated starter trust sets, and verifying the default
+endpoints against live infrastructure.
+
+Store-listing metadata (summary, description, homepage, license, categories,
+screenshots, release date and an icon blob) is now published as additive
+release tags by `npack publish`, validated strictly on the way out and read
+leniently and sanitised on the way in. The daemon fetches and verifies icons (`GetIcon`) and `npack-gui` shows
+icons, summaries, categories and a structured details pane.
+
+Update checks now run in the background: `npack update --check --notify` with a
+systemd user timer sends one desktop notification per new update and escalates
+when an installed package has been revoked; the GUI checks at start, with update
+buttons and a revocation warning. `npack history` and `npack rollback` (also in the
+daemon and GUI) record every change and let a package be switched back to the
+version it replaced, offline, after re-verifying the stored archive and the
+cached signed metadata. The GUI now has a Browse tab with category filters,
+a "recently updated" view, a trusted-publishers-only filter and paging, and the
+CLI has `npack categories` and `search --category/--sort/--limit`. Still to do:
+curated "featured" lists (there is no curation source yet), and screenshots
+(which need a privacy-preserving way to fetch them).
+
+Distribution: releases now ship `npack` (no graphics libraries), `npack-gui` and
+an `npack-desktop` meta-package as `.deb` and `.rpm`, plus `.npk` archives for
+Nostr. The desktop app starts its own background service and has a launcher
+entry and icon. Still to do: a Flatpak or AppImage for distributions without a
+package, a proper copyright file and changelog in the `.deb`, and the native
+store integrations (Phases 6-8).
+
+`npack doctor` diagnoses a setup (config, store, interrupted installs, damaged
+packages, catalogue age, the local service, helper tools, and relay and download
+reachability) with a suggested fix for each finding, and works even when the
+config file is broken. The GUI has the same check as a Health tab (daemon method
+`RunDoctor`), run at start with a badge and a warning strip when something stops
+npack working. Not yet done: checking installed packages for revocation from
+doctor, which `npack update --check` still does.
 
 ## Phase 6: COSMIC Store integration
 
