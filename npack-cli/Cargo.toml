@@ -1,6 +1,6 @@
 [package]
 name = "npack"
-version = "0.7.1"
+version = "0.7.2"
 edition.workspace = true
 description = "A Nostr-native package manager"
 license.workspace = true
