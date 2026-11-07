@@ -195,6 +195,67 @@ The package root should contain payload paths relative to the host root:
 `bin/`, `lib/`, `share/`, `etc/`, and so on. Do not put `/usr` or `/home`
 inside the archive unless that is deliberately part of the target layout.
 
+### Hard-coded install paths
+
+The same package is installed under `~/.local` for one person and under `/` for
+everyone, so a file that names an absolute location works in one mode and
+breaks in the other. `npack pack` (and `npack publish`, which checks the
+finished archive) warns about:
+
+- **Your own files by absolute path:** `ExecStart=/usr/bin/app` or
+  `DATA=/usr/share/app/data` in a unit, script, `.desktop` or config file, when
+  the package installs `bin/app` or `share/app/data` itself. References to
+  system tools (`/usr/bin/env`, `/etc/ssl`) are fine.
+- **Build-machine paths:** the directory you packed from, `/home/<name>`,
+  `/Users/<name>`, `/root`, CI work folders. In binaries only the directory you
+  packed from is reported, because compilers record their own toolchain's paths.
+- **Absolute library paths:** an ELF `RPATH`/`RUNPATH` outside `/lib`, `/usr/lib`
+  and friends. Use `$ORIGIN/../lib`.
+- **Absolute symlink targets.**
+
+Documentation, man pages, licences and translations are skipped, as are
+`.npack/` files. Nothing in the package is ever run: the check only reads
+bytes. Findings are warnings by default; `npack pack --strict` fails (before
+writing anything) so a build script can insist. A path that is hard-coded on
+purpose is allowed with `--allow-path /usr/share/zoneinfo` (repeatable) or by
+listing it, one absolute prefix per line, in `.npack/path-allow.txt` inside the
+package.
+
+#### Writing paths that move: `{{prefix}}`
+
+Instead of a fixed path, a package can write `{{prefix}}` where its install
+location belongs, in the text files that need it (service files, launchers,
+wrapper scripts). List those files in `.npack/templates.txt`, one
+package-relative path per line (`#` starts a comment):
+
+```text
+# .npack/templates.txt
+lib/systemd/user/app.service
+share/applications/app.desktop
+```
+
+```ini
+# lib/systemd/user/app.service
+[Service]
+ExecStart={{prefix}}/bin/app --serve
+```
+
+When the package is installed, npack replaces `{{prefix}}` in exactly the listed
+files with the prefix it installs under: `/home/me/.local` for a user install, so
+the line becomes `ExecStart=/home/me/.local/bin/app --serve`, and nothing for an
+install at `/`, so it becomes `ExecStart=/bin/app --serve` (lay the package out
+the way you want it to land under `/`). Only `{{prefix}}` is expanded: no
+environment, no commands, and files that are not listed are installed exactly as
+they are. The list is inside the archive, so the same signed hash covers it, and
+the stored archive stays untouched, so a rollback or reinstall fills in the
+placeholder again for wherever it lands.
+
+`npack pack` checks the list: a listed file that is missing, a link, too big
+(over 1 MiB) or not text is an error, and a file that uses `{{prefix}}` without
+being listed (or is listed without using it) is a warning, so the placeholder
+never reaches a user unexpanded. An install refuses the same problems before it
+writes anything.
+
 ## Manifest fields
 
 The important fields are:
