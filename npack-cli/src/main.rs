@@ -6,6 +6,7 @@ use futures_util::StreamExt;
 use goblin::Object;
 
 mod pathcheck;
+mod templates;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use nostr_blossom::prelude::BlossomClient;
 use nostr_sdk::prelude::*;
@@ -2774,8 +2775,9 @@ fn print_path_findings(findings: &[pathcheck::Finding]) {
         return;
     }
     eprintln!(
-        "warning: {} hard-coded path(s) found. The same package is installed under \
-         ~/.local for one person and under / for everyone, so these may work in only one mode:",
+        "warning: {} path problem(s) found. The same package is installed under \
+         ~/.local for one person and under / for everyone, so a fixed path may work in only \
+         one mode:",
         findings.len()
     );
     for finding in findings.iter().take(pathcheck::MAX_SHOWN) {
@@ -2803,6 +2805,7 @@ fn pack_with_path_checks(
     }
     if source.is_dir() {
         let entries = pathcheck::load_dir(source)?;
+        templates::validate_entries(&entries)?;
         let mut allow = pathcheck::allow_from_entries(&entries);
         allow.extend(extra_allow.iter().cloned());
         let root = fs::canonicalize(source)
@@ -9071,6 +9074,9 @@ fn install_locked(
             fs::remove_dir_all(&staging)?;
         }
         extract_npk(&destination, &staging)?;
+        // Fill in {{prefix}} in the files the package lists as templates,
+        // before anything is copied into the prefix.
+        templates::apply_to_staging(&staging, prefix)?;
         install_staged_npk(&staging, prefix, &npk_entry_paths(&destination)?)?
     } else {
         vec![destination.clone()]

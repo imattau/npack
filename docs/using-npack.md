@@ -221,6 +221,41 @@ purpose is allowed with `--allow-path /usr/share/zoneinfo` (repeatable) or by
 listing it, one absolute prefix per line, in `.npack/path-allow.txt` inside the
 package.
 
+#### Writing paths that move: `{{prefix}}`
+
+Instead of a fixed path, a package can write `{{prefix}}` where its install
+location belongs, in the text files that need it (service files, launchers,
+wrapper scripts). List those files in `.npack/templates.txt`, one
+package-relative path per line (`#` starts a comment):
+
+```text
+# .npack/templates.txt
+lib/systemd/user/app.service
+share/applications/app.desktop
+```
+
+```ini
+# lib/systemd/user/app.service
+[Service]
+ExecStart={{prefix}}/bin/app --serve
+```
+
+When the package is installed, npack replaces `{{prefix}}` in exactly the listed
+files with the prefix it installs under: `/home/me/.local` for a user install, so
+the line becomes `ExecStart=/home/me/.local/bin/app --serve`, and nothing for an
+install at `/`, so it becomes `ExecStart=/bin/app --serve` (lay the package out
+the way you want it to land under `/`). Only `{{prefix}}` is expanded: no
+environment, no commands, and files that are not listed are installed exactly as
+they are. The list is inside the archive, so the same signed hash covers it, and
+the stored archive stays untouched, so a rollback or reinstall fills in the
+placeholder again for wherever it lands.
+
+`npack pack` checks the list: a listed file that is missing, a link, too big
+(over 1 MiB) or not text is an error, and a file that uses `{{prefix}}` without
+being listed (or is listed without using it) is a warning, so the placeholder
+never reaches a user unexpanded. An install refuses the same problems before it
+writes anything.
+
 ## Manifest fields
 
 The important fields are:

@@ -56,6 +56,10 @@ pub enum Rule {
     BuildLeak,
     Runpath,
     AbsoluteSymlink,
+    /// A text file that uses `{{prefix}}` but is not listed as a template.
+    UnlistedPlaceholder,
+    /// A listed template that never uses `{{prefix}}`.
+    UnusedTemplate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -79,6 +83,14 @@ impl Finding {
                  wherever the package is installed"
             }
             Rule::AbsoluteSymlink => "an absolute symlink target; make it relative",
+            Rule::UnlistedPlaceholder => {
+                "uses {{prefix}} but is not listed in .npack/templates.txt, so it would be \
+                 installed with the placeholder as it is"
+            }
+            Rule::UnusedTemplate => {
+                "is listed in .npack/templates.txt but has no {{prefix}}; remove it from the \
+                 list, or add the placeholder"
+            }
         }
     }
 
@@ -219,6 +231,7 @@ pub fn check(entries: &[Entry], options: &Options) -> Vec<Finding> {
             EntryKind::Dir => {}
         }
     }
+    let listed: HashSet<String> = templates_from_entries(entries).into_iter().collect();
     let mut findings = Vec::new();
     for entry in entries {
         if entry.path.starts_with(".npack/") {
@@ -236,12 +249,66 @@ pub fn check(entries: &[Entry], options: &Options) -> Vec<Finding> {
                     });
                 }
             }
-            EntryKind::File(bytes) => check_file(&entry.path, bytes, &own, options, &mut findings),
+            EntryKind::File(bytes) => {
+                check_placeholders(&entry.path, bytes, &listed, &mut findings);
+                check_file(&entry.path, bytes, &own, options, &mut findings);
+            }
         }
     }
     findings.sort();
     findings.dedup();
     findings
+}
+
+/// The package-relative paths in the package's templates list (leniently: a
+/// list that does not parse is reported when packing, not here).
+pub fn templates_from_entries(entries: &[Entry]) -> Vec<String> {
+    entries
+        .iter()
+        .find(|entry| entry.path == crate::templates::TEMPLATES_FILE)
+        .and_then(|entry| match &entry.kind {
+            EntryKind::File(bytes) => std::str::from_utf8(bytes).ok(),
+            _ => None,
+        })
+        .and_then(|text| crate::templates::parse_list(text).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect()
+}
+
+/// `{{prefix}}` used without being listed, and listed without being used.
+fn check_placeholders(
+    path: &str,
+    bytes: &[u8],
+    listed: &HashSet<String>,
+    findings: &mut Vec<Finding>,
+) {
+    let is_listed = listed.contains(path);
+    if (is_document(path) && !is_listed) || bytes.starts_with(b"\x7fELF") {
+        return;
+    }
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return;
+    };
+    let first_use = text
+        .lines()
+        .position(|line| line.contains(crate::templates::PLACEHOLDER));
+    match (first_use, is_listed) {
+        (Some(line), false) => findings.push(Finding {
+            file: path.to_owned(),
+            line: Some(line + 1),
+            rule: Rule::UnlistedPlaceholder,
+            text: crate::templates::PLACEHOLDER.to_owned(),
+        }),
+        (None, true) => findings.push(Finding {
+            file: path.to_owned(),
+            line: None,
+            rule: Rule::UnusedTemplate,
+            text: "(no placeholder)".to_owned(),
+        }),
+        _ => {}
+    }
 }
 
 fn check_file(
@@ -675,6 +742,49 @@ mod tests {
         );
         assert!(absolute_paths("see //double and https://h/p and a/b").is_empty());
         assert_eq!(absolute_paths("cd /srv/app."), ["/srv/app"]);
+    }
+
+    #[test]
+    fn placeholders_must_be_listed_and_listed_templates_must_use_one() {
+        let templates = crate::templates::TEMPLATES_FILE;
+        let findings = run(&[
+            file(templates, "lib/ok.service\nlib/unused.service\n"),
+            file("bin/app", "x"),
+            file("lib/ok.service", "ExecStart={{prefix}}/bin/app\n"),
+            file("lib/unused.service", "ExecStart=/bin/true\n"),
+            file(
+                "lib/forgot.service",
+                "[Service]\nExecStart={{prefix}}/bin/app\n",
+            ),
+            // Documents may talk about the placeholder.
+            file("share/doc/app/README", "write {{prefix}} here\n"),
+        ]);
+        let hits: Vec<_> = findings
+            .iter()
+            .map(|f| (f.file.as_str(), f.line, f.rule))
+            .collect();
+        assert_eq!(
+            hits,
+            [
+                ("lib/forgot.service", Some(2), Rule::UnlistedPlaceholder),
+                ("lib/unused.service", None, Rule::UnusedTemplate),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_placeholder_path_is_not_a_hard_coded_one_but_other_paths_in_a_template_still_are() {
+        let findings = run(&[
+            file(crate::templates::TEMPLATES_FILE, "lib/app.service\n"),
+            file("bin/app", "x"),
+            file(
+                "lib/app.service",
+                "ExecStart={{prefix}}/bin/app\nExecStop=/usr/bin/app --stop\n",
+            ),
+        ]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, Rule::OwnFile);
+        assert_eq!(findings[0].line, Some(2));
     }
 
     #[test]
