@@ -212,7 +212,7 @@ The important fields are:
 | `runtime_requires` | Host capabilities needed by the package, such as ELF libraries. |
 | `provides` | Capabilities supplied to other packages. |
 | `post_install` | Declarative, capability-gated installation actions. |
-| `app` | Optional desktop-store metadata: `summary`, `description`, `homepage`, `license`, `categories`, `icon`, `screenshots`, `desktop_file`, `release_date`. See [AppStream metadata](#appstream-metadata) below. |
+| `app` | Optional desktop-store metadata: `summary`, `description`, `homepage`, `license`, `categories`, `icon`, `screenshots`, `desktop_file`, `release_date`, `release_notes`, `support_url`. See [AppStream metadata](#appstream-metadata) below. |
 
 Packages may also set `app.install_inputs` to an array of install-time input
 descriptors. Each has an identifier, a namespaced `value_type`, `required`,
@@ -273,10 +273,21 @@ Linux application stores already understand:
     "icon": "share/icons/myapp.png",
     "screenshots": ["https://example.com/myapp/screenshot.png"],
     "desktop_file": "myapp.desktop",
-    "release_date": "2026-01-15"
+    "release_date": "2026-01-15",
+    "release_notes": "Fixes a crash on start.\nFaster search.",
+    "support_url": "https://example.com/myapp/help"
   }
 }
 ```
+
+`release_notes` (at most 2000 characters) is the "what's new" for this version
+and `support_url` an http(s) page for help; both are published with the
+release so a store can show them without downloading the package. The package
+size and installed size are not written by hand: `npack publish` measures the
+artifact it uploads and the files inside it and adds them to the release event.
+`npack publish` also warns when a release has no summary or categories, because
+a store cannot describe it or list it under a category (publish again with an
+`app` section to fix it; the newer event replaces the older one).
 
 `icon` and `desktop_file` are package-relative paths to files included in the
 `.npk`; `npack pack` checks both exist in the source directory, and validates
@@ -390,6 +401,10 @@ common spelling. `--sort recent` orders by when the release event was
 published, which the publisher sets, so treat it as a convenience rather than
 a guarantee. Search also matches a query against each package's summary and
 categories, not just its name.
+
+Packages whose release lists no category (older releases, or ones published
+without an `app` section) are not hidden: `npack categories` ends with an
+"(uncategorised)" line and `npack search "" --uncategorised` lists them.
 
 Install a publisher-qualified package:
 
@@ -701,7 +716,7 @@ Supported methods, mirroring the CLI operations above:
 | Method | Params | Result |
 | --- | --- | --- |
 | `Search` | `query` (empty matches everything), `relay[]`, `trusted_publisher[]`, `pubkey`, `refresh`, `no_cache`, `include_untrusted`, `category`, `sort` (`name` or `recent`), `limit`, `offset`, `only_trusted`, `host_only` | Array of matching releases, each with `trust` (`"trusted"` or `"unknown"`), `npub`, `published_at` and `compatible` (whether its os/arch fit this machine). With `include_untrusted` the trust list does not filter results. `only_trusted` keeps only publishers in the daemon's trust list (an empty list trusts no one); `host_only` keeps only compatible releases; `category` is case-insensitive. Filters apply before `sort`, `offset` and `limit`. |
-| `ListCategories` | the same filters as `Search` (`category`, `sort`, `limit` and `offset` are ignored) | Array of `{category, count}`, most populous first, over the same set a browse view draws from. |
+| `ListCategories` | the same filters as `Search` (`category`, `sort`, `limit` and `offset` are ignored) | Array of `{category, count}`, most populous first, over the same set a browse view draws from. When some packages list no category (and there is at least one real category), the last entry is `{category: "Uncategorised", count, uncategorised: true}`; list those with `Search` and `"uncategorised": true`. |
 | `GetPackage` | `package`, `relay[]`, `requirement`, `os`, `arch`, `trusted_publisher[]`, `store`, `user`, `include_untrusted` | The same resolved-metadata object as `npack resolve`, plus `trust` and `npub`; `verification.publisher_trusted` reflects the trust list even when it is empty. |
 | `ListInstalled` | `user`, `store` | Array of installed packages. |
 | `Install` | `package`, `requirement`, `relay[]`, `server[]`, `user`, `store`, `allow_capability[]`, `trust_once[]`, `install_values{}`, `async` | The installed package's record, or `{"transaction_id": N}` if `async` is true. `install_values` is a per-install object keyed by descriptor id. |
@@ -725,10 +740,17 @@ Supported methods, mirroring the CLI operations above:
 
 `Search` results and `GetPackage` include an `app` object when the release
 published a store listing: `summary`, `description`, `homepage`, `license`,
-`categories[]`, `screenshots[]`, `release_date`, and `icon {url, sha256}`. It has
+`categories[]`, `screenshots[]`, `release_date`, `release_notes`, `support_url`,
+`download_size`, `installed_size` (bytes, the publisher's statement), and
+`icon {url, sha256}`. It has
 been cleaned and bounded by npack, but it is still publisher-supplied text:
-show it as text, and do not fetch `screenshots` or `homepage` without a user
-action. `Search` also matches a query against the summary and categories.
+show it as text, and do not fetch `screenshots`, `homepage` or `support_url`
+without a user action. Results also carry `details` when the release declares
+anything a person should see before installing: `repo`, `commit`, `depends[]`,
+`requires[]` and `post_install[]` (what installing does besides unpacking
+files, such as `register-service lib/systemd/user/app.service`). Only the
+newest event for each publisher, name, version, os and arch is returned, so a
+republished listing replaces the old one. `Search` also matches a query against the summary and categories.
 
 An unknown method or a request that fails to deserialize its params returns
 `{"id": ..., "error": "...", "error_code": "..."}` instead of `result`. Each
@@ -1266,7 +1288,7 @@ npack manifest <file.npk> --output <manifest.json>
 npack install <file.npk> [--user|--system|--store <path>]
 npack verify <file.npk-or-manifest.json>
 npack refresh [--relay <url>] [--pubkey <hex>] [--store <path>]
-npack search <query> [--refresh] [--no-cache] [--relay <url>] [--category <name>] [--sort name|recent] [--limit <n>] [--store <path>]
+npack search <query> [--refresh] [--no-cache] [--relay <url>] [--category <name> | --uncategorised] [--sort name|recent] [--limit <n>] [--store <path>]
 npack categories [--refresh] [--all-platforms] [--relay <url>] [--store <path>]
 npack info [<publisher>/]<name> [--trusted-publisher <hex>] [--store <path>]
 npack trust add <name@domain|npub|hex> [--yes] [--relay <url>]

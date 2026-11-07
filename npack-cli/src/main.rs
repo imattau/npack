@@ -446,6 +446,12 @@ enum Command {
             help = "Only packages listing this category (case-insensitive); see `npack categories`"
         )]
         category: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "category",
+            help = "Only packages that list no category"
+        )]
+        uncategorised: bool,
         #[arg(long, help = "Order results by: name or recent (newest first)")]
         sort: Option<String>,
         #[arg(long, help = "Show at most this many results")]
@@ -934,6 +940,22 @@ struct AppMetadata {
     /// (and read back from the release event); never written by hand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     icon_blob: Option<IconBlob>,
+    /// "What's new" for this version, shown by stores next to an update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    release_notes: Option<String>,
+    /// Where to ask for help or report a problem (http or https). Shown as a
+    /// link the user chooses to open; never fetched by npack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    support_url: Option<String>,
+    /// Size in bytes of the published artifact. Set by `npack publish` from
+    /// the file it uploads (and read back from the release event); never
+    /// written by hand. The signed SHA-256 stays the authority over the bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    download_size: Option<u64>,
+    /// Total size in bytes of the regular files the package installs. Set by
+    /// `npack publish`, like `download_size`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    installed_size: Option<u64>,
     /// RFC 3339 date this version was released, e.g. "2026-01-15". Optional
     /// because a bare .npk built with `pack` has no release timestamp of its
     /// own; set by publishers who want a `<releases>` entry in the generated
@@ -1233,6 +1255,7 @@ async fn main() -> Result<()> {
             no_cache,
             store,
             category,
+            uncategorised,
             sort,
             limit,
         } => {
@@ -1242,6 +1265,7 @@ async fn main() -> Result<()> {
             let root = store.unwrap_or_else(default_store);
             let options = SearchOptions {
                 category,
+                uncategorised,
                 sort: SearchSort::parse(sort.as_deref())?,
                 limit,
                 offset: 0,
@@ -1287,6 +1311,12 @@ async fn main() -> Result<()> {
             }
             for (category, count) in counts {
                 println!("{category} ({count})");
+            }
+            let uncategorised = uncategorised_count(&results);
+            if uncategorised > 0 {
+                println!(
+                    "(uncategorised) ({uncategorised}); list them with `npack search --uncategorised`"
+                );
             }
         }
         Command::Refresh {
@@ -4121,6 +4151,10 @@ fn manifest_from_release(event: &Event, artifact: &Path, sha256: &str) -> Result
         "license",
         "release-date",
         "icon",
+        "release-notes",
+        "support",
+        "download-size",
+        "installed-size",
     ] {
         let count = event.tags.iter().filter(|tag| tag.kind() == kind).count();
         if count > 1 {
@@ -4518,6 +4552,123 @@ struct SearchResult {
     published_at: u64,
     /// Whether this release's os/arch tags fit the machine npack runs on.
     compatible: bool,
+    /// Technical facts from the signed event that tell a person what
+    /// installing does (post-install actions, requirements, source). Absent
+    /// when the release declares none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<ReleaseDetails>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+struct ReleaseDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit: Option<String>,
+    /// Other packages this one needs, as "name requirement" (or
+    /// "publisher/name requirement" when the publisher is named).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    depends: Vec<String>,
+    /// Libraries and capabilities it needs on the system.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    requires: Vec<String>,
+    /// What the install does besides unpacking files, as "action path".
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    post_install: Vec<String>,
+}
+
+/// Reads the facts a person should see before installing straight from the
+/// release event's tags (lenient: anything malformed is skipped).
+fn release_details(event: &Event) -> Option<ReleaseDetails> {
+    let list = |kind: &str| -> Vec<String> {
+        event
+            .tags
+            .iter()
+            .filter(|tag| tag.kind() == kind)
+            .filter_map(Tag::content)
+            .map(|text| text.chars().take(200).collect())
+            .collect()
+    };
+    let depends = event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind() == "depends")
+        .filter_map(|tag| {
+            let values = tag.clone().to_vec();
+            match values.len() {
+                3 => Some(format!("{} {}", values[1], values[2])),
+                4.. => Some(format!(
+                    "{}/{} {}",
+                    short_hex(&values[1]),
+                    values[2],
+                    values[3]
+                )),
+                _ => None,
+            }
+        })
+        .map(|text: String| text.chars().take(200).collect())
+        .collect();
+    let post_install = event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind() == "post-install")
+        .filter_map(|tag| {
+            let values = tag.clone().to_vec();
+            (values.len() >= 3).then(|| {
+                format!("{} {}", values[1], values[2])
+                    .chars()
+                    .take(200)
+                    .collect()
+            })
+        })
+        .collect();
+    let details = ReleaseDetails {
+        repo: tag_value(event, "repo").map(|text| text.chars().take(200).collect()),
+        commit: tag_value(event, "commit").map(|text| text.chars().take(64).collect()),
+        depends,
+        requires: list("requires"),
+        post_install,
+    };
+    (details != ReleaseDetails::default()).then_some(details)
+}
+
+fn short_hex(key: &str) -> String {
+    key.chars().take(8).collect()
+}
+
+/// Keeps only the newest event for each publisher, name, version, os and arch.
+/// A publisher can fix a listing by publishing the same release again; the
+/// older event must not also show up as a duplicate row. Order of first
+/// appearance is kept.
+fn newest_per_release(events: Vec<Event>) -> Vec<Event> {
+    let key = |event: &Event| {
+        (
+            event.pubkey.to_hex(),
+            tag_value(event, "name").unwrap_or_default().to_owned(),
+            tag_value(event, "version").unwrap_or_default().to_owned(),
+            tag_value(event, "os").unwrap_or_default().to_owned(),
+            tag_value(event, "arch").unwrap_or_default().to_owned(),
+        )
+    };
+    let mut order = Vec::<(String, String, String, String, String)>::new();
+    let mut newest = HashMap::<(String, String, String, String, String), Event>::new();
+    for event in events {
+        let k = key(&event);
+        match newest.get(&k) {
+            None => {
+                order.push(k.clone());
+                newest.insert(k, event);
+            }
+            Some(existing) if (event.created_at, event.id) > (existing.created_at, existing.id) => {
+                newest.insert(k, event);
+            }
+            Some(_) => {}
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|k| newest.remove(&k))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4661,6 +4812,7 @@ async fn search_matching_releases(
         }
         matches.push(event);
     }
+    let matches = newest_per_release(matches);
     let mut results = Vec::new();
     for event in matches {
         let name = tag_value(&event, "name").unwrap_or_default();
@@ -4682,6 +4834,7 @@ async fn search_matching_releases(
                     .filter(|listing| !listing.is_empty()),
                 published_at: event.created_at.as_secs(),
                 compatible: release_matches_target(&event, OS, ARCH),
+                details: release_details(&event),
             });
         }
     }
@@ -6224,6 +6377,9 @@ impl SearchSort {
 struct SearchOptions {
     /// Case-insensitive; matches any of a release's listed categories.
     category: Option<String>,
+    /// Only releases that list no category at all. Ignored when `category`
+    /// is set.
+    uncategorised: bool,
     sort: SearchSort,
     limit: Option<usize>,
     offset: usize,
@@ -6244,6 +6400,14 @@ fn apply_search_options(
             })
         });
     }
+    if options.uncategorised && options.category.is_none() {
+        results.retain(|result| {
+            result
+                .app
+                .as_ref()
+                .is_none_or(|app| app.categories.is_empty())
+        });
+    }
     match options.sort {
         SearchSort::Catalogue => {}
         SearchSort::Name => results.sort_by_key(|r| (r.name.to_lowercase(), r.publisher.clone())),
@@ -6258,6 +6422,22 @@ fn apply_search_options(
         .skip(options.offset)
         .take(options.limit.unwrap_or(usize::MAX))
         .collect()
+}
+
+/// How many distinct packages list no category, so a browse view can offer
+/// them under "Uncategorised" instead of hiding them.
+fn uncategorised_count(results: &[SearchResult]) -> usize {
+    results
+        .iter()
+        .filter(|result| {
+            result
+                .app
+                .as_ref()
+                .is_none_or(|app| app.categories.is_empty())
+        })
+        .map(|result| (result.publisher.clone(), result.name.clone()))
+        .collect::<HashSet<_>>()
+        .len()
 }
 
 /// Every listed category with how many distinct packages carry it, most
@@ -6324,6 +6504,9 @@ struct SearchParams {
     /// Only packages listing this category (case-insensitive).
     #[serde(default)]
     category: Option<String>,
+    /// Only packages that list no category (ignored when `category` is set).
+    #[serde(default)]
+    uncategorised: bool,
     /// `name` or `recent`; omitted keeps the catalogue order.
     #[serde(default)]
     sort: Option<String>,
@@ -6381,6 +6564,7 @@ async fn daemon_search(config: &Config, params: serde_json::Value) -> Result<ser
     let params: SearchParams = serde_json::from_value(params).context("invalid Search params")?;
     let options = SearchOptions {
         category: params.category.clone(),
+        uncategorised: params.uncategorised,
         sort: SearchSort::parse(params.sort.as_deref())?,
         limit: params.limit,
         offset: params.offset,
@@ -6416,12 +6600,19 @@ async fn daemon_list_categories(
     let params: SearchParams =
         serde_json::from_value(params).context("invalid ListCategories params")?;
     let results = daemon_search_results(config, &params).await?;
-    Ok(serde_json::Value::Array(
-        category_counts(&results)
-            .into_iter()
-            .map(|(category, count)| serde_json::json!({ "category": category, "count": count }))
-            .collect(),
-    ))
+    let mut entries: Vec<serde_json::Value> = category_counts(&results)
+        .into_iter()
+        .map(|(category, count)| serde_json::json!({ "category": category, "count": count }))
+        .collect();
+    // Packages with no category get their own entry, but only next to real
+    // categories: on its own it would just repeat "All".
+    let uncategorised = uncategorised_count(&results);
+    if uncategorised > 0 && !entries.is_empty() {
+        entries.push(serde_json::json!({
+            "category": "Uncategorised", "count": uncategorised, "uncategorised": true
+        }));
+    }
+    Ok(serde_json::Value::Array(entries))
 }
 
 #[derive(Debug, Deserialize)]
@@ -7056,7 +7247,8 @@ fn verify_release_event(event: &Event, manifest: &Manifest) -> Result<()> {
     // Events published before store-listing tags existed carry none; only an
     // event that does carry them must agree with the manifest.
     if event_has_app_tags(event)
-        && AppListing::from_app(&event_manifest.app) != AppListing::from_app(&manifest.app)
+        && AppListing::from_app(&event_manifest.app).without_publish_facts()
+            != AppListing::from_app(&manifest.app).without_publish_facts()
     {
         bail!("release event app listing does not match the package manifest");
     }
@@ -7087,6 +7279,10 @@ fn release_event_is_v1(event: &Event) -> bool {
         "license",
         "release-date",
         "icon",
+        "release-notes",
+        "support",
+        "download-size",
+        "installed-size",
     ]
     .iter()
     .any(|kind| event.tags.iter().filter(|tag| tag.kind() == *kind).count() > 1)
@@ -7316,6 +7512,48 @@ fn read_npk_file(archive_path: &Path, wanted: &Path, max_bytes: usize) -> Result
     bail!("{} not found in the package", wanted.display())
 }
 
+/// Total size of the regular files in an `.npk` (what installing it writes).
+fn installed_size_of(archive_path: &Path) -> Result<u64> {
+    let decoder = zstd::Decoder::new(fs::File::open(archive_path)?)?;
+    let mut archive = tar::Archive::new(decoder);
+    let mut total = 0u64;
+    for entry in archive.entries()? {
+        let entry = entry?;
+        if entry.header().entry_type().is_file() {
+            total = total.saturating_add(entry.size());
+        }
+    }
+    Ok(total)
+}
+
+/// What is missing from a manifest's store listing, in words a publisher can
+/// act on. A release without these still publishes and installs; stores just
+/// have little to show, and it cannot appear under a category.
+fn listing_warnings(manifest: &Manifest) -> Vec<String> {
+    if manifest
+        .kind
+        .as_deref()
+        .is_some_and(|kind| kind != "package")
+    {
+        return Vec::new();
+    }
+    let app = &manifest.app;
+    let mut missing = Vec::new();
+    if app.summary.as_deref().is_none_or(|s| s.trim().is_empty()) {
+        missing.push("a summary");
+    }
+    if app.categories.is_empty() {
+        missing.push("categories");
+    }
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "this release has no {}, so stores cannot describe it or list it under a category; add an \"app\" section to the manifest (summary, categories, ...) and publish again",
+        missing.join(" or ")
+    )]
+}
+
 async fn publish_icon(
     archive_path: &Path,
     icon_path: &Path,
@@ -7350,6 +7588,14 @@ async fn publish_release(
     let artifact_event = sign_artifact_event(&manifest, &artifact_url, bytes.len(), &keys)?;
     let mut release_manifest = manifest.clone();
     release_manifest.artifact_event = Some(artifact_event.id.to_hex());
+    for warning in listing_warnings(&manifest) {
+        eprintln!("warning: {warning}");
+    }
+    release_manifest.app.download_size = Some(bytes.len() as u64);
+    match installed_size_of(&artifact_path) {
+        Ok(size) => release_manifest.app.installed_size = Some(size),
+        Err(error) => eprintln!("warning: release published without an installed size: {error:#}"),
+    }
     if let Some(icon_path) = &manifest.app.icon {
         // The icon is also published on its own so a store can show it before
         // the package is downloaded. A failure here costs the listing its
@@ -7615,6 +7861,9 @@ const MAX_LICENSE_CHARS: usize = 128;
 const MAX_CATEGORIES: usize = 8;
 const MAX_CATEGORY_CHARS: usize = 32;
 const MAX_SCREENSHOTS: usize = 6;
+const MAX_RELEASE_NOTES_CHARS: usize = 2000;
+/// A size above this (16 TiB) is treated as garbage and dropped.
+const MAX_LISTED_SIZE_BYTES: u64 = 1 << 44;
 const MAX_URL_CHARS: usize = 2048;
 /// Largest icon `npack publish` will upload and `GetIcon` will fetch.
 const MAX_ICON_BYTES: usize = 256 * 1024;
@@ -7681,6 +7930,14 @@ struct AppListing {
     release_date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     icon: Option<IconBlob>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release_notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    support_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    download_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    installed_size: Option<u64>,
 }
 
 impl AppListing {
@@ -7721,7 +7978,22 @@ impl AppListing {
                 .icon_blob
                 .clone()
                 .filter(|icon| is_http_url(&icon.url) && is_sha256_hex(&icon.sha256)),
+            release_notes: app
+                .release_notes
+                .as_deref()
+                .and_then(|text| clean_listing_text(text, MAX_RELEASE_NOTES_CHARS, true)),
+            support_url: app.support_url.clone().filter(|url| is_http_url(url)),
+            download_size: app.download_size.filter(|size| is_plausible_size(*size)),
+            installed_size: app.installed_size.filter(|size| is_plausible_size(*size)),
         }
+    }
+
+    /// The listing minus the facts only `npack publish` knows (sizes), so a
+    /// manifest written before publishing can be compared with its event.
+    fn without_publish_facts(mut self) -> Self {
+        self.download_size = None;
+        self.installed_size = None;
+        self
     }
 
     fn is_empty(&self) -> bool {
@@ -7737,6 +8009,8 @@ impl AppListing {
             ("homepage", &self.homepage),
             ("license", &self.license),
             ("release-date", &self.release_date),
+            ("release-notes", &self.release_notes),
+            ("support", &self.support_url),
         ] {
             if let Some(value) = value {
                 tags.push(vec![name.to_owned(), value.clone()]);
@@ -7751,15 +8025,27 @@ impl AppListing {
         if let Some(icon) = &self.icon {
             tags.push(vec!["icon".into(), icon.url.clone(), icon.sha256.clone()]);
         }
+        for (name, size) in [
+            ("download-size", self.download_size),
+            ("installed-size", self.installed_size),
+        ] {
+            if let Some(size) = size {
+                tags.push(vec![name.to_owned(), size.to_string()]);
+            }
+        }
         tags
     }
+}
+
+fn is_plausible_size(size: u64) -> bool {
+    size > 0 && size <= MAX_LISTED_SIZE_BYTES
 }
 
 fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-const APP_LISTING_TAGS: [&str; 8] = [
+const APP_LISTING_TAGS: [&str; 12] = [
     "summary",
     "description",
     "homepage",
@@ -7768,6 +8054,10 @@ const APP_LISTING_TAGS: [&str; 8] = [
     "category",
     "screenshot",
     "icon",
+    "release-notes",
+    "support",
+    "download-size",
+    "installed-size",
 ];
 
 fn event_has_app_tags(event: &Event) -> bool {
@@ -7809,6 +8099,10 @@ fn app_metadata_from_event(event: &Event) -> AppMetadata {
         screenshots: values("screenshot"),
         release_date: tag_value(event, "release-date").map(str::to_owned),
         icon_blob,
+        release_notes: tag_value(event, "release-notes").map(str::to_owned),
+        support_url: tag_value(event, "support").map(str::to_owned),
+        download_size: tag_value(event, "download-size").and_then(|v| v.parse().ok()),
+        installed_size: tag_value(event, "installed-size").and_then(|v| v.parse().ok()),
         ..AppMetadata::default()
     };
     let listing = AppListing::from_app(&raw);
@@ -7821,6 +8115,10 @@ fn app_metadata_from_event(event: &Event) -> AppMetadata {
         screenshots: listing.screenshots,
         release_date: listing.release_date,
         icon_blob: listing.icon,
+        release_notes: listing.release_notes,
+        support_url: listing.support_url,
+        download_size: listing.download_size,
+        installed_size: listing.installed_size,
         ..AppMetadata::default()
     }
 }
@@ -7903,6 +8201,16 @@ fn validate_app_metadata(app: &AppMetadata) -> Result<()> {
         && (!is_http_url(&icon.url) || !is_sha256_hex(&icon.sha256))
     {
         bail!("manifest app.icon_blob must have an http(s) URL and a SHA-256");
+    }
+    if let Some(notes) = &app.release_notes
+        && notes.chars().count() > MAX_RELEASE_NOTES_CHARS
+    {
+        bail!("manifest app.release_notes must be at most {MAX_RELEASE_NOTES_CHARS} characters");
+    }
+    if let Some(support) = &app.support_url
+        && !is_http_url(support)
+    {
+        bail!("manifest app.support_url must be an http(s) URL");
     }
     if let Some(release_date) = &app.release_date
         && !is_valid_release_date(release_date)
@@ -11998,6 +12306,10 @@ mod tests {
             desktop_file: Some("hello.desktop".into()),
             release_date: Some("2026-01-15".into()),
             icon_blob: None,
+            release_notes: None,
+            support_url: None,
+            download_size: None,
+            installed_size: None,
             install_inputs: vec![],
         });
         fs::write(
@@ -13434,6 +13746,217 @@ mod tests {
     }
 
     #[test]
+    fn release_notes_support_link_and_sizes_round_trip_and_do_not_break_verification() -> Result<()>
+    {
+        let mut app = listed_app();
+        app.release_notes = Some("Fixes a crash.\nStarts faster.".into());
+        app.support_url = Some("https://example.com/help".into());
+        app.download_size = Some(12_345);
+        app.installed_size = Some(54_321);
+        let (event, manifest) = signed_release_with_app(app.clone())?;
+        assert!(release_event_is_v1(&event));
+        let read = app_metadata_from_event(&event);
+        assert_eq!(read.release_notes, app.release_notes);
+        assert_eq!(read.support_url, app.support_url);
+        assert_eq!(read.download_size, Some(12_345));
+        assert_eq!(read.installed_size, Some(54_321));
+        // The manifest written before publishing has no sizes; it must still
+        // match the event, but a different note must not.
+        let mut before = manifest.clone();
+        before.app.download_size = None;
+        before.app.installed_size = None;
+        verify_release_event(&event, &before)?;
+        before.app.release_notes = Some("something else".into());
+        assert!(verify_release_event(&event, &before).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn bad_notes_support_links_and_sizes_in_someone_elses_event_are_dropped() -> Result<()> {
+        let keys = Keys::generate();
+        let (event, _) = signed_release_with_app(AppMetadata::default())?;
+        let mut tags: Vec<Tag> = event.tags.iter().cloned().collect();
+        for tag in [
+            ["support", "ftp://example.com/help"],
+            ["download-size", "lots"],
+            ["installed-size", "0"],
+            ["release-notes", "fine notes"],
+        ] {
+            tags.push(Tag::parse(tag)?);
+        }
+        let odd = EventBuilder::new(Kind::Custom(RELEASE_KIND), "x")
+            .tags(tags)
+            .finalize(&keys)?;
+        let app = app_metadata_from_event(&odd);
+        assert_eq!(app.support_url, None);
+        assert_eq!(app.download_size, None);
+        assert_eq!(app.installed_size, None);
+        assert_eq!(app.release_notes.as_deref(), Some("fine notes"));
+        let mut huge: Vec<Tag> = event.tags.iter().cloned().collect();
+        huge.push(Tag::parse(["download-size", &u64::MAX.to_string()])?);
+        let huge = EventBuilder::new(Kind::Custom(RELEASE_KIND), "x")
+            .tags(huge)
+            .finalize(&keys)?;
+        assert_eq!(app_metadata_from_event(&huge).download_size, None);
+        // And a repeated singleton still invalidates the release.
+        let mut doubled: Vec<Tag> = event.tags.iter().cloned().collect();
+        doubled.push(Tag::parse(["download-size", "1"])?);
+        doubled.push(Tag::parse(["download-size", "2"])?);
+        let doubled = EventBuilder::new(Kind::Custom(RELEASE_KIND), "x")
+            .tags(doubled)
+            .finalize(&keys)?;
+        assert!(!release_event_is_v1(&doubled));
+        Ok(())
+    }
+
+    #[test]
+    fn publishing_rejects_unsafe_notes_and_support_links() {
+        let bad = |edit: fn(&mut AppMetadata)| {
+            let mut app = listed_app();
+            edit(&mut app);
+            validate_app_metadata(&app).is_err()
+        };
+        assert!(bad(|a| a.support_url = Some("javascript:alert(1)".into())));
+        assert!(bad(
+            |a| a.release_notes = Some("x".repeat(MAX_RELEASE_NOTES_CHARS + 1))
+        ));
+    }
+
+    #[test]
+    fn the_installed_size_is_the_sum_of_the_regular_files() -> Result<()> {
+        let dir = tempdir()?;
+        let source = dir.path().join("src");
+        fs::create_dir_all(source.join("bin"))?;
+        fs::write(source.join("bin/a"), vec![0u8; 1000])?;
+        fs::write(source.join("b"), vec![0u8; 234])?;
+        let npk = dir.path().join("x.npk");
+        pack_npk(&source, &npk)?;
+        assert_eq!(installed_size_of(&npk)?, 1234);
+        Ok(())
+    }
+
+    #[test]
+    fn a_missing_listing_is_called_out_at_publish_time() {
+        let manifest = |app: AppMetadata, kind: Option<&str>| Manifest {
+            kind: kind.map(str::to_owned),
+            ..sample_manifest_with_app(app)
+        };
+        let warnings = listing_warnings(&manifest(AppMetadata::default(), None));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("a summary or categories"));
+        let only_summary = AppMetadata {
+            summary: Some("x".into()),
+            ..AppMetadata::default()
+        };
+        assert!(listing_warnings(&manifest(only_summary, None))[0].contains("no categories"));
+        assert!(listing_warnings(&manifest(listed_app(), None)).is_empty());
+        // A Nix recipe is not shown in a store, so it is not nagged.
+        assert!(listing_warnings(&manifest(AppMetadata::default(), Some("nix-recipe"))).is_empty());
+    }
+
+    #[test]
+    fn a_republished_release_replaces_the_older_event_instead_of_duplicating() -> Result<()> {
+        let keys = Keys::generate();
+        let secret = keys.secret_key().to_secret_hex();
+        let mut manifest = sample_manifest_with_app(AppMetadata::default());
+        manifest.publisher = keys.public_key().to_hex();
+        manifest.sha256 = "ab".repeat(32);
+        manifest.artifact_event = Some("11".repeat(32));
+        let old = sign_release_event(&manifest, &secret, 1_700_000_000)?;
+        manifest.app = listed_app();
+        let new = sign_release_event(&manifest, &secret, 1_700_000_500)?;
+        let mut other_version = manifest.clone();
+        other_version.version = "2.0.0".into();
+        let other = sign_release_event(&other_version, &secret, 1_700_000_100)?;
+        // Whatever order they arrive in, the newer event wins and other
+        // versions are untouched.
+        for events in [
+            vec![old.clone(), other.clone(), new.clone()],
+            vec![new.clone(), old.clone(), other.clone()],
+        ] {
+            let kept = newest_per_release(events);
+            assert_eq!(kept.len(), 2);
+            assert!(kept.iter().any(|e| e.id == new.id));
+            assert!(kept.iter().all(|e| e.id != old.id));
+            assert!(kept.iter().any(|e| e.id == other.id));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn uncategorised_packages_can_be_listed_and_counted() {
+        let result = |name: &str, categories: &[&str]| SearchResult {
+            release_event_id: String::new(),
+            publisher: "p".into(),
+            name: name.into(),
+            version: "1.0.0".into(),
+            content: String::new(),
+            kind: None,
+            fork_of: None,
+            app: (!categories.is_empty()).then(|| AppListing {
+                categories: categories.iter().map(|c| (*c).to_owned()).collect(),
+                ..AppListing::default()
+            }),
+            published_at: 0,
+            compatible: true,
+            details: None,
+        };
+        let all = vec![result("a", &["Tools"]), result("b", &[]), result("c", &[])];
+        assert_eq!(uncategorised_count(&all), 2);
+        let only = apply_search_options(
+            all.clone(),
+            &SearchOptions {
+                uncategorised: true,
+                ..SearchOptions::default()
+            },
+        );
+        assert_eq!(
+            only.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["b", "c"]
+        );
+        // An explicit category wins over the flag.
+        let both = apply_search_options(
+            all,
+            &SearchOptions {
+                category: Some("tools".into()),
+                uncategorised: true,
+                ..SearchOptions::default()
+            },
+        );
+        assert_eq!(both.len(), 1);
+    }
+
+    #[test]
+    fn release_details_summarise_what_installing_does() -> Result<()> {
+        let keys = Keys::generate();
+        let (event, mut manifest) = signed_release_with_app(AppMetadata::default())?;
+        assert_eq!(release_details(&event), None);
+        manifest.publisher = keys.public_key().to_hex();
+        manifest.repo = Some(format!("30617:{}:hello", "11".repeat(32)));
+        manifest.commit = Some("abc123".into());
+        manifest.runtime_requires = vec!["libc.so.6".into()];
+        manifest.post_install = vec![PostInstallAction {
+            action: "register-service".into(),
+            path: "lib/systemd/user/hello.service".into(),
+        }];
+        manifest.dependencies = vec![Dependency {
+            publisher: None,
+            name: "helper".into(),
+            requirement: ">=1.0.0".into(),
+        }];
+        let event = sign_release_event(&manifest, &keys.secret_key().to_secret_hex(), 1)?;
+        let details = release_details(&event).unwrap();
+        assert_eq!(details.commit.as_deref(), Some("abc123"));
+        assert_eq!(details.requires, ["libc.so.6"]);
+        assert_eq!(details.depends, ["helper >=1.0.0"]);
+        assert_eq!(
+            details.post_install,
+            ["register-service lib/systemd/user/hello.service"]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn duplicate_singleton_listing_tags_make_a_release_invalid() -> Result<()> {
         let keys = Keys::generate();
         let (event, _) = signed_release_with_app(listed_app())?;
@@ -14304,7 +14827,17 @@ mod tests {
             })
             .collect();
         // Utility: zebra + apple (winonly is another OS). Games: zebra + mango.
-        assert_eq!(pairs, [("Games".to_owned(), 2), ("Utility".to_owned(), 2)]);
+        assert_eq!(
+            pairs,
+            [
+                ("Games".to_owned(), 2),
+                ("Utility".to_owned(), 2),
+                // One package in the catalogue lists no category.
+                ("Uncategorised".to_owned(), 1)
+            ]
+        );
+        let last = categories.as_array().unwrap().last().unwrap();
+        assert_eq!(last["uncategorised"], true);
         Ok(())
     }
 
@@ -14343,6 +14876,7 @@ mod tests {
             }),
             published_at: 0,
             compatible: true,
+            details: None,
         };
         let counts = category_counts(&[
             result("a", &["Tools"]),
