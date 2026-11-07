@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.npack.Gui</id>
+  <name>npack</name>
+  <summary>Find, install and update software published by people you trust</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer_name>npack contributors</developer_name>
+  <description>
+    <p>
+      npack installs software that publishers have signed and announced on
+      Nostr. Every download is checked against a signed checksum before
+      anything is installed, and nobody is trusted until you say so.
+    </p>
+    <p>Browse by category, see who published each app, install it, and switch back to the previous version if an update does not suit you.</p>
+  </description>
+  <launchable type="desktop-id">io.npack.Gui.desktop</launchable>
+  <url type="homepage">https://github.com/imattau/npack</url>
+  <url type="bugtracker">https://github.com/imattau/npack/issues</url>
+  <categories>
+    <category>System</category>
+    <category>PackageManager</category>
+  </categories>
+  <provides>
+    <binary>npack-gui</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="@VERSION@" date="@DATE@"/>
+  </releases>
+</component>

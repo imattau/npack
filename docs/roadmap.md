@@ -318,6 +318,13 @@ CLI has `npack categories` and `search --category/--sort/--limit`. Still to do:
 curated "featured" lists (there is no curation source yet), and screenshots
 (which need a privacy-preserving way to fetch them).
 
+Distribution: releases now ship `npack` (no graphics libraries), `npack-gui` and
+an `npack-desktop` meta-package as `.deb` and `.rpm`, plus `.npk` archives for
+Nostr. The desktop app starts its own background service and has a launcher
+entry and icon. Still to do: a Flatpak or AppImage for distributions without a
+package, a proper copyright file and changelog in the `.deb`, and the native
+store integrations (Phases 6-8).
+
 `npack doctor` diagnoses a setup (config, store, interrupted installs, damaged
 packages, catalogue age, the local service, helper tools, and relay and download
 reachability) with a suggested fix for each finding, and works even when the

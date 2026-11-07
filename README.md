@@ -55,18 +55,22 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-## Reference GUI
+## Desktop app
 
-`npack-gui` is a small `egui`/`eframe` desktop app that exercises npackd's
-JSON-RPC service API (Search, Details, Install, Installed, Updates,
-Remove) purely as a client of its documented Unix-socket protocol -- it has
-no special access to `npack-cli`'s internals, proving `npackd` is
-frontend-independent before integrating with an existing desktop store.
+`npack-gui` is a small `egui`/`eframe` desktop app: browse by category, install
+with a clear "do you trust this publisher?" step, update, switch back to the
+previous version, and a health check. It is a plain client of npackd's
+documented Unix-socket protocol -- it has no special access to `npack-cli`'s
+internals, proving `npackd` is frontend-independent. It starts the background
+service itself if it is not running.
 
 ```bash
-npack daemon &            # start npackd-user in the background
 cargo run --release -p npack-gui
 ```
+
+Releases ship three Linux packages (`.deb` and `.rpm`): `npack` (command line
+and service, no graphics libraries), `npack-gui` (the app) and `npack-desktop`
+(installs both). See [Install npack](docs/using-npack.md#install-npack).
 
 ## Bootstrap installation
 

@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH npack 1  "npack 0.4.0" 
+.TH npack 1  "npack 0.5.0" 
 .SH NAME
 npack \- A Nostr\-native package manager
 .SH SYNOPSIS
@@ -28,6 +28,9 @@ Install a local .npk or resolve and install a package from Nostr
 npack\-list(1)
 List installed packages
 .TP
+npack\-doctor(1)
+Check that npack is set up and working, and say how to fix what isn\*(Aqt
+.TP
 npack\-verify\-installed(1)
 Verify the files and metadata of installed packages
 .TP
@@ -42,6 +45,9 @@ Create a signed revocation event for a package release
 .TP
 npack\-search(1)
 Search the local package catalogue for available packages. Reads the catalogue built by `npack refresh` by default; pass \-\-refresh or \-\-no\-cache to query relays directly instead
+.TP
+npack\-categories(1)
+List the software categories in the local catalogue, with how many packages are in each
 .TP
 npack\-refresh(1)
 Rebuild the local package catalogue from Nostr relays, so `search` and `info` can browse it without a relay round trip on every call
@@ -67,6 +73,12 @@ Register a Nostr secret key in the OS credential store
 npack\-init(1)
 Create package metadata for a new project
 .TP
+npack\-trust(1)
+Manage the publishers you trust (`[trust].publishers` in config.toml)
+.TP
+npack\-unpack(1)
+Download, verify, and extract a published package into a directory, optionally scaffolding a fork of it under your own publisher key
+.TP
 npack\-man(1)
 Render the complete command reference as a man page
 .TP
@@ -78,6 +90,12 @@ Resolve and verify a package\*(Aqs release metadata without installing it
 .TP
 npack\-pack(1)
 Build a deterministic .npk archive from a package directory
+.TP
+npack\-history(1)
+Show what npack installed, upgraded, rolled back or removed
+.TP
+npack\-rollback(1)
+Switch an installed package back to the version it replaced
 .TP
 npack\-remove(1)
 Remove an installed package
@@ -97,4 +115,4 @@ Run npackd, a local JSON\-RPC service over a Unix socket that exposes Search/Get
 npack\-help(1)
 Print this message or the help of the given subcommand(s)
 .SH VERSION
-v0.4.0
+v0.5.0

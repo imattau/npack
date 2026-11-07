@@ -1,0 +1,14 @@
+[Unit]
+Description=npackd, the npack package service for your own account
+Documentation=https://github.com/imattau/npack
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/npack daemon
+Restart=on-failure
+
+[Install]
+# Optional: the npack app starts this service itself when it is not running.
+# Enable this only if you want it started at login for other tools to use:
+#   systemctl --user enable --now npackd.service
+WantedBy=default.target

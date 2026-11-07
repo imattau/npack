@@ -48,3 +48,19 @@ jobs:
           cargo run --quiet -- pack /tmp/appstream-ci/source --output /tmp/appstream-ci/ci.npk
           cargo run --quiet -- appstream /tmp/appstream-ci/ci.npk --output /tmp/appstream-ci/ci.metainfo.xml
           appstreamcli validate --no-net /tmp/appstream-ci/ci.metainfo.xml
+      - name: Install packaging tooling
+        run: sudo apt-get install -y dpkg-dev rpm desktop-file-utils
+      - name: Validate the desktop app's launcher and AppStream files
+        run: |
+          desktop-file-validate packaging/desktop/io.npack.Gui.desktop
+          sed 's/@VERSION@/0.0.0/;s/@DATE@/2026-01-01/' packaging/desktop/io.npack.Gui.metainfo.xml > /tmp/gui.metainfo.xml
+          appstreamcli validate --no-net /tmp/gui.metainfo.xml
+      # Catches a broken packaging script on the pull request, not on release day.
+      - name: Packaging smoke test
+        run: |
+          cargo build --locked
+          packaging/build-npk.sh 0.0.0 manual-test-publisher target/debug /tmp/npk-ci
+          for manifest in /tmp/npk-ci/*.manifest.json; do
+            cargo run --quiet -- verify "$manifest"
+          done
+          packaging/build-linux-packages.sh 0.0.0 target/debug /tmp/pkgs-ci

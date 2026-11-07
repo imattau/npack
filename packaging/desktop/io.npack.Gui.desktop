@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=npack
+GenericName=Software Installer
+Comment=Find, install and update software published by people you trust
+Exec=npack-gui
+Icon=io.npack.Gui
+Terminal=false
+Categories=System;PackageManager;
+Keywords=software;install;update;packages;apps;nostr;
+StartupNotify=true
+StartupWMClass=io.npack.Gui

@@ -11,6 +11,42 @@ protocol and is not yet a registered NIP.
 
 ## Install npack
 
+### From a release
+
+Each GitHub release has Debian and RPM packages (and `.npk` archives, which
+npack itself can install). There are three:
+
+| Package | What it is |
+| --- | --- |
+| `npack` | The command line tool, the `npackd` service, the man page, the systemd units and the PolicyKit policy. No graphics libraries, so it installs on servers and containers. |
+| `npack-gui` | The desktop app, with its launcher entry, icon and AppStream description. Needs the matching `npack`. |
+| `npack-desktop` | An empty package that installs the other two. This is the one to pick for a desktop. |
+
+```bash
+# Debian, Ubuntu and derivatives: the command line tool only
+sudo apt install ./npack_0.5.0_amd64.deb
+
+# ...or the desktop as well (give apt all three files together)
+sudo apt install ./npack_0.5.0_amd64.deb ./npack-gui_0.5.0_amd64.deb ./npack-desktop_0.5.0_amd64.deb
+
+# Fedora and other RPM systems
+sudo dnf install ./npack-0.5.0-1.x86_64.rpm ./npack-gui-0.5.0-1.x86_64.rpm ./npack-desktop-0.5.0-1.x86_64.rpm
+```
+
+Open **npack** from your applications menu. The app starts the background
+service itself when it isn't already running, so there is nothing else to set
+up. If you would rather have the service start at login for other tools to use:
+
+```bash
+systemctl --user enable --now npackd.service
+```
+
+The packages declare the libraries the desktop app loads at run time (X11 or
+Wayland, EGL and Vulkan). Software rendering works if your machine has no GPU
+driver, provided Mesa's drivers are installed (the package recommends them).
+
+### From source
+
 Build from source:
 
 ```bash
@@ -441,12 +477,14 @@ announced in `update-notified.txt` in the store, so running it from a timer does
 not repeat itself until the situation changes. If `notify-send` is missing the
 command fails rather than staying silent.
 
-To check daily, install the systemd user units from `packaging/` and enable the
-timer:
+To check daily, enable the timer. The `npack` package installs the units; from
+a source build, copy them from `packaging/` first:
 
 ```bash
+# from a source build only:
 mkdir -p ~/.config/systemd/user
 cp packaging/npack-update-check.service packaging/npack-update-check.timer ~/.config/systemd/user/
+
 systemctl --user enable --now npack-update-check.timer
 ```
 
@@ -829,12 +867,21 @@ Updates, Remove -- purely as a client of the protocol documented above, with
 no dependency on `npack-cli`'s internals:
 
 ```bash
-npack daemon &
 cargo run --release -p npack-gui
 ```
 
-It reads/writes `$XDG_RUNTIME_DIR/npackd.sock` by default; the socket path
-is editable in its top bar for talking to a different instance.
+If nothing is listening on the socket, the app starts `npack daemon` for you
+(found next to the app's own executable, otherwise on `PATH`) in its own
+process group, so closing the window does not stop it. It only ever does this
+when nothing is listening: `npack daemon` replaces an existing socket, so a
+second one would orphan the first. If it cannot start the service it says so and
+offers "Try again".
+
+It reads and writes `$XDG_RUNTIME_DIR/npackd.sock` by default. To talk to a
+different instance, change the socket path under Settings, Advanced.
+
+A daemon started this way (or by plain `npack daemon`) is npackd-user, so it
+installs into your own prefix (`~/.local`), never the system one.
 
 ## Configuration
 
