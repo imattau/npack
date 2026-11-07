@@ -316,6 +316,14 @@ pub struct NpackGuiApp {
     scope: InstallScope,
     /// `CatalogueStatus`: `present`, `created_at`, `stale`, ...
     catalogue: Option<Value>,
+    /// An update check is running (the button shows it and waits).
+    updates_checking: bool,
+    /// The installed list is being loaded.
+    installed_refreshing: bool,
+    /// "Refresh catalogue" was pressed and the download has not finished.
+    browse_refreshing: bool,
+    /// When the last update check finished (Unix seconds).
+    updates_checked_at: Option<u64>,
     /// Why the last background refresh did not happen, in plain words.
     catalogue_note: Option<String>,
     catalogue_refreshing: bool,
@@ -418,6 +426,10 @@ impl NpackGuiApp {
             crate::remember::save(&remembered);
         }
         let mut app = Self {
+            updates_checking: false,
+            installed_refreshing: false,
+            browse_refreshing: false,
+            updates_checked_at: None,
             catalogue: None,
             catalogue_note: None,
             catalogue_refreshing: false,
@@ -785,7 +797,8 @@ impl NpackGuiApp {
         });
     }
 
-    fn refresh_installed(&self) {
+    fn refresh_installed(&mut self) {
+        self.installed_refreshing = true;
         self.spawn(|client| {
             let result = client
                 .call("ListInstalled", serde_json::json!({}))
@@ -801,6 +814,7 @@ impl NpackGuiApp {
     fn browse(&mut self, refresh: bool) {
         if refresh {
             self.status = "Fetching the software catalogue...".to_owned();
+            self.browse_refreshing = true;
         }
         let query = self.search_query.trim().to_owned();
         let relays: Vec<String> = self
@@ -853,7 +867,8 @@ impl NpackGuiApp {
         });
     }
 
-    fn refresh_updates(&self) {
+    fn refresh_updates(&mut self) {
+        self.updates_checking = true;
         self.spawn(|client| {
             let result = client
                 .call("CheckUpdates", serde_json::json!({}))
@@ -1048,6 +1063,7 @@ impl NpackGuiApp {
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 Event::Installed(Ok(items)) => {
+                    self.installed_refreshing = false;
                     self.status = format!("{} package(s) installed.", items.len());
                     let publishers = items
                         .iter()
@@ -1086,8 +1102,12 @@ impl NpackGuiApp {
                 // Rollback and history are extras; failing to load them must
                 // not raise an error banner over the installed list.
                 Event::Rollbacks(Err(_)) | Event::History(Err(_)) => {}
-                Event::Installed(Err(error)) => self.fail("Loading installed packages", error),
+                Event::Installed(Err(error)) => {
+                    self.installed_refreshing = false;
+                    self.fail("Loading installed packages", error);
+                }
                 Event::Search(Ok(items)) => {
+                    self.browse_refreshing = false;
                     self.status = format!("{} result(s).", items.len());
                     let publishers = items
                         .iter()
@@ -1098,6 +1118,7 @@ impl NpackGuiApp {
                     self.request_profiles(publishers);
                 }
                 Event::Search(Err(error)) => {
+                    self.browse_refreshing = false;
                     if error.code.as_deref() == Some("no_catalogue") && !self.auto_refreshed {
                         // First time here: there is nothing to browse until
                         // the catalogue has been downloaded, so do that now
@@ -1116,8 +1137,13 @@ impl NpackGuiApp {
                 Event::Updates(Ok(items)) => {
                     self.status = format!("Checked {} installed package(s).", items.len());
                     self.updates = items;
+                    self.updates_checking = false;
+                    self.updates_checked_at = Some(unix_seconds());
                 }
-                Event::Updates(Err(error)) => self.fail("Checking for updates", error),
+                Event::Updates(Err(error)) => {
+                    self.updates_checking = false;
+                    self.fail("Checking for updates", error);
+                }
                 Event::Details(Ok(value)) => {
                     self.request_icons(std::slice::from_ref(&value));
                     self.details = Some(value);
@@ -2391,9 +2417,21 @@ impl NpackGuiApp {
     }
 
     fn show_installed_tab(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Refresh installed list").clicked() {
-            self.refresh_installed();
-        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.installed_refreshing,
+                    egui::Button::new("Refresh installed list"),
+                )
+                .clicked()
+            {
+                self.refresh_installed();
+            }
+            if self.installed_refreshing {
+                ui.spinner();
+                ui.weak("Loading...");
+            }
+        });
         ui.separator();
         let mut to_remove = None;
         let mut to_show = None;
@@ -2509,11 +2547,17 @@ impl NpackGuiApp {
                 rerun = true;
             }
             if ui
-                .button("Refresh catalogue")
+                .add_enabled(
+                    !self.browse_refreshing && !self.catalogue_refreshing,
+                    egui::Button::new("Refresh catalogue"),
+                )
                 .on_hover_text("Download the latest list of software from the relays")
                 .clicked()
             {
                 refresh = true;
+            }
+            if self.browse_refreshing || self.catalogue_refreshing {
+                ui.spinner();
             }
         });
         ui.horizontal(|ui| {
@@ -2611,7 +2655,7 @@ impl NpackGuiApp {
                 if let Some(line) = catalogue_line(
                     self.catalogue.as_ref(),
                     self.catalogue_note.as_deref(),
-                    self.catalogue_refreshing,
+                    self.catalogue_refreshing || self.browse_refreshing,
                     unix_seconds(),
                 ) {
                     ui.weak(line);
@@ -2735,8 +2779,28 @@ impl NpackGuiApp {
         let mut to_update = None;
         let mut update_all = false;
         ui.horizontal(|ui| {
-            if ui.button("Check for updates").clicked() {
+            // While a check runs the button waits and a spinner says why: the
+            // relays can take several seconds, and nothing else on the screen
+            // changes in the meantime.
+            if ui
+                .add_enabled(
+                    !self.updates_checking,
+                    egui::Button::new("Check for updates"),
+                )
+                .clicked()
+            {
                 self.refresh_updates();
+            }
+            if self.updates_checking {
+                ui.spinner();
+            }
+            if let Some(line) = updates_line(
+                &self.updates,
+                self.updates_checking,
+                self.updates_checked_at,
+                unix_seconds(),
+            ) {
+                ui.weak(line);
             }
             if available > 0
                 && self.active_transaction.is_none()
@@ -2834,6 +2898,37 @@ impl NpackGuiApp {
 }
 
 /// (packages with an update available, installed packages that were revoked).
+/// The words next to the "Check for updates" button: what is happening, or what
+/// the last check found and when.
+fn updates_line(
+    updates: &[Value],
+    checking: bool,
+    checked_at: Option<u64>,
+    now: u64,
+) -> Option<String> {
+    if checking {
+        return Some("Checking for updates...".to_owned());
+    }
+    let then = checked_at?;
+    let (available, revoked) = update_counts(updates);
+    let found = match (available, revoked) {
+        (0, 0) => "everything is up to date".to_owned(),
+        (available, 0) => format!(
+            "{available} update{} available",
+            if available == 1 { "" } else { "s" }
+        ),
+        (0, revoked) => format!(
+            "{revoked} installed package{} withdrawn by the publisher",
+            if revoked == 1 { " was" } else { "s were" }
+        ),
+        (available, revoked) => format!(
+            "{available} update{} available and {revoked} withdrawn by the publisher",
+            if available == 1 { "" } else { "s" }
+        ),
+    };
+    Some(format!("Checked {}: {found}.", describe_age(now, then)))
+}
+
 fn update_counts(updates: &[Value]) -> (usize, usize) {
     let available = updates
         .iter()
@@ -3005,6 +3100,39 @@ mod tests {
         );
         assert!(install_effects(&serde_json::json!({})).is_empty());
         assert_eq!(source_line(&serde_json::json!({"details": {}})), None);
+    }
+
+    #[test]
+    fn the_updates_line_says_what_is_happening_and_what_was_found() {
+        let ok = serde_json::json!({"reference": "a", "available_version": null});
+        let newer = serde_json::json!({"reference": "b", "available_version": "2.0.0"});
+        let revoked = serde_json::json!({"reference": "c", "revoked": "bad build"});
+        assert_eq!(
+            updates_line(&[], true, None, 5).as_deref(),
+            Some("Checking for updates...")
+        );
+        // Never checked: no line at all.
+        assert_eq!(updates_line(&[], false, None, 5), None);
+        assert_eq!(
+            updates_line(std::slice::from_ref(&ok), false, Some(100), 100).as_deref(),
+            Some("Checked just now: everything is up to date.")
+        );
+        assert_eq!(
+            updates_line(&[ok.clone(), newer.clone()], false, Some(0), 180).as_deref(),
+            Some("Checked 3 minutes ago: 1 update available.")
+        );
+        assert_eq!(
+            updates_line(&[newer.clone(), newer.clone()], false, Some(0), 10).as_deref(),
+            Some("Checked just now: 2 updates available.")
+        );
+        assert_eq!(
+            updates_line(std::slice::from_ref(&revoked), false, Some(0), 10).as_deref(),
+            Some("Checked just now: 1 installed package was withdrawn by the publisher.")
+        );
+        assert_eq!(
+            updates_line(&[newer, revoked], false, Some(0), 10).as_deref(),
+            Some("Checked just now: 1 update available and 1 withdrawn by the publisher.")
+        );
     }
 
     #[test]
