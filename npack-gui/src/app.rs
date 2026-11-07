@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
@@ -45,6 +45,45 @@ impl Tab {
     }
 }
 
+/// What an install, update, removal or switch-back is doing right now, so the
+/// row it concerns can show it (and the other rows wait).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Activity {
+    /// The `publisher/name` being changed; None for "update everything".
+    target: Option<String>,
+    /// "Installing", "Updating", "Removing", "Switching back".
+    label: &'static str,
+    /// The daemon's stage ("downloading", ...), once it reports one.
+    stage: Option<String>,
+}
+
+/// The words shown next to the spinner on a row.
+fn activity_words(activity: &Activity) -> String {
+    match activity.stage.as_deref() {
+        Some("connecting") => "Connecting...".to_owned(),
+        Some("resolving") => "Finding it...".to_owned(),
+        Some("downloading") => "Downloading...".to_owned(),
+        Some("updating") | Some("installing") => format!("{}...", activity.label),
+        Some("installed") => "Finishing...".to_owned(),
+        _ => format!("{}...", activity.label),
+    }
+}
+
+/// "Installed notepad-lite." for the status line once an action finishes.
+fn finished_words(action: &str, target: Option<&str>) -> String {
+    let past = match action {
+        "install" => "Installed",
+        "update" => "Updated",
+        "remove" => "Removed",
+        "rollback" => "Switched back",
+        other => return format!("{other} finished."),
+    };
+    match target.and_then(|reference| reference.rsplit('/').next()) {
+        Some(name) if !name.is_empty() => format!("{past} {name}."),
+        _ => format!("{past} everything."),
+    }
+}
+
 /// Whose software installs go to: the person's own prefix (`~/.local`, the
 /// default) or the whole computer, through the system-wide service.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -80,6 +119,9 @@ impl InstallScope {
 
 /// How often to look again for the system-wide service.
 const SYSTEM_CHECK_EVERY: Duration = Duration::from_secs(5);
+
+/// How long a status message stays on screen after it last changed.
+const STATUS_VISIBLE_FOR: Duration = Duration::from_secs(10);
 
 /// How often an open window asks whether the software list has gone stale.
 const CATALOGUE_CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
@@ -239,6 +281,8 @@ enum Event {
     Config(Result<Value, UiError>),
     /// Whether the system-wide service is answering.
     SystemService(bool),
+    /// `InspectLocal` for a dropped file: the path and what is in it.
+    LocalInspected(Result<(PathBuf, Value), UiError>),
     /// `CatalogueStatus`: when the software list was last downloaded.
     CatalogueStatus(Result<Value, UiError>),
     /// `RefreshCatalogue` finished (the new status), or could not download.
@@ -363,6 +407,21 @@ pub struct NpackGuiApp {
     details: Option<Value>,
     status: String,
     active_transaction: Option<(&'static str, u64)>,
+    /// The package action in progress (shown on its row).
+    activity: Option<Activity>,
+    /// A dropped `.npk` waiting for a yes or no.
+    pending_local: Option<PendingLocal>,
+    /// A `.npk` from the command line, to look at once set up.
+    open_on_start: Option<PathBuf>,
+    /// "Save" was pressed and the daemon has not answered yet.
+    save_pending: bool,
+    /// When the settings were last saved (for the "Saved." note).
+    settings_saved_at: Option<Instant>,
+    /// Installed apps that can be opened, by `publisher/name`.
+    launchers: HashMap<String, crate::launch::Launcher>,
+    /// The status line last seen and when it changed, so old messages fade.
+    status_seen: String,
+    status_changed_at: Instant,
 
     config: Option<Value>,
     welcome_dismissed: bool,
@@ -400,7 +459,9 @@ pub struct NpackGuiApp {
 }
 
 impl NpackGuiApp {
-    pub fn new(ctx: egui::Context) -> Self {
+    /// `open_file`: a `.npk` named on the command line (`npack-gui app.npk`),
+    /// looked at once the app is set up, exactly as if it had been dropped.
+    pub fn new(ctx: egui::Context, open_file: Option<PathBuf>) -> Self {
         let (tx, rx) = mpsc::channel();
         let tx = EventSender { tx, ctx };
         let remembered = crate::remember::load();
@@ -426,6 +487,7 @@ impl NpackGuiApp {
             crate::remember::save(&remembered);
         }
         let mut app = Self {
+            open_on_start: open_file,
             updates_checking: false,
             installed_refreshing: false,
             browse_refreshing: false,
@@ -460,6 +522,13 @@ impl NpackGuiApp {
             details: None,
             status: "Connecting...".to_owned(),
             active_transaction: None,
+            activity: None,
+            launchers: HashMap::new(),
+            pending_local: None,
+            save_pending: false,
+            settings_saved_at: None,
+            status_seen: String::new(),
+            status_changed_at: Instant::now(),
             config: None,
             welcome_dismissed: false,
             error: None,
@@ -487,6 +556,276 @@ impl NpackGuiApp {
         app.start_up();
         app.check_system_service();
         app
+    }
+
+    /// The app name and "by ..." text for an update row, from its
+    /// `publisher/name` reference, using the installed list for the publisher's
+    /// name when it is known.
+    fn update_identity(&self, reference: &str) -> (String, String) {
+        let (publisher, name) = reference.rsplit_once('/').unwrap_or(("", reference));
+        let installed = self.installed.iter().find(|item| {
+            value_str(item, "name") == name
+                && (value_str(item, "npub") == publisher
+                    || value_str(item, "publisher") == publisher)
+        });
+        let who = match installed {
+            Some(item) => {
+                self.publisher_text(&value_str(item, "publisher"), &display_publisher(item))
+            }
+            None => short_npub(publisher),
+        };
+        (name.to_owned(), who)
+    }
+
+    /// Handles files dropped on the window: a `.npk` is read (installing
+    /// nothing) and then confirmed in a dialog.
+    fn handle_drops(&mut self, ctx: &egui::Context) {
+        let files: Vec<PathBuf> = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .collect()
+        });
+        match classify_drop(&files) {
+            Dropped::Nothing => {}
+            _ if self.is_first_run() => {
+                self.status = "Finish setting up npack first, then drop the file again.".to_owned();
+            }
+            _ if self.scope == InstallScope::System => {
+                self.status = "Installing a file isn't available for everyone yet. Switch to \
+                               \"Just me\" in Settings."
+                    .to_owned();
+            }
+            _ if self.activity.is_some() || self.pending_local.is_some() => {
+                self.status =
+                    "Finish the current install first, then drop the file again.".to_owned();
+            }
+            Dropped::NotAPackage(name) => {
+                self.status = format!("{name} isn't a .npk package file.");
+            }
+            Dropped::NoPath => {
+                self.status = "That file couldn't be read from here.".to_owned();
+            }
+            Dropped::Package { path, others } => {
+                if others > 0 {
+                    self.status =
+                        "One file at a time: using the first package you dropped.".to_owned();
+                }
+                self.inspect_local(path);
+            }
+        }
+    }
+
+    fn inspect_local(&mut self, path: PathBuf) {
+        let shown = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.status = format!("Reading {shown}...");
+        self.spawn(move |client| {
+            Event::LocalInspected(
+                client
+                    .call("InspectLocal", serde_json::json!({ "path": path }))
+                    .map(|preview| (path, preview))
+                    .map_err(|error| UiError::from_anyhow(&error)),
+            )
+        });
+    }
+
+    fn install_local(&mut self, pending: PendingLocal) {
+        let name = value_str(&pending.preview, "name");
+        let reference = format!("{}/{}", value_str(&pending.preview, "publisher"), name);
+        self.status = format!("Installing {name}...");
+        self.activity = Some(Activity {
+            target: Some(reference),
+            label: "Installing",
+            stage: None,
+        });
+        let capabilities: Vec<&str> = if pending.allow_service {
+            vec!["service-manager"]
+        } else {
+            Vec::new()
+        };
+        let params = serde_json::json!({
+            "path": pending.path,
+            "allow_capability": capabilities,
+            "async": true,
+        });
+        self.spawn(move |client| match client.call("InstallLocal", params) {
+            Ok(value) => match value.get("transaction_id").and_then(Value::as_u64) {
+                Some(id) => Event::TransactionStarted {
+                    action: "install",
+                    id,
+                },
+                None => Event::ActionFinished {
+                    action: "install",
+                    result: Ok(value),
+                },
+            },
+            Err(error) => Event::ActionFinished {
+                action: "install",
+                result: Err(UiError::from_anyhow(&error)),
+            },
+        });
+    }
+
+    /// While files are dragged over the window, say what dropping will do.
+    fn show_drop_hint(&self, ctx: &egui::Context) {
+        if ctx.input(|input| input.raw.hovered_files.is_empty()) {
+            return;
+        }
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("drop-hint"),
+        ));
+        let rect = ctx.content_rect();
+        painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(170));
+        painter.rect_stroke(
+            rect.shrink(12.0),
+            8.0,
+            egui::Stroke::new(3.0, crate::style::ACCENT),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Drop a .npk file here to install it",
+            egui::FontId::proportional(26.0),
+            egui::Color32::WHITE,
+        );
+    }
+
+    /// The confirmation for a dropped file. A file carries no signature, so the
+    /// dialog says plainly that npack cannot tell who made it.
+    fn show_local_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &mut self.pending_local else {
+            return;
+        };
+        let preview = pending.preview.clone();
+        let blocked = preview
+            .get("blocked_by")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let compatible = preview.get("compatible").and_then(Value::as_bool) != Some(false);
+        let needs_service = preview
+            .get("required_capabilities")
+            .and_then(Value::as_array)
+            .is_some_and(|caps| {
+                caps.iter()
+                    .any(|cap| cap.as_str() == Some("service-manager"))
+            });
+        let mut install = false;
+        let mut cancel = false;
+        egui::Window::new("Install this file?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.strong(format!(
+                    "{} {}",
+                    value_str(&preview, "name"),
+                    value_str(&preview, "version")
+                ));
+                if let Some(summary) = app_text(&preview, "summary") {
+                    ui.label(summary);
+                }
+                let file = value_str(&preview, "file_name");
+                let size = preview.get("size").and_then(Value::as_u64).map(format_size);
+                ui.weak(match size {
+                    Some(size) => format!("From the file {file} ({size})."),
+                    None => format!("From the file {file}."),
+                });
+                ui.add_space(4.0);
+                ui.label(format!(
+                    "The file says it is from {}. That is not checked.",
+                    short_npub(&value_str(&preview, "npub"))
+                ));
+                ui.colored_label(
+                    egui::Color32::from_rgb(200, 130, 20),
+                    "This file isn't signed, so npack can't tell who made it, only that it \
+                     hasn't been damaged. Only install files from someone you trust.",
+                );
+                let effects: Vec<&str> = preview
+                    .get("post_install")
+                    .and_then(Value::as_array)
+                    .map(|items| items.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let effects = effects_in_words(&effects);
+                if !effects.is_empty() {
+                    ui.add_space(4.0);
+                    ui.strong("What installing does");
+                    for effect in &effects {
+                        ui.label(effect);
+                    }
+                }
+                let requires: Vec<&str> = preview
+                    .get("runtime_requires")
+                    .and_then(Value::as_array)
+                    .map(|items| items.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                if !requires.is_empty() {
+                    ui.label(format!("Needs on your system: {}", requires.join(", ")));
+                }
+                let dependencies: Vec<String> = preview
+                    .get("dependencies")
+                    .and_then(Value::as_array)
+                    .map(|items| items.iter().map(|d| value_str(d, "name")).collect())
+                    .unwrap_or_default();
+                if !dependencies.is_empty() {
+                    ui.label(format!(
+                        "Needs these installed first: {}",
+                        dependencies.join(", ")
+                    ));
+                }
+                if let Some(problem) = &blocked {
+                    ui.colored_label(egui::Color32::from_rgb(200, 50, 40), problem);
+                }
+                if !compatible {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 50, 40),
+                        "This package is for a different kind of computer.",
+                    );
+                }
+                if needs_service && let Some(pending) = &mut self.pending_local {
+                    ui.checkbox(
+                        &mut pending.allow_service,
+                        "Allow it to add the background service",
+                    );
+                }
+                ui.add_space(8.0);
+                let allowed = blocked.is_none()
+                    && compatible
+                    && (!needs_service
+                        || self
+                            .pending_local
+                            .as_ref()
+                            .is_some_and(|pending| pending.allow_service));
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(allowed, crate::style::primary_button("Install"))
+                        .clicked()
+                    {
+                        install = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if cancel {
+            self.pending_local = None;
+        } else if install && let Some(pending) = self.pending_local.take() {
+            self.install_local(pending);
+        }
+    }
+
+    /// What to say on `reference`'s row while it is being installed, updated,
+    /// removed or switched back; None when it is not the one being changed.
+    fn activity_words_for(&self, reference: &str) -> Option<String> {
+        let activity = self.activity.as_ref()?;
+        (activity.target.as_deref() == Some(reference)).then(|| activity_words(activity))
     }
 
     /// Looks, off the UI thread, for the system-wide service.
@@ -894,6 +1233,11 @@ impl NpackGuiApp {
     fn install(&mut self, package: &str, trust_once: Vec<String>, trust_first: Option<String>) {
         let package = package.to_owned();
         self.status = format!("Starting install of {package}...");
+        self.activity = Some(Activity {
+            target: Some(package.clone()),
+            label: "Installing",
+            stage: None,
+        });
         self.spawn(move |client| {
             if let Some(publisher) = trust_first
                 && let Err(error) = client.call(
@@ -954,6 +1298,11 @@ impl NpackGuiApp {
             Some(package) => format!("Starting update of {package}..."),
             None => "Starting update of all packages...".to_owned(),
         };
+        self.activity = Some(Activity {
+            target: package.clone(),
+            label: "Updating",
+            stage: None,
+        });
         self.spawn(move |client| {
             let mut params = serde_json::json!({ "async": true });
             if let Some(package) = package {
@@ -1001,6 +1350,11 @@ impl NpackGuiApp {
     fn rollback(&mut self, package: &str) {
         let package = package.to_owned();
         self.status = format!("Switching {package} back...");
+        self.activity = Some(Activity {
+            target: Some(package.clone()),
+            label: "Switching back",
+            stage: None,
+        });
         self.spawn(move |client| Event::ActionFinished {
             action: "rollback",
             result: client
@@ -1012,6 +1366,11 @@ impl NpackGuiApp {
     fn remove(&mut self, package: &str) {
         let package = package.to_owned();
         self.status = format!("Removing {package}...");
+        self.activity = Some(Activity {
+            target: Some(package.clone()),
+            label: "Removing",
+            stage: None,
+        });
         self.spawn(move |client| {
             let result = client
                 .call("Remove", serde_json::json!({ "package": package }))
@@ -1064,7 +1423,25 @@ impl NpackGuiApp {
             match event {
                 Event::Installed(Ok(items)) => {
                     self.installed_refreshing = false;
-                    self.status = format!("{} package(s) installed.", items.len());
+                    self.launchers = items
+                        .iter()
+                        .filter_map(|item| {
+                            let files: Vec<String> = item
+                                .get("files")
+                                .and_then(Value::as_array)
+                                .map(|files| {
+                                    files
+                                        .iter()
+                                        .filter_map(Value::as_str)
+                                        .map(str::to_owned)
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            crate::launch::find_launcher(&files)
+                                .map(|launcher| (package_reference(item), launcher))
+                        })
+                        .collect();
+                    // The list itself says how many there are.
                     let publishers = items
                         .iter()
                         .map(|item| value_str(item, "publisher"))
@@ -1108,7 +1485,7 @@ impl NpackGuiApp {
                 }
                 Event::Search(Ok(items)) => {
                     self.browse_refreshing = false;
-                    self.status = format!("{} result(s).", items.len());
+                    // The heading says how many are shown.
                     let publishers = items
                         .iter()
                         .map(|item| value_str(item, "publisher"))
@@ -1135,7 +1512,7 @@ impl NpackGuiApp {
                 // The sidebar is a convenience; results still show without it.
                 Event::Categories(Err(_)) => {}
                 Event::Updates(Ok(items)) => {
-                    self.status = format!("Checked {} installed package(s).", items.len());
+                    // The line beside the button says what the check found.
                     self.updates = items;
                     self.updates_checking = false;
                     self.updates_checked_at = Some(unix_seconds());
@@ -1161,6 +1538,16 @@ impl NpackGuiApp {
                     self.icons.insert(sha256, (bytes.into(), extension));
                 }
                 Event::Details(Err(error)) => self.fail("Loading details", error),
+                Event::LocalInspected(Ok((path, preview))) => {
+                    let name = value_str(&preview, "name");
+                    self.status = format!("Read {name}. Check it, then choose Install.");
+                    self.pending_local = Some(PendingLocal {
+                        path,
+                        preview,
+                        allow_service: false,
+                    });
+                }
+                Event::LocalInspected(Err(error)) => self.fail("Reading that file", error),
                 Event::CatalogueStatus(Ok(status)) => {
                     let wanted = should_refresh_catalogue(
                         &status,
@@ -1214,6 +1601,10 @@ impl NpackGuiApp {
                     }
                 }
                 Event::Config(Ok(value)) => {
+                    if self.save_pending {
+                        self.save_pending = false;
+                        self.settings_saved_at = Some(Instant::now());
+                    }
                     self.relays_text = string_lines(&value, "relays");
                     self.blossom_text = string_lines(&value, "blossom");
                     let trusted = value
@@ -1227,7 +1618,7 @@ impl NpackGuiApp {
                         })
                         .unwrap_or_default();
                     if self.status == "Connecting..." {
-                        self.status = "Ready.".to_owned();
+                        self.status = String::new();
                     }
                     // Only a person's own prefix has a first run; the
                     // computer-wide service is set up by an administrator.
@@ -1242,6 +1633,9 @@ impl NpackGuiApp {
                         self.refresh_installed();
                         self.refresh_updates();
                     }
+                    if !first_run && let Some(path) = self.open_on_start.take() {
+                        self.inspect_local(path);
+                    }
                     if !first_run && !self.auto_browsed {
                         self.auto_browsed = true;
                         self.browse(false);
@@ -1252,7 +1646,10 @@ impl NpackGuiApp {
                         self.run_health_check();
                     }
                 }
-                Event::Config(Err(error)) => self.fail("Updating settings", error),
+                Event::Config(Err(error)) => {
+                    self.save_pending = false;
+                    self.fail("Updating settings", error);
+                }
                 Event::InstallPreview(Ok(value)) => {
                     if let Some(pending) = &mut self.pending_install {
                         pending.preview = Some(value);
@@ -1292,6 +1689,9 @@ impl NpackGuiApp {
                         .get("progress")
                         .and_then(|progress| progress.get("package"))
                         .and_then(Value::as_str);
+                    if let Some(activity) = &mut self.activity {
+                        activity.stage = Some(stage.to_owned());
+                    }
                     self.status = match package {
                         Some(package) => format!("{stage}: {package}"),
                         None => stage.to_owned(),
@@ -1299,11 +1699,12 @@ impl NpackGuiApp {
                 }
                 Event::ActionFinished { action, result } => {
                     self.active_transaction = None;
+                    let target = self.activity.take().and_then(|activity| activity.target);
                     match result {
                         Ok(value) => match UiError::from_failed_status(&value) {
                             Some(error) => self.fail(action, error),
                             None => {
-                                self.status = format!("{action} finished.");
+                                self.status = finished_words(action, target.as_deref());
                                 self.error = None;
                                 self.refresh_installed();
                                 self.refresh_config();
@@ -1368,6 +1769,25 @@ fn short_npub(npub: &str) -> String {
 const ICON_SIZE: f32 = 40.0;
 
 /// (problems that stop npack working, warnings) in a health check's findings.
+/// The words in the warning strip: the first problem that stops npack
+/// working, by name, and how many more there are. None when nothing does.
+fn health_banner_text(findings: &[Value]) -> Option<String> {
+    let failures: Vec<&Value> = findings
+        .iter()
+        .filter(|finding| finding.get("level").and_then(Value::as_str) == Some("fail"))
+        .collect();
+    let first = failures.first()?;
+    let title = value_str(first, "title");
+    Some(match failures.len() {
+        1 => format!("npack can't work properly: {title}."),
+        more => format!(
+            "npack can't work properly: {title}, and {} more problem{}.",
+            more - 1,
+            if more == 2 { "" } else { "s" }
+        ),
+    })
+}
+
 fn health_counts(findings: &[Value]) -> (usize, usize) {
     let count = |level: &str| {
         findings
@@ -1524,12 +1944,21 @@ fn size_summary(item: &Value) -> Option<String> {
 /// What installing does besides copying files, in plain words, from the
 /// release's `details.post_install` entries ("action path").
 fn install_effects(item: &Value) -> Vec<String> {
-    item.get("details")
+    let entries: Vec<&str> = item
+        .get("details")
         .and_then(|details| details.get("post_install"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
+        .collect();
+    effects_in_words(&entries)
+}
+
+/// Plain-words versions of post-install entries ("action path").
+fn effects_in_words(entries: &[&str]) -> Vec<String> {
+    entries
+        .iter()
         .map(|entry| {
             let (action, path) = entry.split_once(' ').unwrap_or((entry, ""));
             let file = path.rsplit('/').next().unwrap_or(path);
@@ -1542,6 +1971,51 @@ fn install_effects(item: &Value) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// What a drop onto the window means.
+#[derive(Debug, PartialEq, Eq)]
+enum Dropped {
+    Nothing,
+    /// The first `.npk`, and how many other files were dropped with it.
+    Package {
+        path: PathBuf,
+        others: usize,
+    },
+    /// Something that is not a `.npk`, by file name.
+    NotAPackage(String),
+    /// A drop with no usable path.
+    NoPath,
+}
+
+fn classify_drop(files: &[PathBuf]) -> Dropped {
+    let is_npk = |path: &Path| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("npk"))
+    };
+    if files.is_empty() {
+        return Dropped::Nothing;
+    }
+    if let Some(path) = files.iter().find(|path| is_npk(path)) {
+        return Dropped::Package {
+            path: path.clone(),
+            others: files.len() - 1,
+        };
+    }
+    match files[0].file_name() {
+        Some(name) => Dropped::NotAPackage(name.to_string_lossy().into_owned()),
+        None => Dropped::NoPath,
+    }
+}
+
+/// A `.npk` the person dropped, being looked at before anything is installed.
+struct PendingLocal {
+    path: PathBuf,
+    /// The `InspectLocal` answer: what the file is and what installing does.
+    preview: Value,
+    /// They ticked "allow the background service".
+    allow_service: bool,
 }
 
 /// Where the code came from, if the release says: "repo at commit".
@@ -1594,7 +2068,12 @@ fn details_view(
         ui.strong(summary);
     }
     ui.horizontal_wrapped(|ui| {
-        publisher_line(ui, publisher, value.get("trust").and_then(Value::as_str));
+        publisher_line(
+            ui,
+            publisher,
+            value.get("trust").and_then(Value::as_str),
+            false,
+        );
     });
     if let Some(description) = app_text(value, "description") {
         ui.add_space(6.0);
@@ -1702,16 +2181,23 @@ fn trust_label(trust: Option<&str>) -> (egui::Color32, &'static str) {
     }
 }
 
-fn trust_badge(ui: &mut egui::Ui, trust: Option<&str>) {
+/// `quiet` is for long lists: "Not trusted yet" is plain grey text there, since
+/// with nobody trusted by default every row would otherwise glow orange. The
+/// details pane and the install confirmation keep the warning colour.
+fn trust_badge(ui: &mut egui::Ui, trust: Option<&str>, quiet: bool) {
     let (color, text) = trust_label(trust);
+    if quiet && trust != Some("trusted") {
+        ui.weak(text);
+        return;
+    }
     status_dot(ui, color);
     ui.colored_label(color, text);
 }
 
 /// "by <best name available>" followed by the trust badge.
-fn publisher_line(ui: &mut egui::Ui, who: &str, trust: Option<&str>) {
+fn publisher_line(ui: &mut egui::Ui, who: &str, trust: Option<&str>, quiet: bool) {
     ui.label(format!("by {who}"));
-    trust_badge(ui, trust);
+    trust_badge(ui, trust, quiet);
 }
 
 /// Muted tile colours for the stand-in icon.
@@ -1803,6 +2289,10 @@ fn package_reference(value: &Value) -> String {
 impl eframe::App for NpackGuiApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        if self.status != self.status_seen {
+            self.status_seen = self.status.clone();
+            self.status_changed_at = Instant::now();
+        }
         if self
             .system_checked_at
             .is_none_or(|checked| checked.elapsed() >= SYSTEM_CHECK_EVERY)
@@ -1819,6 +2309,7 @@ impl eframe::App for NpackGuiApp {
         // egui only redraws on input, so ask to be woken for the next look.
         ctx.request_repaint_after(SYSTEM_CHECK_EVERY);
         self.handle_shortcuts(ctx);
+        self.handle_drops(ctx);
         self.remember_changes(ctx);
         // Redraw regularly while a background call or transaction is in
         // flight, so polling results and progress show up promptly.
@@ -1828,8 +2319,20 @@ impl eframe::App for NpackGuiApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // A message stays while something is running and for a few seconds
+        // after it changes, then clears, so it never describes the past.
+        let busy = self.activity.is_some()
+            || self.updates_checking
+            || self.installed_refreshing
+            || self.browse_refreshing
+            || self.catalogue_refreshing;
+        let status_visible = busy || self.status_changed_at.elapsed() < STATUS_VISIBLE_FOR;
         egui::Panel::bottom("status").show(ui, |ui| {
-            ui.label(&self.status);
+            if status_visible && !self.status.is_empty() {
+                ui.label(&self.status);
+            } else {
+                ui.label(" ");
+            }
         });
 
         // The details pane only appears while a package is selected, and only
@@ -1915,6 +2418,8 @@ impl eframe::App for NpackGuiApp {
         });
 
         self.show_trust_dialog(&ui.ctx().clone());
+        self.show_local_dialog(&ui.ctx().clone());
+        self.show_drop_hint(&ui.ctx().clone());
     }
 }
 
@@ -2111,17 +2616,17 @@ impl NpackGuiApp {
     /// A strip on every tab while the last check found something that stops
     /// npack working (warnings alone only show on the tab's badge).
     fn show_health_warning(&mut self, ui: &mut egui::Ui) {
-        if health_counts(&self.health).0 == 0 {
+        let Some(text) = health_banner_text(&self.health) else {
             return;
-        }
+        };
         let mut open = false;
         egui::Frame::new()
             .fill(egui::Color32::from_rgba_unmultiplied(220, 60, 40, 50))
             .inner_margin(egui::Margin::same(8))
             .corner_radius(4)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("npack found a problem that stops it working properly.");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(&text);
                     if ui.button("See what to do").clicked() {
                         open = true;
                     }
@@ -2191,7 +2696,15 @@ impl NpackGuiApp {
         }
     }
 
+    /// Settings scroll, because the page is longer than a small window.
     fn show_settings_tab(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("settings")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.show_settings_sections(ui));
+    }
+
+    fn show_settings_sections(&mut self, ui: &mut egui::Ui) {
         let mut reconnect = false;
         // Offered only while the system-wide service is running (or already
         // in use, so it can always be switched back).
@@ -2213,19 +2726,6 @@ impl NpackGuiApp {
             if choice != self.scope {
                 self.set_scope(choice);
             }
-        }
-        ui.collapsing("Advanced", |ui| {
-            ui.label("npack's background service listens on this socket.");
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.socket_path_text);
-                if ui.button("Reconnect").clicked() {
-                    reconnect = true;
-                }
-            });
-        });
-        ui.add_space(8.0);
-        if reconnect {
-            self.reconnect();
         }
         ui.heading("Trusted publishers");
         ui.label("npack only installs without asking from publishers on this list.");
@@ -2302,15 +2802,40 @@ impl NpackGuiApp {
         ui.add(egui::TextEdit::multiline(&mut self.blossom_text).desired_rows(3));
         ui.horizontal(|ui| {
             if ui.button("Save").clicked() {
+                self.save_pending = true;
                 self.save_config(
                     Some(lines_to_list(&self.relays_text)),
                     Some(lines_to_list(&self.blossom_text)),
                 );
             }
             if ui.button("Restore recommended").clicked() {
+                self.save_pending = true;
                 self.save_config(Some(Vec::new()), Some(Vec::new()));
             }
+            if self.save_pending {
+                ui.spinner();
+            } else if self
+                .settings_saved_at
+                .is_some_and(|saved| saved.elapsed() < Duration::from_secs(5))
+            {
+                ui.label("Saved.");
+            }
         });
+
+        ui.add_space(12.0);
+        ui.collapsing("Advanced", |ui| {
+            ui.label("npack's background service listens on this socket.");
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(&mut self.socket_path_text);
+                if ui.button("Reconnect").clicked() {
+                    reconnect = true;
+                }
+            });
+        });
+        ui.add_space(8.0);
+        if reconnect {
+            self.reconnect();
+        }
     }
 
     fn show_trust_dialog(&mut self, ctx: &egui::Context) {
@@ -2436,6 +2961,7 @@ impl NpackGuiApp {
         let mut to_remove = None;
         let mut to_show = None;
         let mut to_rollback = None;
+        let mut to_open = None;
         let mut go_browse = false;
         if !self.installed_loaded {
             ui.add_space(8.0);
@@ -2456,23 +2982,40 @@ impl NpackGuiApp {
                         ui.strong(value_str(item, "name"));
                         ui.label(value_str(item, "version"));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Remove").clicked() {
-                                to_remove = Some(reference.clone());
-                            }
-                            if let Some(previous) = self.rollbacks.get(&reference)
-                                && self.active_transaction.is_none()
-                                && ui
-                                    .button(format!("Switch back to {previous}"))
-                                    .on_hover_text(
-                                        "Reinstalls the version this one replaced, from the copy \
-                                         npack kept. No download needed.",
-                                    )
-                                    .clicked()
-                            {
-                                to_rollback = Some(reference.clone());
+                            let idle = self.activity.is_none();
+                            if let Some(words) = self.activity_words_for(&reference) {
+                                ui.label(words);
+                                ui.spinner();
+                            } else {
+                                if ui.add_enabled(idle, egui::Button::new("Remove")).clicked() {
+                                    to_remove = Some(reference.clone());
+                                }
+                                if let Some(previous) = self.rollbacks.get(&reference)
+                                    && ui
+                                        .add_enabled(
+                                            idle,
+                                            egui::Button::new(format!("Switch back to {previous}")),
+                                        )
+                                        .on_hover_text(
+                                            "Reinstalls the version this one replaced, from the \
+                                             copy npack kept. No download needed.",
+                                        )
+                                        .clicked()
+                                {
+                                    to_rollback = Some(reference.clone());
+                                }
                             }
                             if ui.button("Details").clicked() {
                                 to_show = Some(reference.clone());
+                            }
+                            if self.launchers.contains_key(&reference)
+                                && idle
+                                && ui
+                                    .add(crate::style::primary_button("Open"))
+                                    .on_hover_text("Start this app")
+                                    .clicked()
+                            {
+                                to_open = Some(reference.clone());
                             }
                         });
                     });
@@ -2511,6 +3054,28 @@ impl NpackGuiApp {
         if let Some(reference) = to_remove {
             self.remove(&reference);
         }
+        if let Some(reference) = to_open {
+            self.open_app(&reference);
+        }
+    }
+
+    /// Starts an installed app from its launcher. A per-user install puts its
+    /// programs in `~/.local/bin`, so that folder is searched first.
+    fn open_app(&mut self, reference: &str) {
+        let Some(launcher) = self.launchers.get(reference) else {
+            return;
+        };
+        let name = reference.rsplit('/').next().unwrap_or(reference).to_owned();
+        let extra: Vec<PathBuf> = match self.scope {
+            InstallScope::User => dirs::home_dir()
+                .map(|home| vec![home.join(".local/bin")])
+                .unwrap_or_default(),
+            InstallScope::System => Vec::new(),
+        };
+        self.status = match crate::launch::start(launcher, &extra) {
+            Ok(()) => format!("Opening {name}..."),
+            Err(error) => format!("Couldn't open {name}: {error}."),
+        };
     }
 
     fn show_browse_tab(&mut self, ui: &mut egui::Ui) {
@@ -2680,34 +3245,45 @@ impl NpackGuiApp {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
-                                                match install_state(&self.installed, item) {
-                                                    InstallState::NotInstalled => {
-                                                        if ui
-                                                            .add(crate::style::primary_button(
-                                                                "Install",
-                                                            ))
-                                                            .clicked()
-                                                        {
-                                                            to_install = Some(item.clone());
+                                                let idle = self.activity.is_none();
+                                                if let Some(words) =
+                                                    self.activity_words_for(&reference)
+                                                {
+                                                    ui.label(words);
+                                                    ui.spinner();
+                                                } else {
+                                                    match install_state(&self.installed, item) {
+                                                        InstallState::NotInstalled => {
+                                                            if ui
+                                                                .add_enabled(
+                                                                    idle,
+                                                                    crate::style::primary_button(
+                                                                        "Install",
+                                                                    ),
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                to_install = Some(item.clone());
+                                                            }
                                                         }
-                                                    }
-                                                    InstallState::Installed => {
-                                                        ui.add_enabled(
-                                                            false,
-                                                            egui::Button::new("Installed"),
-                                                        );
-                                                    }
-                                                    InstallState::OtherVersion(version) => {
-                                                        ui.add_enabled(
-                                                            false,
-                                                            egui::Button::new(format!(
-                                                                "Installed ({version})"
-                                                            )),
-                                                        )
-                                                        .on_disabled_hover_text(
-                                                            "A different version is installed. \
+                                                        InstallState::Installed => {
+                                                            ui.add_enabled(
+                                                                false,
+                                                                egui::Button::new("Installed"),
+                                                            );
+                                                        }
+                                                        InstallState::OtherVersion(version) => {
+                                                            ui.add_enabled(
+                                                                false,
+                                                                egui::Button::new(format!(
+                                                                    "Installed ({version})"
+                                                                )),
+                                                            )
+                                                            .on_disabled_hover_text(
+                                                                "A different version is installed. \
                                                              Newer versions appear under Updates.",
-                                                        );
+                                                            );
+                                                        }
                                                     }
                                                 }
                                                 if ui.button("Details").clicked() {
@@ -2735,6 +3311,7 @@ impl NpackGuiApp {
                                             ui,
                                             &who,
                                             item.get("trust").and_then(Value::as_str),
+                                            true,
                                         );
                                     });
                                 });
@@ -2803,7 +3380,7 @@ impl NpackGuiApp {
                 ui.weak(line);
             }
             if available > 0
-                && self.active_transaction.is_none()
+                && self.activity.is_none()
                 && ui.button(format!("Update all ({available})")).clicked()
             {
                 update_all = true;
@@ -2824,32 +3401,47 @@ impl NpackGuiApp {
                 .get("available_version")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
+            let (name, who) = self.update_identity(&reference);
+            let revoked = item.get("revoked").and_then(Value::as_str);
             ui.horizontal(|ui| {
-                if let Some(reason) = item.get("revoked").and_then(Value::as_str) {
-                    ui.colored_label(egui::Color32::from_rgb(200, 50, 40), "Revoked");
-                    ui.label(format!("{reference} {current}"));
-                    ui.weak(format!("The publisher withdrew this version: {reason}"));
-                } else {
-                    ui.label(format!("{reference} {current}"));
-                }
-                match &available {
-                    Some(available) => {
-                        ui.label(format!("to {available}"));
-                        if self.active_transaction.is_none()
-                            && ui.add(crate::style::primary_button("Update")).clicked()
-                        {
-                            to_update = Some(reference.clone());
-                        }
+                show_icon(ui, None, &name);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(&name);
+                        match &available {
+                            Some(available) => ui.label(format!("{current} to {available}")),
+                            None => ui.label(&current),
+                        };
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let idle = self.activity.is_none();
+                            if let Some(words) = self.activity_words_for(&reference) {
+                                ui.label(words);
+                                ui.spinner();
+                            } else if available.is_some() {
+                                if ui
+                                    .add_enabled(idle, crate::style::primary_button("Update"))
+                                    .clicked()
+                                {
+                                    to_update = Some(reference.clone());
+                                }
+                                if let Some(size) =
+                                    item.get("download_size").and_then(Value::as_u64)
+                                {
+                                    ui.weak(format_size(size));
+                                }
+                            } else if revoked.is_none() {
+                                ui.weak("up to date");
+                            }
+                        });
+                    });
+                    ui.weak(format!("by {who}"));
+                    if let Some(reason) = revoked {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(200, 50, 40),
+                            format!("Withdrawn by the publisher: {reason}"),
+                        );
                     }
-                    None => {
-                        ui.weak("up to date");
-                    }
-                }
-                if available.is_some()
-                    && let Some(size) = item.get("download_size").and_then(Value::as_u64)
-                {
-                    ui.weak(format_size(size));
-                }
+                });
             });
             if available.is_some()
                 && let Some(notes) = item.get("release_notes").and_then(Value::as_str)
@@ -2859,6 +3451,7 @@ impl NpackGuiApp {
                     ui.label(notes);
                 });
             }
+            ui.add_space(6.0);
         }
         if update_all {
             self.update(None);
@@ -3100,6 +3693,117 @@ mod tests {
         );
         assert!(install_effects(&serde_json::json!({})).is_empty());
         assert_eq!(source_line(&serde_json::json!({"details": {}})), None);
+    }
+
+    #[test]
+    fn a_drop_is_understood_by_what_was_dropped() {
+        let path = |p: &str| PathBuf::from(p);
+        assert_eq!(classify_drop(&[]), Dropped::Nothing);
+        assert_eq!(
+            classify_drop(&[path("/home/me/app-1.0.npk")]),
+            Dropped::Package {
+                path: path("/home/me/app-1.0.npk"),
+                others: 0
+            }
+        );
+        // The extension is not case sensitive, and the first package wins.
+        assert_eq!(
+            classify_drop(&[path("/x/readme.txt"), path("/x/A.NPK"), path("/x/b.npk")]),
+            Dropped::Package {
+                path: path("/x/A.NPK"),
+                others: 2
+            }
+        );
+        assert_eq!(
+            classify_drop(&[path("/x/readme.txt")]),
+            Dropped::NotAPackage("readme.txt".into())
+        );
+        assert_eq!(classify_drop(&[path("/")]), Dropped::NoPath);
+        // A folder named like a package is still passed on; the daemon refuses it.
+        assert!(matches!(
+            classify_drop(&[path("/x/odd.npk")]),
+            Dropped::Package { .. }
+        ));
+    }
+
+    #[test]
+    fn effects_are_put_in_plain_words_for_dropped_files_too() {
+        let effects = effects_in_words(&[
+            "register-service lib/systemd/user/a.service",
+            "create-directory var/a",
+        ]);
+        assert!(effects[0].contains("background service (a.service)"));
+        assert!(effects[1].contains("var/a"));
+        assert!(effects_in_words(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_row_says_what_it_is_doing_in_plain_words() {
+        let activity = |label: &'static str, stage: Option<&str>| Activity {
+            target: Some("pub/app".into()),
+            label,
+            stage: stage.map(str::to_owned),
+        };
+        assert_eq!(
+            activity_words(&activity("Installing", None)),
+            "Installing..."
+        );
+        assert_eq!(
+            activity_words(&activity("Installing", Some("downloading"))),
+            "Downloading..."
+        );
+        assert_eq!(
+            activity_words(&activity("Updating", Some("updating"))),
+            "Updating..."
+        );
+        assert_eq!(
+            activity_words(&activity("Removing", Some("something new"))),
+            "Removing..."
+        );
+        assert_eq!(
+            finished_words("install", Some("pub/notepad-lite")),
+            "Installed notepad-lite."
+        );
+        assert_eq!(finished_words("update", None), "Updated everything.");
+        assert_eq!(finished_words("remove", Some("pub/x")), "Removed x.");
+        assert_eq!(
+            finished_words("rollback", Some("pub/x")),
+            "Switched back x."
+        );
+        assert_eq!(finished_words("trust", Some("pub/x")), "trust finished.");
+    }
+
+    #[test]
+    fn the_warning_strip_names_the_problem() {
+        let finding =
+            |level: &str, title: &str| serde_json::json!({"level": level, "title": title});
+        assert_eq!(health_banner_text(&[]), None);
+        assert_eq!(
+            health_banner_text(&[finding("warn", "A dead relay"), finding("ok", "Fine")]),
+            None,
+            "warnings alone do not raise the strip"
+        );
+        assert_eq!(
+            health_banner_text(&[
+                finding("ok", "Fine"),
+                finding("fail", "No relay can be reached")
+            ])
+            .as_deref(),
+            Some("npack can't work properly: No relay can be reached.")
+        );
+        assert_eq!(
+            health_banner_text(&[finding("fail", "A"), finding("fail", "B")]).as_deref(),
+            Some("npack can't work properly: A, and 1 more problem.")
+        );
+        assert_eq!(
+            health_banner_text(&[
+                finding("fail", "A"),
+                finding("fail", "B"),
+                finding("fail", "C")
+            ])
+            .as_deref(),
+            Some("npack can't work properly: A, and 2 more problems.")
+        );
     }
 
     #[test]
