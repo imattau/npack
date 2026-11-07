@@ -4,6 +4,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_mangen::Man;
 use futures_util::StreamExt;
 use goblin::Object;
+
+mod pathcheck;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use nostr_blossom::prelude::BlossomClient;
 use nostr_sdk::prelude::*;
@@ -763,6 +765,18 @@ enum Command {
         source: PathBuf,
         #[arg(long, help = "Path to write the .npk archive to")]
         output: PathBuf,
+        #[arg(
+            long,
+            help = "Fail instead of warning when the package hard-codes install paths"
+        )]
+        strict: bool,
+        #[arg(
+            long = "allow-path",
+            value_name = "PATH",
+            help = "An absolute path (or folder) that is hard-coded on purpose; repeatable. \
+                    Packages can also list them in .npack/path-allow.txt"
+        )]
+        allow_paths: Vec<String>,
     },
     /// Show what npack installed, upgraded, rolled back or removed.
     History {
@@ -1550,7 +1564,12 @@ async fn main() -> Result<()> {
             )
             .await?
         }
-        Command::Pack { source, output } => pack_npk(&source, &output)?,
+        Command::Pack {
+            source,
+            output,
+            strict,
+            allow_paths,
+        } => pack_with_path_checks(&source, &output, strict, &allow_paths)?,
         Command::History {
             package,
             limit,
@@ -2747,6 +2766,64 @@ fn download_progress_bar(message: String) -> ProgressBar {
     } else {
         ProgressBar::hidden()
     }
+}
+
+/// Prints what the path checks found, in words a publisher can act on.
+fn print_path_findings(findings: &[pathcheck::Finding]) {
+    if findings.is_empty() {
+        return;
+    }
+    eprintln!(
+        "warning: {} hard-coded path(s) found. The same package is installed under \
+         ~/.local for one person and under / for everyone, so these may work in only one mode:",
+        findings.len()
+    );
+    for finding in findings.iter().take(pathcheck::MAX_SHOWN) {
+        eprintln!("{}", finding.render());
+    }
+    if findings.len() > pathcheck::MAX_SHOWN {
+        eprintln!("  ...and {} more", findings.len() - pathcheck::MAX_SHOWN);
+    }
+    eprintln!(
+        "  Fix them, or list a path as intentional with --allow-path or in {}.",
+        pathcheck::ALLOW_FILE
+    );
+}
+
+/// `npack pack`: checks the source for hard-coded install paths (warnings, or
+/// an error with `--strict`), then builds the archive.
+fn pack_with_path_checks(
+    source: &Path,
+    output: &Path,
+    strict: bool,
+    extra_allow: &[String],
+) -> Result<()> {
+    if let Some(bad) = extra_allow.iter().find(|path| !path.starts_with('/')) {
+        bail!("--allow-path must be an absolute path, got {bad}");
+    }
+    if source.is_dir() {
+        let entries = pathcheck::load_dir(source)?;
+        let mut allow = pathcheck::allow_from_entries(&entries);
+        allow.extend(extra_allow.iter().cloned());
+        let root = fs::canonicalize(source)
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned());
+        let findings = pathcheck::check(
+            &entries,
+            &pathcheck::Options {
+                source_root: root.as_deref(),
+                allow: &allow,
+            },
+        );
+        print_path_findings(&findings);
+        if strict && !findings.is_empty() {
+            bail!(
+                "{} hard-coded path(s) found and --strict is set; nothing was written",
+                findings.len()
+            );
+        }
+    }
+    pack_npk(source, output)
 }
 
 fn pack_npk(source: &Path, output: &Path) -> Result<()> {
@@ -7610,6 +7687,23 @@ async fn publish_release(
     release_manifest.artifact_event = Some(artifact_event.id.to_hex());
     for warning in listing_warnings(&manifest) {
         eprintln!("warning: {warning}");
+    }
+    if manifest.format == "npk" {
+        match pathcheck::load_npk(&artifact_path) {
+            Ok(entries) => {
+                let allow = pathcheck::allow_from_entries(&entries);
+                print_path_findings(&pathcheck::check(
+                    &entries,
+                    &pathcheck::Options {
+                        source_root: None,
+                        allow: &allow,
+                    },
+                ));
+            }
+            Err(error) => {
+                eprintln!("warning: could not check the package for fixed paths: {error:#}")
+            }
+        }
     }
     release_manifest.app.download_size = Some(bytes.len() as u64);
     match installed_size_of(&artifact_path) {

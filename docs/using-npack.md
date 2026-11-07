@@ -195,6 +195,32 @@ The package root should contain payload paths relative to the host root:
 `bin/`, `lib/`, `share/`, `etc/`, and so on. Do not put `/usr` or `/home`
 inside the archive unless that is deliberately part of the target layout.
 
+### Hard-coded install paths
+
+The same package is installed under `~/.local` for one person and under `/` for
+everyone, so a file that names an absolute location works in one mode and
+breaks in the other. `npack pack` (and `npack publish`, which checks the
+finished archive) warns about:
+
+- **Your own files by absolute path:** `ExecStart=/usr/bin/app` or
+  `DATA=/usr/share/app/data` in a unit, script, `.desktop` or config file, when
+  the package installs `bin/app` or `share/app/data` itself. References to
+  system tools (`/usr/bin/env`, `/etc/ssl`) are fine.
+- **Build-machine paths:** the directory you packed from, `/home/<name>`,
+  `/Users/<name>`, `/root`, CI work folders. In binaries only the directory you
+  packed from is reported, because compilers record their own toolchain's paths.
+- **Absolute library paths:** an ELF `RPATH`/`RUNPATH` outside `/lib`, `/usr/lib`
+  and friends. Use `$ORIGIN/../lib`.
+- **Absolute symlink targets.**
+
+Documentation, man pages, licences and translations are skipped, as are
+`.npack/` files. Nothing in the package is ever run: the check only reads
+bytes. Findings are warnings by default; `npack pack --strict` fails (before
+writing anything) so a build script can insist. A path that is hard-coded on
+purpose is allowed with `--allow-path /usr/share/zoneinfo` (repeatable) or by
+listing it, one absolute prefix per line, in `.npack/path-allow.txt` inside the
+package.
+
 ## Manifest fields
 
 The important fields are:

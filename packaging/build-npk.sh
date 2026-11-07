@@ -55,7 +55,8 @@ finish() {
   local artifact="${name}-${VERSION}-linux-x86_64.npk"
   mkdir -p "$root/.npack"
   cp "$manifest" "$root/.npack/manifest.json"
-  "$NPACK" pack "$root" --output "$OUT/$artifact" > /dev/null
+  # --strict: our own packages must not hard-code install paths (see docs).
+  "$NPACK" pack "$root" --output "$OUT/$artifact" --strict > /dev/null
   "$NPACK" manifest "$OUT/$artifact" --output "$OUT/${name}-${VERSION}.manifest.json" > /dev/null
   (cd "$OUT" && sha256sum "$artifact") >> "$OUT/SHA256SUMS"
 }
