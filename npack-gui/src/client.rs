@@ -98,6 +98,22 @@ pub fn ensure_daemon_at(socket: &Path, program: &Path, wait: Duration) -> anyhow
     )))
 }
 
+/// Where the system-wide service (`npack daemon --system`) listens.
+pub const SYSTEM_SOCKET: &str = "/run/npackd.sock";
+
+pub fn system_socket_path() -> PathBuf {
+    PathBuf::from(SYSTEM_SOCKET)
+}
+
+pub fn is_system_socket(path: &Path) -> bool {
+    path == Path::new(SYSTEM_SOCKET)
+}
+
+/// Whether something is accepting connections on `socket`.
+pub fn listening_at(socket: &Path) -> bool {
+    UnixStream::connect(socket).is_ok()
+}
+
 pub struct DaemonClient {
     socket_path: PathBuf,
     next_id: AtomicU64,
@@ -115,6 +131,18 @@ impl DaemonClient {
     /// `npack daemon` for this person if nothing is listening. Returns whether
     /// it had to start one. Blocks for up to `wait`, so call it off the UI thread.
     pub fn ensure_daemon(&self, wait: Duration) -> anyhow::Result<bool> {
+        // The system-wide service belongs to the administrator (systemd starts
+        // it as root). Starting a copy of it as this person would just fail
+        // or, worse, answer on the wrong socket, so it is never started here.
+        if is_system_socket(&self.socket_path) {
+            return if listening_at(&self.socket_path) {
+                Ok(false)
+            } else {
+                Err(unreachable(
+                    "the system-wide npack service isn't running on this computer".to_owned(),
+                ))
+            };
+        }
         ensure_daemon_at(&self.socket_path, &npack_program(), wait)
     }
 
@@ -308,6 +336,27 @@ mod tests {
             daemon_error
                 .message
                 .contains("stopped as soon as it started")
+        );
+    }
+
+    #[test]
+    fn only_the_system_socket_is_treated_as_the_system_service() {
+        assert!(is_system_socket(Path::new("/run/npackd.sock")));
+        assert!(!is_system_socket(Path::new("/run/user/1000/npackd.sock")));
+        assert!(!is_system_socket(Path::new("/tmp/npackd.sock")));
+    }
+
+    #[test]
+    fn listening_is_detected_only_while_something_accepts_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.sock");
+        assert!(!listening_at(&socket));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(listening_at(&socket));
+        drop(listener);
+        assert!(
+            !listening_at(&socket),
+            "a stale socket file is not a service"
         );
     }
 

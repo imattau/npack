@@ -45,6 +45,42 @@ impl Tab {
     }
 }
 
+/// Whose software installs go to: the person's own prefix (`~/.local`, the
+/// default) or the whole computer, through the system-wide service.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InstallScope {
+    User,
+    System,
+}
+
+impl InstallScope {
+    fn name(self) -> &'static str {
+        match self {
+            InstallScope::User => "user",
+            InstallScope::System => "system",
+        }
+    }
+
+    fn from_name(name: &str) -> InstallScope {
+        if name == "system" {
+            InstallScope::System
+        } else {
+            InstallScope::User
+        }
+    }
+
+    /// The socket of the service that serves this scope.
+    fn socket(self) -> PathBuf {
+        match self {
+            InstallScope::User => DaemonClient::default_socket_path(),
+            InstallScope::System => crate::client::system_socket_path(),
+        }
+    }
+}
+
+/// How often to look again for the system-wide service.
+const SYSTEM_CHECK_EVERY: Duration = Duration::from_secs(5);
+
 /// What a keyboard shortcut asks for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Shortcut {
@@ -161,6 +197,8 @@ enum Event {
     Details(Result<Value, UiError>),
     /// `GetConfig`: first-run flag, relays, download servers, trusted publishers.
     Config(Result<Value, UiError>),
+    /// Whether the system-wide service is answering.
+    SystemService(bool),
     /// Extra package details for the "unknown publisher" dialog.
     InstallPreview(Result<Value, UiError>),
     /// `ListCategories`: [{category, count}] for the sidebar.
@@ -231,6 +269,11 @@ enum TrustChoice {
 pub struct NpackGuiApp {
     client: Arc<DaemonClient>,
     remembered: crate::remember::Remembered,
+    scope: InstallScope,
+    /// The system-wide service answered the last time we looked. The option
+    /// to install for everyone is only offered while this is true.
+    system_available: bool,
+    system_checked_at: Option<Instant>,
     /// When the search box was last edited, while a search is waiting for the
     /// typing to pause.
     search_edited_at: Option<Instant>,
@@ -298,7 +341,6 @@ pub struct NpackGuiApp {
 
 impl NpackGuiApp {
     pub fn new(ctx: egui::Context) -> Self {
-        let socket_path = DaemonClient::default_socket_path();
         let (tx, rx) = mpsc::channel();
         let tx = EventSender { tx, ctx };
         let remembered = crate::remember::load();
@@ -307,8 +349,17 @@ impl NpackGuiApp {
             .as_deref()
             .and_then(Tab::from_name)
             .unwrap_or(Tab::Installed);
-        let app = Self {
+        let scope = remembered
+            .scope
+            .as_deref()
+            .map(InstallScope::from_name)
+            .unwrap_or(InstallScope::User);
+        let socket_path = scope.socket();
+        let mut app = Self {
             remembered,
+            scope,
+            system_available: false,
+            system_checked_at: None,
             search_edited_at: None,
             focus_search: false,
             socket_path_text: socket_path.display().to_string(),
@@ -355,7 +406,53 @@ impl NpackGuiApp {
             rx,
         };
         app.start_up();
+        app.check_system_service();
         app
+    }
+
+    /// Looks, off the UI thread, for the system-wide service.
+    fn check_system_service(&mut self) {
+        self.system_checked_at = Some(Instant::now());
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(Event::SystemService(crate::client::listening_at(
+                &crate::client::system_socket_path(),
+            )));
+        });
+    }
+
+    /// Switches between installing for this person and for everyone. The two
+    /// services keep separate stores, catalogues and settings, so everything
+    /// shown is cleared and loaded again from the new one.
+    fn set_scope(&mut self, scope: InstallScope) {
+        if scope == self.scope {
+            return;
+        }
+        self.scope = scope;
+        self.installed.clear();
+        self.installed_loaded = false;
+        self.updates.clear();
+        self.rollbacks.clear();
+        self.history.clear();
+        self.health.clear();
+        self.health_error = None;
+        self.search_results.clear();
+        self.categories.clear();
+        self.selected_category = None;
+        self.selected_uncategorised = false;
+        self.details = None;
+        self.config = None;
+        self.pending_install = None;
+        self.auto_refreshed = false;
+        // The welcome screen is for a person's own first run, never for the
+        // computer-wide service.
+        self.welcome_dismissed = scope == InstallScope::System;
+        self.socket_path_text = scope.socket().display().to_string();
+        self.reconnect();
+        self.status = match scope {
+            InstallScope::User => "Installing for just you.".to_owned(),
+            InstallScope::System => "Installing for everyone on this computer.".to_owned(),
+        };
     }
 
     /// Starts the background service if it isn't running (a normal person
@@ -920,6 +1017,18 @@ impl NpackGuiApp {
                     self.icons.insert(sha256, (bytes.into(), extension));
                 }
                 Event::Details(Err(error)) => self.fail("Loading details", error),
+                Event::SystemService(available) => {
+                    self.system_available = available;
+                    // The service we were using has gone away: go back to
+                    // installing for just this person rather than leave a
+                    // broken screen.
+                    if !available && self.scope == InstallScope::System {
+                        self.set_scope(InstallScope::User);
+                        self.status = "The system-wide service isn't running, so the app \
+                                       is installing for just you again."
+                            .to_owned();
+                    }
+                }
                 Event::Config(Ok(value)) => {
                     self.relays_text = string_lines(&value, "relays");
                     self.blossom_text = string_lines(&value, "blossom");
@@ -936,7 +1045,10 @@ impl NpackGuiApp {
                     if self.status == "Connecting..." {
                         self.status = "Ready.".to_owned();
                     }
-                    let first_run = value.get("first_run").and_then(Value::as_bool) == Some(true);
+                    // Only a person's own prefix has a first run; the
+                    // computer-wide service is set up by an administrator.
+                    let first_run = self.scope == InstallScope::User
+                        && value.get("first_run").and_then(Value::as_bool) == Some(true);
                     self.config = Some(value);
                     self.request_profiles(trusted);
                     // Look for updates (and revoked packages) once at start,
@@ -1506,6 +1618,14 @@ fn package_reference(value: &Value) -> String {
 impl eframe::App for NpackGuiApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        if self
+            .system_checked_at
+            .is_none_or(|checked| checked.elapsed() >= SYSTEM_CHECK_EVERY)
+        {
+            self.check_system_service();
+        }
+        // egui only redraws on input, so ask to be woken for the next look.
+        ctx.request_repaint_after(SYSTEM_CHECK_EVERY);
         self.handle_shortcuts(ctx);
         self.remember_changes(ctx);
         // Redraw regularly while a background call or transaction is in
@@ -1554,6 +1674,26 @@ impl eframe::App for NpackGuiApp {
             if self.is_first_run() {
                 self.show_welcome(ui);
                 return;
+            }
+            if self.scope == InstallScope::System {
+                let mut back = false;
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_unmultiplied(40, 100, 200, 40))
+                    .inner_margin(egui::Margin::same(8))
+                    .corner_radius(4)
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.strong("Installing for everyone on this computer.");
+                            ui.label("Each change asks for an administrator password.");
+                            if ui.button("Switch to just me").clicked() {
+                                back = true;
+                            }
+                        });
+                    });
+                ui.add_space(6.0);
+                if back {
+                    self.set_scope(InstallScope::User);
+                }
             }
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Installed, "Installed");
@@ -1653,6 +1793,10 @@ impl NpackGuiApp {
             self.remembered.tab = Some(self.tab.name().to_owned());
             changed = true;
         }
+        if self.remembered.scope.as_deref() != Some(self.scope.name()) {
+            self.remembered.scope = Some(self.scope.name().to_owned());
+            changed = true;
+        }
         if let Some(size) = size
             && self.remembered.size_changed(size)
         {
@@ -1665,7 +1809,8 @@ impl NpackGuiApp {
     }
 
     fn is_first_run(&self) -> bool {
-        !self.welcome_dismissed
+        self.scope == InstallScope::User
+            && !self.welcome_dismissed
             && self
                 .config
                 .as_ref()
@@ -1856,6 +2001,27 @@ impl NpackGuiApp {
 
     fn show_settings_tab(&mut self, ui: &mut egui::Ui) {
         let mut reconnect = false;
+        // Offered only while the system-wide service is running (or already
+        // in use, so it can always be switched back).
+        if self.system_available || self.scope == InstallScope::System {
+            ui.heading("Install software for");
+            let mut choice = self.scope;
+            ui.radio_value(&mut choice, InstallScope::User, "Just me (default)");
+            ui.radio_value(
+                &mut choice,
+                InstallScope::System,
+                "Everyone on this computer",
+            );
+            ui.weak(
+                "Installing for everyone asks for an administrator password each time. \
+                 It has its own list of installed software, its own updates, and its own \
+                 trusted publishers and relays, separate from yours.",
+            );
+            ui.add_space(8.0);
+            if choice != self.scope {
+                self.set_scope(choice);
+            }
+        }
         ui.collapsing("Advanced", |ui| {
             ui.label("npack's background service listens on this socket.");
             ui.horizontal(|ui| {
@@ -2665,6 +2831,21 @@ mod tests {
         );
         assert!(install_effects(&serde_json::json!({})).is_empty());
         assert_eq!(source_line(&serde_json::json!({"details": {}})), None);
+    }
+
+    #[test]
+    fn install_scopes_round_trip_and_default_to_the_person() {
+        for scope in [InstallScope::User, InstallScope::System] {
+            assert_eq!(InstallScope::from_name(scope.name()), scope);
+        }
+        // Anything unknown, or nothing at all, means "just me".
+        assert_eq!(InstallScope::from_name("everyone"), InstallScope::User);
+        assert_eq!(InstallScope::from_name(""), InstallScope::User);
+        assert_eq!(
+            InstallScope::System.socket(),
+            std::path::PathBuf::from("/run/npackd.sock")
+        );
+        assert_ne!(InstallScope::User.socket(), InstallScope::System.socket());
     }
 
     #[test]
