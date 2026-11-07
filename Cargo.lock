@@ -2858,7 +2858,7 @@ dependencies = [
 
 [[package]]
 name = "npack"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -2889,7 +2889,7 @@ dependencies = [
 
 [[package]]
 name = "npack-gui"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "base64",
