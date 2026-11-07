@@ -52,6 +52,27 @@ fn unreachable(message: String) -> anyhow::Error {
     .into()
 }
 
+/// Runs `attempt`, trying again a few times while the program is "busy"
+/// (`ETXTBSY`: Linux refuses to run a file that some process still has open for
+/// writing). That happens briefly when the program was just written or is being
+/// replaced, for instance by a package upgrade, and a short wait clears it. Any
+/// other error is returned at once.
+fn retry_if_busy<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    const TRIES: usize = 5;
+    let mut tries = 1;
+    loop {
+        match attempt() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < TRIES =>
+            {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// If nothing is listening on `socket`, starts `program daemon --socket
 /// <socket>` and waits up to `wait` for it to accept connections.
 ///
@@ -63,21 +84,23 @@ pub fn ensure_daemon_at(socket: &Path, program: &Path, wait: Duration) -> anyhow
     if UnixStream::connect(socket).is_ok() {
         return Ok(false);
     }
-    let mut child = Command::new(program)
-        .arg("daemon")
-        .arg("--socket")
-        .arg(socket)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .map_err(|error| {
-            unreachable(format!(
-                "couldn't start the npack background service ({}): {error}",
-                program.display()
-            ))
-        })?;
+    let mut child = retry_if_busy(|| {
+        Command::new(program)
+            .arg("daemon")
+            .arg("--socket")
+            .arg(socket)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+    })
+    .map_err(|error| {
+        unreachable(format!(
+            "couldn't start the npack background service ({}): {error}",
+            program.display()
+        ))
+    })?;
     let started = Instant::now();
     while started.elapsed() < wait {
         if UnixStream::connect(socket).is_ok() {
@@ -340,6 +363,41 @@ mod tests {
     }
 
     #[test]
+    fn a_busy_program_is_retried_but_other_errors_are_not() {
+        use std::io::{Error, ErrorKind};
+        let mut calls = 0;
+        let result = retry_if_busy(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(Error::from(ErrorKind::ExecutableFileBusy))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(result.unwrap(), 3);
+
+        // It gives up after a few tries rather than waiting forever.
+        let mut calls = 0;
+        let error = retry_if_busy::<()>(|| {
+            calls += 1;
+            Err(Error::from(ErrorKind::ExecutableFileBusy))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ExecutableFileBusy);
+        assert_eq!(calls, 5);
+
+        // Anything else is returned straight away.
+        let mut calls = 0;
+        let error = retry_if_busy::<()>(|| {
+            calls += 1;
+            Err(Error::from(ErrorKind::NotFound))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
     fn only_the_system_socket_is_treated_as_the_system_service() {
         assert!(is_system_socket(Path::new("/run/npackd.sock")));
         assert!(!is_system_socket(Path::new("/run/user/1000/npackd.sock")));
@@ -386,7 +444,10 @@ mod tests {
             Duration::from_millis(600),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("didn't start listening"));
+        assert!(
+            error.to_string().contains("didn't start listening"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
