@@ -778,6 +778,8 @@ Supported methods, mirroring the CLI operations above:
 | --- | --- | --- |
 | `Search` | `query` (empty matches everything), `relay[]`, `trusted_publisher[]`, `pubkey`, `refresh`, `no_cache`, `include_untrusted`, `category`, `sort` (`name` or `recent`), `limit`, `offset`, `only_trusted`, `host_only` | Array of matching releases, each with `trust` (`"trusted"` or `"unknown"`), `npub`, `published_at` and `compatible` (whether its os/arch fit this machine). With `include_untrusted` the trust list does not filter results. `only_trusted` keeps only publishers in the daemon's trust list (an empty list trusts no one); `host_only` keeps only compatible releases; `category` is case-insensitive. Filters apply before `sort`, `offset` and `limit`. |
 | `ListCategories` | the same filters as `Search` (`category`, `sort`, `limit` and `offset` are ignored) | Array of `{category, count}`, most populous first, over the same set a browse view draws from. When some packages list no category (and there is at least one real category), the last entry is `{category: "Uncategorised", count, uncategorised: true}`; list those with `Search` and `"uncategorised": true`. |
+| `CatalogueStatus` | `store` (optional) | Read-only, no network: `{present, created_at, age_seconds, stale, stale_after_seconds, releases}` (only `present`, `stale` and `stale_after_seconds` when there is no catalogue). `stale` is true once the catalogue is more than 6 hours old. |
+| `RefreshCatalogue` | `relay[]`, `pubkey`, `store` (all optional) | Downloads the catalogue from the relays, saves it and returns the new `CatalogueStatus`. Callers asking at the same moment share one download, and a catalogue fetched in the last 30 seconds is returned as it is. If the relays return no releases at all while a real catalogue exists, the old one is kept and the call fails with `relay_unreachable`, because unreachable relays look like an empty answer. Not gated by PolicyKit, like `Search` with `refresh`. |
 | `GetPackage` | `package`, `relay[]`, `requirement`, `os`, `arch`, `trusted_publisher[]`, `store`, `user`, `include_untrusted` | The same resolved-metadata object as `npack resolve`, plus `trust` and `npub`; `verification.publisher_trusted` reflects the trust list even when it is empty. |
 | `ListInstalled` | `user`, `store` | Array of installed packages. |
 | `Install` | `package`, `requirement`, `relay[]`, `server[]`, `user`, `store`, `allow_capability[]`, `trust_once[]`, `install_values{}`, `async` | The installed package's record, or `{"transaction_id": N}` if `async` is true. `install_values` is a per-install object keyed by descriptor id. |
@@ -822,7 +824,7 @@ category a frontend can map to its own wording: `unknown_method`,
 `invalid_params`, `invalid_request`, `invalid_input` (a value such as a
 publisher key or relay URL was rejected), `nip05_failed`, `not_authorized`, `no_relays`,
 `no_blossom_servers`, `relay_unreachable`, `store_busy`, `publisher_untrusted`,
-`download_failed`, `cancelled`, `no_catalogue` (nothing to browse until the catalogue has been fetched: call `Search` with `refresh`), `not_found`, `no_icon`, `no_rollback`, `rollback_blocked`, and `internal` for anything else.
+`download_failed`, `cancelled`, `no_catalogue` (nothing to browse until the catalogue has been fetched: call `RefreshCatalogue`, or `Search` with `refresh`), `not_found`, `no_icon`, `no_rollback`, `rollback_blocked`, and `internal` for anything else.
 A `failed` `GetTransaction` status carries `error_code` the same way. The
 field is additive; older daemons omit it.
 
@@ -986,6 +988,16 @@ publisher's release notes and a support link. Updates shows the release notes
 and download size of the new version. All of this comes from the signed
 release event, so nothing is downloaded to show it; sizes and notes are the
 publisher's statements.
+
+The software list (the catalogue) is kept up to date quietly: when the app
+starts and the list is more than 6 hours old, or the first time it starts after
+the app itself was updated, it downloads a fresh one in the background. The old
+list stays on screen until the new one is in, "Software list updated 3 hours
+ago" under the Browse heading says how fresh it is, and if the download fails
+(offline, relays down) the old list is kept and a note says so, with no error
+banner. A window left open looks again every 30 minutes. "Refresh catalogue"
+still refreshes on demand. `npack search` reads the same saved list and says how
+old it is, and suggests `npack refresh` once it is more than 6 hours old.
 
 Keyboard shortcuts: Ctrl+1 to Ctrl+5 switch tabs, Ctrl+F jumps to the search
 box (results update as you type, a moment after you pause), F5 or Ctrl+R

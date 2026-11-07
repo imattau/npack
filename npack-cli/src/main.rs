@@ -4425,6 +4425,23 @@ fn load_catalogue(root: &Path) -> Result<Option<Catalogue>> {
     }
 }
 
+/// Saves a freshly downloaded catalogue, unless that would replace a real one
+/// with nothing. Relays that cannot be reached do not fail the download: they
+/// just return no events, and writing that down would wipe out everything the
+/// person could browse. In that case the old catalogue stays and the caller
+/// gets an error saying why.
+fn save_refreshed_catalogue(root: &Path, fresh: &Catalogue) -> Result<()> {
+    if fresh.releases.is_empty()
+        && load_catalogue(root)
+            .ok()
+            .flatten()
+            .is_some_and(|old| !old.releases.is_empty())
+    {
+        bail!("the relays returned no releases (are they reachable?); keeping the previous list");
+    }
+    save_catalogue(root, fresh)
+}
+
 fn save_catalogue(root: &Path, catalogue: &Catalogue) -> Result<()> {
     let path = catalogue_path(root);
     if let Some(parent) = path.parent() {
@@ -4610,7 +4627,7 @@ async fn refresh_command(relays: &[String], user_pubkey: Option<&str>, root: &Pa
     let catalogue = fetch_catalogue_from_relays(relays, user_pubkey).await?;
     let releases = catalogue.releases.len();
     let revocations = catalogue.revocations.len();
-    save_catalogue(root, &catalogue)?;
+    save_refreshed_catalogue(root, &catalogue)?;
     println!(
         "refreshed local catalogue: {releases} release(s), {revocations} revocation(s) from {} relay(s)",
         relays.len()
@@ -4827,7 +4844,7 @@ async fn search_matching_releases(
             bail!("no relays configured; pass --relay or configure [network].relays");
         }
         let catalogue = fetch_catalogue_from_relays(relays, user_pubkey).await?;
-        save_catalogue(root, &catalogue)?;
+        save_refreshed_catalogue(root, &catalogue)?;
         catalogue
     } else {
         let catalogue = load_catalogue(root)?.context(
@@ -4837,7 +4854,16 @@ async fn search_matching_releases(
             .duration_since(UNIX_EPOCH)
             .map(|now| now.as_secs().saturating_sub(catalogue.created_at))
             .unwrap_or_default();
-        eprintln!("Searching local catalogue ({age}s old; run `npack refresh` to update)");
+        eprintln!(
+            "Searching local catalogue ({} old; run `npack refresh` to update)",
+            human_age(age)
+        );
+        if age >= CATALOGUE_STALE_SECS {
+            eprintln!(
+                "That is a while ago: new software and updated listings only appear after \
+                 `npack refresh` (or add --refresh to this command)."
+            );
+        }
         catalogue
     };
     let revoked = revocation_pairs(&catalogue.revocations);
@@ -4984,7 +5010,7 @@ fn daemon_error_code(message: &str) -> &'static str {
         "no_relays"
     } else if has("no blossom servers configured") {
         "no_blossom_servers"
-    } else if has("timed out connecting") {
+    } else if has("timed out connecting") || has("are they reachable") {
         "relay_unreachable"
     } else if has("another npack operation is already in progress") {
         "store_busy"
@@ -5217,6 +5243,9 @@ struct DaemonState {
     identities: std::sync::Mutex<HashMap<String, (std::time::Instant, PublisherIdentity)>>,
     /// Serialises `RunDoctor` and holds its last result for a few seconds.
     doctor_gate: tokio::sync::Mutex<()>,
+    /// One catalogue download at a time: a second `RefreshCatalogue` waits for
+    /// the first and then finds a fresh catalogue instead of fetching again.
+    refresh_gate: tokio::sync::Mutex<()>,
     doctor_cache: std::sync::Mutex<Option<DoctorCacheEntry>>,
     role: DaemonRole,
     transactions: std::sync::Mutex<HashMap<u64, TransactionEntry>>,
@@ -5236,6 +5265,7 @@ impl DaemonState {
             config_mtime,
             identities: std::sync::Mutex::new(HashMap::new()),
             doctor_gate: tokio::sync::Mutex::new(()),
+            refresh_gate: tokio::sync::Mutex::new(()),
             doctor_cache: std::sync::Mutex::new(None),
             role,
             transactions: std::sync::Mutex::new(HashMap::new()),
@@ -5438,6 +5468,8 @@ async fn dispatch_daemon_request(
         "GetIcon" => daemon_get_icon(request.params).await,
         "RunDoctor" => daemon_run_doctor(state, request.params).await,
         "ListCategories" => daemon_list_categories(&state.config(), request.params).await,
+        "CatalogueStatus" => daemon_catalogue_status(request.params),
+        "RefreshCatalogue" => daemon_refresh_catalogue(state, request.params).await,
         "GetHistory" => daemon_get_history(&state.config(), request.params),
         "ListRollbacks" => daemon_list_rollbacks(&state.config(), request.params),
         "Rollback" => daemon_rollback(&state.config(), request.params),
@@ -6678,6 +6710,108 @@ async fn daemon_search(config: &Config, params: serde_json::Value) -> Result<ser
 /// `ListCategories`: the categories present in the catalogue, with how many
 /// packages carry each. Takes the same filters as `Search` (trust, host,
 /// refresh), so counts match what a browse view would then show.
+/// A catalogue older than this is worth refreshing in the background (the GUI
+/// does, and `npack search` says so).
+const CATALOGUE_STALE_SECS: u64 = 6 * 3600;
+/// `RefreshCatalogue` does not fetch again when the catalogue is this fresh,
+/// which absorbs several callers asking at once.
+const CATALOGUE_FRESH_SECS: u64 = 30;
+
+/// "3 hours", "2 days", "under a minute": a catalogue's age in plain words.
+fn human_age(seconds: u64) -> String {
+    let plural = |count: u64, unit: &str| {
+        if count == 1 {
+            format!("1 {unit}")
+        } else {
+            format!("{count} {unit}s")
+        }
+    };
+    match seconds {
+        0..=59 => "under a minute".to_owned(),
+        60..=3599 => plural(seconds / 60, "minute"),
+        3600..=86_399 => plural(seconds / 3600, "hour"),
+        _ => plural(seconds / 86_400, "day"),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CatalogueParams {
+    #[serde(default)]
+    relay: Vec<String>,
+    #[serde(default)]
+    pubkey: Option<String>,
+    #[serde(default)]
+    store: Option<PathBuf>,
+}
+
+/// What a client needs to decide whether to refresh: whether a catalogue
+/// exists, when it was fetched, how big it is and whether it is stale.
+fn catalogue_status_value(root: &Path, now: u64) -> Result<serde_json::Value> {
+    Ok(match load_catalogue(root)? {
+        None => serde_json::json!({
+            "present": false,
+            "stale": false,
+            "stale_after_seconds": CATALOGUE_STALE_SECS,
+        }),
+        Some(catalogue) => {
+            let age = now.saturating_sub(catalogue.created_at);
+            serde_json::json!({
+                "present": true,
+                "created_at": catalogue.created_at,
+                "age_seconds": age,
+                "stale": age >= CATALOGUE_STALE_SECS,
+                "stale_after_seconds": CATALOGUE_STALE_SECS,
+                "releases": catalogue.releases.len(),
+            })
+        }
+    })
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|now| now.as_secs())
+        .unwrap_or_default()
+}
+
+/// `CatalogueStatus`: read-only, no network.
+fn daemon_catalogue_status(params: serde_json::Value) -> Result<serde_json::Value> {
+    let params: CatalogueParams =
+        serde_json::from_value(params).context("invalid CatalogueStatus params")?;
+    let root = params.store.unwrap_or_else(default_store);
+    catalogue_status_value(&root, unix_now())
+}
+
+/// `RefreshCatalogue`: downloads the catalogue from the relays and saves it,
+/// returning the new status. A failed download leaves the old catalogue in
+/// place. Callers asking at the same moment share one download.
+async fn daemon_refresh_catalogue(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let params: CatalogueParams =
+        serde_json::from_value(params).context("invalid RefreshCatalogue params")?;
+    let config = state.config();
+    let relays = normalize_relays(params.relay, &config);
+    if relays.is_empty() {
+        bail!("no relays configured; pass --relay or configure [network].relays");
+    }
+    let root = params.store.unwrap_or_else(default_store);
+    let pubkey = params.pubkey.or_else(|| config.identity.pubkey.clone());
+    let _one_at_a_time = state.refresh_gate.lock().await;
+    let status = catalogue_status_value(&root, unix_now());
+    if let Ok(status) = &status
+        && status["age_seconds"]
+            .as_u64()
+            .is_some_and(|age| age < CATALOGUE_FRESH_SECS)
+    {
+        return Ok(status.clone());
+    }
+    let catalogue = fetch_catalogue_from_relays(&relays, pubkey.as_deref()).await?;
+    save_refreshed_catalogue(&root, &catalogue)?;
+    catalogue_status_value(&root, unix_now())
+}
+
 async fn daemon_list_categories(
     config: &Config,
     params: serde_json::Value,
@@ -14922,6 +15056,131 @@ mod tests {
             serde_json::json!({"store": dir.path(), "include_untrusted": true, "only_trusted": true}),
         )?)
         .is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_download_never_replaces_a_real_catalogue() -> Result<()> {
+        let dir = tempdir()?;
+        let empty = Catalogue {
+            created_at: 1,
+            releases: vec![],
+            revocations: vec![],
+        };
+        // Nothing to lose yet: an empty first catalogue is saved.
+        save_refreshed_catalogue(dir.path(), &empty)?;
+        assert!(load_catalogue(dir.path())?.is_some());
+
+        let secret = "11".repeat(32);
+        let real = Catalogue {
+            created_at: 2,
+            releases: vec![sample_release_event(&secret, "hello", "1.0.0")?],
+            revocations: vec![],
+        };
+        save_refreshed_catalogue(dir.path(), &real)?;
+        let error = save_refreshed_catalogue(dir.path(), &empty).unwrap_err();
+        assert_eq!(daemon_error_code(&error.to_string()), "relay_unreachable");
+        let kept = load_catalogue(dir.path())?.unwrap();
+        assert_eq!(kept.releases.len(), 1, "the real catalogue is untouched");
+        assert_eq!(kept.created_at, 2);
+
+        // A catalogue that still has releases replaces it as usual.
+        let newer = Catalogue {
+            created_at: 3,
+            releases: vec![sample_release_event(&secret, "hello", "2.0.0")?],
+            revocations: vec![],
+        };
+        save_refreshed_catalogue(dir.path(), &newer)?;
+        assert_eq!(load_catalogue(dir.path())?.unwrap().created_at, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn catalogue_ages_are_described_in_plain_words() {
+        assert_eq!(human_age(0), "under a minute");
+        assert_eq!(human_age(59), "under a minute");
+        assert_eq!(human_age(60), "1 minute");
+        assert_eq!(human_age(150), "2 minutes");
+        assert_eq!(human_age(3600), "1 hour");
+        assert_eq!(human_age(3 * 3600 + 5), "3 hours");
+        assert_eq!(human_age(86_400), "1 day");
+        assert_eq!(human_age(5 * 86_400), "5 days");
+    }
+
+    fn user_state() -> Arc<DaemonState> {
+        Arc::new(DaemonState::with_config_path(
+            Config::default(),
+            DaemonRole::User,
+            None,
+        ))
+    }
+
+    #[test]
+    fn catalogue_status_reports_missing_fresh_and_stale_catalogues() -> Result<()> {
+        let dir = tempdir()?;
+        let state = user_state();
+        let status =
+            |dir: &Path| call_daemon(&state, "CatalogueStatus", serde_json::json!({"store": dir}));
+        let missing = status(dir.path())?;
+        assert_eq!(missing["present"], false);
+        assert_eq!(missing["stale"], false);
+
+        let now = unix_now();
+        save_catalogue(
+            dir.path(),
+            &Catalogue {
+                created_at: now - 60,
+                releases: vec![],
+                revocations: vec![],
+            },
+        )?;
+        let fresh = status(dir.path())?;
+        assert_eq!(fresh["present"], true);
+        assert_eq!(fresh["stale"], false);
+        assert!(fresh["age_seconds"].as_u64().unwrap() >= 60);
+        assert_eq!(fresh["stale_after_seconds"], CATALOGUE_STALE_SECS);
+
+        save_catalogue(
+            dir.path(),
+            &Catalogue {
+                created_at: now - CATALOGUE_STALE_SECS - 1,
+                releases: vec![],
+                revocations: vec![],
+            },
+        )?;
+        assert_eq!(status(dir.path())?["stale"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn refreshing_needs_relays_and_skips_a_catalogue_that_was_just_fetched() -> Result<()> {
+        let dir = tempdir()?;
+        let state = user_state();
+        let refresh = |relays: Vec<&str>| {
+            call_daemon(
+                &state,
+                "RefreshCatalogue",
+                serde_json::json!({"store": dir.path(), "relay": relays}),
+            )
+        };
+        // No relays: a clear error, and nothing is written.
+        let error = refresh(vec![]).unwrap_err();
+        assert_eq!(daemon_error_code(&error.to_string()), "no_relays");
+        assert!(load_catalogue(dir.path())?.is_none());
+
+        // A catalogue fetched a moment ago is returned as it is, without
+        // touching the (unreachable) relay.
+        save_catalogue(
+            dir.path(),
+            &Catalogue {
+                created_at: unix_now(),
+                releases: vec![],
+                revocations: vec![],
+            },
+        )?;
+        let status = refresh(vec!["ws://127.0.0.1:1"])?;
+        assert_eq!(status["present"], true);
+        assert_eq!(status["stale"], false);
         Ok(())
     }
 

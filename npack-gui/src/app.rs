@@ -81,6 +81,46 @@ impl InstallScope {
 /// How often to look again for the system-wide service.
 const SYSTEM_CHECK_EVERY: Duration = Duration::from_secs(5);
 
+/// How often an open window asks whether the software list has gone stale.
+const CATALOGUE_CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|now| now.as_secs())
+        .unwrap_or_default()
+}
+
+/// Whether a background refresh should start: there is a software list to
+/// refresh (a missing one is fetched by the Browse tab itself), it is stale or
+/// the app was just updated, and one is not already running.
+fn should_refresh_catalogue(status: &Value, after_update: bool, refreshing: bool) -> bool {
+    let present = status.get("present").and_then(Value::as_bool) == Some(true);
+    let stale = status.get("stale").and_then(Value::as_bool) == Some(true);
+    present && (stale || after_update) && !refreshing
+}
+
+/// The line under the Browse heading about how fresh the list is.
+fn catalogue_line(
+    status: Option<&Value>,
+    note: Option<&str>,
+    refreshing: bool,
+    now: u64,
+) -> Option<String> {
+    if refreshing {
+        return Some("Updating the software list...".to_owned());
+    }
+    if let Some(note) = note {
+        return Some(note.to_owned());
+    }
+    let status = status?;
+    if status.get("present").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let then = status.get("created_at").and_then(Value::as_u64)?;
+    Some(format!("Software list updated {}", describe_age(now, then)))
+}
+
 /// What a keyboard shortcut asks for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Shortcut {
@@ -199,6 +239,10 @@ enum Event {
     Config(Result<Value, UiError>),
     /// Whether the system-wide service is answering.
     SystemService(bool),
+    /// `CatalogueStatus`: when the software list was last downloaded.
+    CatalogueStatus(Result<Value, UiError>),
+    /// `RefreshCatalogue` finished (the new status), or could not download.
+    CatalogueRefreshed(Result<Value, UiError>),
     /// Extra package details for the "unknown publisher" dialog.
     InstallPreview(Result<Value, UiError>),
     /// `ListCategories`: [{category, count}] for the sidebar.
@@ -270,6 +314,14 @@ pub struct NpackGuiApp {
     client: Arc<DaemonClient>,
     remembered: crate::remember::Remembered,
     scope: InstallScope,
+    /// `CatalogueStatus`: `present`, `created_at`, `stale`, ...
+    catalogue: Option<Value>,
+    /// Why the last background refresh did not happen, in plain words.
+    catalogue_note: Option<String>,
+    catalogue_refreshing: bool,
+    catalogue_checked_at: Option<Instant>,
+    /// The app was updated since it last ran: refresh the list once.
+    refresh_after_update: bool,
     /// The system-wide service answered the last time we looked. The option
     /// to install for everyone is only offered while this is true.
     system_available: bool,
@@ -355,7 +407,22 @@ impl NpackGuiApp {
             .map(InstallScope::from_name)
             .unwrap_or(InstallScope::User);
         let socket_path = scope.socket();
+        let current_version = env!("CARGO_PKG_VERSION").to_owned();
+        let refresh_after_update = remembered
+            .version
+            .as_deref()
+            .is_some_and(|previous| previous != current_version);
+        let mut remembered = remembered;
+        if remembered.version.as_deref() != Some(current_version.as_str()) {
+            remembered.version = Some(current_version);
+            crate::remember::save(&remembered);
+        }
         let mut app = Self {
+            catalogue: None,
+            catalogue_note: None,
+            catalogue_refreshing: false,
+            catalogue_checked_at: None,
+            refresh_after_update,
             remembered,
             scope,
             system_available: false,
@@ -421,6 +488,44 @@ impl NpackGuiApp {
         });
     }
 
+    /// Asks how old the software list is. If it is stale (or the app was just
+    /// updated) a background refresh follows; see `CatalogueStatus` below.
+    fn check_catalogue(&mut self) {
+        self.catalogue_checked_at = Some(Instant::now());
+        self.spawn(|client| {
+            Event::CatalogueStatus(
+                client
+                    .call("CatalogueStatus", serde_json::json!({}))
+                    .map_err(|error| UiError::from_anyhow(&error)),
+            )
+        });
+    }
+
+    /// Downloads a fresh software list in the background. What is on screen
+    /// stays until the new list is in, and a failure (offline, relays down)
+    /// only leaves a note, not an error banner.
+    fn refresh_catalogue(&mut self) {
+        if self.catalogue_refreshing {
+            return;
+        }
+        self.catalogue_refreshing = true;
+        self.catalogue_note = None;
+        let relays: Vec<String> = self
+            .search_relays
+            .split(',')
+            .map(str::trim)
+            .filter(|relay| !relay.is_empty())
+            .map(str::to_owned)
+            .collect();
+        self.spawn(move |client| {
+            Event::CatalogueRefreshed(
+                client
+                    .call("RefreshCatalogue", serde_json::json!({ "relay": relays }))
+                    .map_err(|error| UiError::from_anyhow(&error)),
+            )
+        });
+    }
+
     /// Switches between installing for this person and for everyone. The two
     /// services keep separate stores, catalogues and settings, so everything
     /// shown is cleared and loaded again from the new one.
@@ -442,6 +547,11 @@ impl NpackGuiApp {
         self.selected_uncategorised = false;
         self.details = None;
         self.config = None;
+        // The other service has its own software list.
+        self.catalogue = None;
+        self.catalogue_note = None;
+        self.catalogue_refreshing = false;
+        self.catalogue_checked_at = None;
         self.pending_install = None;
         self.auto_refreshed = false;
         // The welcome screen is for a person's own first run, never for the
@@ -731,6 +841,14 @@ impl NpackGuiApp {
                         .map(|value| value.as_array().cloned().unwrap_or_default())
                         .map_err(|error| UiError::from_anyhow(&error)),
                 ));
+                if refresh {
+                    // The list was just downloaded: update "updated ... ago".
+                    let _ = tx.send(Event::CatalogueStatus(
+                        client
+                            .call("CatalogueStatus", serde_json::json!({}))
+                            .map_err(|error| UiError::from_anyhow(&error)),
+                    ));
+                }
             }
         });
     }
@@ -1017,6 +1135,46 @@ impl NpackGuiApp {
                     self.icons.insert(sha256, (bytes.into(), extension));
                 }
                 Event::Details(Err(error)) => self.fail("Loading details", error),
+                Event::CatalogueStatus(Ok(status)) => {
+                    let wanted = should_refresh_catalogue(
+                        &status,
+                        self.refresh_after_update,
+                        self.catalogue_refreshing,
+                    );
+                    self.catalogue = Some(status);
+                    if wanted {
+                        // Once per update: a failure must not loop.
+                        self.refresh_after_update = false;
+                        self.refresh_catalogue();
+                    }
+                }
+                // The line under the list is a convenience.
+                Event::CatalogueStatus(Err(_)) => {}
+                Event::CatalogueRefreshed(Ok(status)) => {
+                    self.catalogue_refreshing = false;
+                    self.catalogue_note = None;
+                    self.catalogue = Some(status);
+                    self.status = "Software list updated.".to_owned();
+                    // Show the new list (and categories) right away.
+                    self.browse(false);
+                }
+                Event::CatalogueRefreshed(Err(_)) => {
+                    self.catalogue_refreshing = false;
+                    self.refresh_after_update = false;
+                    let age = self
+                        .catalogue
+                        .as_ref()
+                        .and_then(|status| status.get("created_at"))
+                        .and_then(Value::as_u64)
+                        .map(|then| describe_age(unix_seconds(), then));
+                    self.catalogue_note = Some(match age {
+                        Some(age) => format!(
+                            "Couldn't update the software list (are you online?). \
+                             Showing the one from {age}."
+                        ),
+                        None => "Couldn't update the software list (are you online?).".to_owned(),
+                    });
+                }
                 Event::SystemService(available) => {
                     self.system_available = available;
                     // The service we were using has gone away: go back to
@@ -1061,6 +1219,7 @@ impl NpackGuiApp {
                     if !first_run && !self.auto_browsed {
                         self.auto_browsed = true;
                         self.browse(false);
+                        self.check_catalogue();
                     }
                     if !first_run && !self.auto_health {
                         self.auto_health = true;
@@ -1623,6 +1782,13 @@ impl eframe::App for NpackGuiApp {
             .is_none_or(|checked| checked.elapsed() >= SYSTEM_CHECK_EVERY)
         {
             self.check_system_service();
+        }
+        // A window left open for days looks again every so often.
+        if self
+            .catalogue_checked_at
+            .is_some_and(|checked| checked.elapsed() >= CATALOGUE_CHECK_EVERY)
+        {
+            self.check_catalogue();
         }
         // egui only redraws on input, so ask to be woken for the next look.
         ctx.request_repaint_after(SYSTEM_CHECK_EVERY);
@@ -2442,6 +2608,14 @@ impl NpackGuiApp {
                 };
                 ui.heading(heading);
                 ui.weak(format!("{} shown", self.search_results.len()));
+                if let Some(line) = catalogue_line(
+                    self.catalogue.as_ref(),
+                    self.catalogue_note.as_deref(),
+                    self.catalogue_refreshing,
+                    unix_seconds(),
+                ) {
+                    ui.weak(line);
+                }
                 egui::ScrollArea::vertical()
                     .id_salt("results")
                     .show(ui, |ui| {
@@ -2831,6 +3005,55 @@ mod tests {
         );
         assert!(install_effects(&serde_json::json!({})).is_empty());
         assert_eq!(source_line(&serde_json::json!({"details": {}})), None);
+    }
+
+    #[test]
+    fn a_stale_or_just_updated_list_is_refreshed_once_and_a_missing_one_is_not() {
+        let status =
+            |present: bool, stale: bool| serde_json::json!({"present": present, "stale": stale});
+        assert!(should_refresh_catalogue(&status(true, true), false, false));
+        assert!(should_refresh_catalogue(&status(true, false), true, false));
+        assert!(!should_refresh_catalogue(
+            &status(true, false),
+            false,
+            false
+        ));
+        // Already running, or no list yet (the Browse tab fetches that itself).
+        assert!(!should_refresh_catalogue(&status(true, true), false, true));
+        assert!(!should_refresh_catalogue(
+            &status(false, false),
+            true,
+            false
+        ));
+        assert!(!should_refresh_catalogue(
+            &serde_json::json!({}),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn the_freshness_line_says_what_is_happening_or_how_old_the_list_is() {
+        let status = serde_json::json!({"present": true, "created_at": 1_000});
+        assert_eq!(
+            catalogue_line(Some(&status), None, true, 2_000).as_deref(),
+            Some("Updating the software list...")
+        );
+        assert_eq!(
+            catalogue_line(Some(&status), Some("Couldn't update."), false, 2_000).as_deref(),
+            Some("Couldn't update.")
+        );
+        assert_eq!(
+            catalogue_line(Some(&status), None, false, 1_000 + 3 * 3600).as_deref(),
+            Some("Software list updated 3 hours ago")
+        );
+        assert_eq!(
+            catalogue_line(Some(&status), None, false, 1_010).as_deref(),
+            Some("Software list updated just now")
+        );
+        let missing = serde_json::json!({"present": false});
+        assert_eq!(catalogue_line(Some(&missing), None, false, 5), None);
+        assert_eq!(catalogue_line(None, None, false, 5), None);
     }
 
     #[test]
