@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::{client::DaemonClient, friendly::UiError};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tab {
     Installed,
     Browse,
@@ -20,6 +20,60 @@ enum Tab {
     Health,
     Settings,
 }
+
+impl Tab {
+    const ALL: [Tab; 5] = [
+        Tab::Installed,
+        Tab::Browse,
+        Tab::Updates,
+        Tab::Health,
+        Tab::Settings,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Tab::Installed => "installed",
+            Tab::Browse => "browse",
+            Tab::Updates => "updates",
+            Tab::Health => "health",
+            Tab::Settings => "settings",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Tab> {
+        Tab::ALL.into_iter().find(|tab| tab.name() == name)
+    }
+}
+
+/// What a keyboard shortcut asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shortcut {
+    GoTo(Tab),
+    FocusSearch,
+    Refresh,
+    CloseDetails,
+}
+
+/// The shortcut for a key press, if any. Ctrl+1..5 switch tabs, Ctrl+F
+/// searches, F5 or Ctrl+R refreshes the current tab and Escape closes the
+/// details pane. Pure, so it is tested without a window.
+fn shortcut_for(key: egui::Key, ctrl: bool) -> Option<Shortcut> {
+    use egui::Key as K;
+    match (key, ctrl) {
+        (K::Num1, true) => Some(Shortcut::GoTo(Tab::Installed)),
+        (K::Num2, true) => Some(Shortcut::GoTo(Tab::Browse)),
+        (K::Num3, true) => Some(Shortcut::GoTo(Tab::Updates)),
+        (K::Num4, true) => Some(Shortcut::GoTo(Tab::Health)),
+        (K::Num5, true) => Some(Shortcut::GoTo(Tab::Settings)),
+        (K::F, true) => Some(Shortcut::FocusSearch),
+        (K::R, true) | (K::F5, _) => Some(Shortcut::Refresh),
+        (K::Escape, false) => Some(Shortcut::CloseDetails),
+        _ => None,
+    }
+}
+
+/// How long to wait after the last keystroke before searching.
+const SEARCH_DELAY: Duration = Duration::from_millis(350);
 
 const BROWSE_PAGE: usize = 48;
 
@@ -153,6 +207,11 @@ enum TrustChoice {
 
 pub struct NpackGuiApp {
     client: Arc<DaemonClient>,
+    remembered: crate::remember::Remembered,
+    /// When the search box was last edited, while a search is waiting for the
+    /// typing to pause.
+    search_edited_at: Option<Instant>,
+    focus_search: bool,
     socket_path_text: String,
     tab: Tab,
 
@@ -217,10 +276,19 @@ impl NpackGuiApp {
         let socket_path = DaemonClient::default_socket_path();
         let (tx, rx) = mpsc::channel();
         let tx = EventSender { tx, ctx };
+        let remembered = crate::remember::load();
+        let tab = remembered
+            .tab
+            .as_deref()
+            .and_then(Tab::from_name)
+            .unwrap_or(Tab::Installed);
         let app = Self {
+            remembered,
+            search_edited_at: None,
+            focus_search: false,
             socket_path_text: socket_path.display().to_string(),
             client: Arc::new(DaemonClient::new(socket_path)),
-            tab: Tab::Installed,
+            tab,
             installed: Vec::new(),
             search_query: String::new(),
             search_relays: String::new(),
@@ -1263,6 +1331,8 @@ fn package_reference(value: &Value) -> String {
 impl eframe::App for NpackGuiApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.handle_shortcuts(ctx);
+        self.remember_changes(ctx);
         // Redraw regularly while a background call or transaction is in
         // flight, so polling results and progress show up promptly.
         if self.active_transaction.is_some() {
@@ -1342,6 +1412,83 @@ impl eframe::App for NpackGuiApp {
 }
 
 impl NpackGuiApp {
+    /// Keyboard shortcuts (see `shortcut_for`). Ignored on the welcome screen,
+    /// where there is nothing to switch to yet.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.is_first_run() {
+            return;
+        }
+        let keys = [
+            egui::Key::Num1,
+            egui::Key::Num2,
+            egui::Key::Num3,
+            egui::Key::Num4,
+            egui::Key::Num5,
+            egui::Key::F,
+            egui::Key::R,
+            egui::Key::F5,
+            egui::Key::Escape,
+        ];
+        let mut requested = Vec::new();
+        ctx.input_mut(|input| {
+            for key in keys {
+                for ctrl in [true, false] {
+                    let modifiers = if ctrl {
+                        egui::Modifiers::COMMAND
+                    } else {
+                        egui::Modifiers::NONE
+                    };
+                    // Escape only counts while there is something to close,
+                    // so it still cancels a text edit or dialog otherwise.
+                    if shortcut_for(key, ctrl).is_some()
+                        && (key != egui::Key::Escape || self.details.is_some())
+                        && input.consume_key(modifiers, key)
+                        && let Some(shortcut) = shortcut_for(key, ctrl)
+                    {
+                        requested.push(shortcut);
+                    }
+                }
+            }
+        });
+        for shortcut in requested {
+            match shortcut {
+                Shortcut::GoTo(tab) => self.tab = tab,
+                Shortcut::FocusSearch => {
+                    self.tab = Tab::Browse;
+                    self.focus_search = true;
+                }
+                Shortcut::CloseDetails => self.details = None,
+                Shortcut::Refresh => match self.tab {
+                    Tab::Installed => self.refresh_installed(),
+                    Tab::Browse => self.browse(false),
+                    Tab::Updates => self.refresh_updates(),
+                    Tab::Health => self.run_health_check(),
+                    Tab::Settings => self.refresh_config(),
+                },
+            }
+        }
+    }
+
+    /// Saves the current tab and window size when they change, so the next
+    /// start looks the same.
+    fn remember_changes(&mut self, ctx: &egui::Context) {
+        let size = ctx.input(|input| input.viewport().inner_rect.map(|r| [r.width(), r.height()]));
+        let mut changed = false;
+        if self.remembered.tab.as_deref() != Some(self.tab.name()) {
+            self.remembered.tab = Some(self.tab.name().to_owned());
+            changed = true;
+        }
+        if let Some(size) = size
+            && self.remembered.size_changed(size)
+        {
+            self.remembered.size = Some(size);
+            changed = true;
+        }
+        if changed {
+            crate::remember::save(&self.remembered);
+        }
+    }
+
     fn is_first_run(&self) -> bool {
         !self.welcome_dismissed
             && self
@@ -1815,10 +1962,30 @@ impl NpackGuiApp {
         ui.horizontal(|ui| {
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.search_query)
-                    .hint_text("Search by name, summary or category"),
+                    .desired_width(340.0)
+                    .hint_text("Search by name, summary or category (Ctrl+F)"),
             );
+            if self.focus_search {
+                response.request_focus();
+                self.focus_search = false;
+            }
+            // Search as you type, once the typing pauses.
+            if response.changed() {
+                self.search_edited_at = Some(Instant::now());
+            }
+            if let Some(edited) = self.search_edited_at {
+                let waited = edited.elapsed();
+                if waited >= SEARCH_DELAY {
+                    self.search_edited_at = None;
+                    self.browse_limit = BROWSE_PAGE;
+                    rerun = true;
+                } else {
+                    ui.ctx().request_repaint_after(SEARCH_DELAY - waited);
+                }
+            }
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if ui.button("Search").clicked() || enter {
+                self.search_edited_at = None;
                 self.browse_limit = BROWSE_PAGE;
                 rerun = true;
             }
@@ -1921,7 +2088,10 @@ impl NpackGuiApp {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
-                                                if ui.button("Install").clicked() {
+                                                if ui
+                                                    .add(crate::style::primary_button("Install"))
+                                                    .clicked()
+                                                {
                                                     to_install = Some(item.clone());
                                                 }
                                                 if ui.button("Details").clicked() {
@@ -2021,7 +2191,9 @@ impl NpackGuiApp {
                 match &available {
                     Some(available) => {
                         ui.label(format!("to {available}"));
-                        if self.active_transaction.is_none() && ui.button("Update").clicked() {
+                        if self.active_transaction.is_none()
+                            && ui.add(crate::style::primary_button("Update")).clicked()
+                        {
                             to_update = Some(reference.clone());
                         }
                     }
@@ -2132,6 +2304,32 @@ mod tests {
             app_text(&serde_json::json!({"app": {"summary": ""}}), "summary"),
             None
         );
+    }
+
+    #[test]
+    fn shortcuts_map_to_actions_and_plain_keys_do_nothing() {
+        use egui::Key as K;
+        assert_eq!(
+            shortcut_for(K::Num2, true),
+            Some(Shortcut::GoTo(Tab::Browse))
+        );
+        assert_eq!(shortcut_for(K::F, true), Some(Shortcut::FocusSearch));
+        assert_eq!(shortcut_for(K::F5, false), Some(Shortcut::Refresh));
+        assert_eq!(shortcut_for(K::R, true), Some(Shortcut::Refresh));
+        assert_eq!(shortcut_for(K::Escape, false), Some(Shortcut::CloseDetails));
+        // Typing the letters or digits must never trigger anything.
+        for key in [K::Num1, K::Num5, K::F, K::R] {
+            assert_eq!(shortcut_for(key, false), None, "{key:?} without Ctrl");
+        }
+        assert_eq!(shortcut_for(K::Escape, true), None);
+    }
+
+    #[test]
+    fn tabs_round_trip_through_their_saved_names() {
+        for tab in Tab::ALL {
+            assert_eq!(Tab::from_name(tab.name()), Some(tab));
+        }
+        assert_eq!(Tab::from_name("nonsense"), None);
     }
 
     #[test]

@@ -883,6 +883,18 @@ different instance, change the socket path under Settings, Advanced.
 A daemon started this way (or by plain `npack daemon`) is npackd-user, so it
 installs into your own prefix (`~/.local`), never the system one.
 
+Keyboard shortcuts: Ctrl+1 to Ctrl+5 switch tabs, Ctrl+F jumps to the search
+box (results update as you type, a moment after you pause), F5 or Ctrl+R
+refreshes the current tab, and Escape closes the details pane. The app
+follows the system light or dark setting and remembers the last tab and the
+window size in `~/.config/npack/gui-state.json`; delete that file to reset
+them.
+
+Text from publishers is shown with system fonts as fallbacks (Noto Sans, Noto
+CJK, DejaVu Sans, when installed), so other scripts display instead of empty
+boxes. egui does not do right-to-left layout yet, so Hebrew and Arabic text
+appears in the wrong order.
+
 ## Configuration
 
 Configuration is stored at the platform's user config path, normally:
