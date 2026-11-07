@@ -73,6 +73,20 @@ a PNG or SVG of at most 256 KiB published as its own Blossom blob, with the
 SHA-256 of its bytes. Repeatable tags: `category` (a whitespace-free word of at
 most 32 characters; at most 8) and `screenshot` (an http(s) URL; at most 6).
 
+Four more listing tags were added after 0.5.0, in the same additive way.
+`release-notes` (at most 2000 characters, newlines allowed) is the "what's new"
+for this version. `support` (an http(s) URL) is where to ask for help; clients
+show it as a link the user opens and never fetch it. `download-size` and
+`installed-size` are decimal byte counts, written by `npack publish` from the
+file it uploads and from the regular files inside the `.npk`; a value of zero or
+above 16 TiB is dropped. They are the publisher's statement, shown so a store
+can say "12 MB" before downloading: the signed `x` hash, not the size, decides
+whether bytes are accepted. All four are singleton tags.
+
+A publisher can fix a listing by publishing the same release again (same
+name, version, os and arch). Clients show only the newest event
+(`created_at`, then event id) for each publisher, name, version, os and arch.
+
 Publishers must stay within these limits, and `npack publish` enforces them.
 Clients must treat every listing value as untrusted text from a stranger: read
 leniently (clean control and bidirectional-override characters, cap length, and
@@ -94,6 +108,9 @@ Repeatable tags:
 | install-input | JSON-encoded install-input descriptor |
 | category | Store-listing category (see above) |
 | screenshot | Store-listing screenshot URL (see above) |
+
+Singleton listing tags added after 0.5.0: `release-notes`, `support`,
+`download-size`, `installed-size` (see above).
 
 Unknown tags are ignored for forward compatibility. Required singleton tags
 must not be duplicated. Malformed dependency or post-install tags invalidate

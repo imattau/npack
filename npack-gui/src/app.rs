@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::{client::DaemonClient, friendly::UiError};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tab {
     Installed,
     Browse,
@@ -21,6 +21,60 @@ enum Tab {
     Settings,
 }
 
+impl Tab {
+    const ALL: [Tab; 5] = [
+        Tab::Installed,
+        Tab::Browse,
+        Tab::Updates,
+        Tab::Health,
+        Tab::Settings,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Tab::Installed => "installed",
+            Tab::Browse => "browse",
+            Tab::Updates => "updates",
+            Tab::Health => "health",
+            Tab::Settings => "settings",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Tab> {
+        Tab::ALL.into_iter().find(|tab| tab.name() == name)
+    }
+}
+
+/// What a keyboard shortcut asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shortcut {
+    GoTo(Tab),
+    FocusSearch,
+    Refresh,
+    CloseDetails,
+}
+
+/// The shortcut for a key press, if any. Ctrl+1..5 switch tabs, Ctrl+F
+/// searches, F5 or Ctrl+R refreshes the current tab and Escape closes the
+/// details pane. Pure, so it is tested without a window.
+fn shortcut_for(key: egui::Key, ctrl: bool) -> Option<Shortcut> {
+    use egui::Key as K;
+    match (key, ctrl) {
+        (K::Num1, true) => Some(Shortcut::GoTo(Tab::Installed)),
+        (K::Num2, true) => Some(Shortcut::GoTo(Tab::Browse)),
+        (K::Num3, true) => Some(Shortcut::GoTo(Tab::Updates)),
+        (K::Num4, true) => Some(Shortcut::GoTo(Tab::Health)),
+        (K::Num5, true) => Some(Shortcut::GoTo(Tab::Settings)),
+        (K::F, true) => Some(Shortcut::FocusSearch),
+        (K::R, true) | (K::F5, _) => Some(Shortcut::Refresh),
+        (K::Escape, false) => Some(Shortcut::CloseDetails),
+        _ => None,
+    }
+}
+
+/// How long to wait after the last keystroke before searching.
+const SEARCH_DELAY: Duration = Duration::from_millis(350);
+
 const BROWSE_PAGE: usize = 48;
 
 /// Everything that shapes one browse request.
@@ -28,6 +82,8 @@ struct BrowseQuery {
     query: String,
     relays: Vec<String>,
     category: Option<String>,
+    /// Only packages that list no category (when no category is chosen).
+    uncategorised: bool,
     sort: &'static str,
     limit: usize,
     only_trusted: bool,
@@ -54,6 +110,8 @@ fn browse_requests(browse: &BrowseQuery) -> (Value, Value) {
     search["limit"] = browse.limit.into();
     if let Some(category) = &browse.category {
         search["category"] = category.clone().into();
+    } else if browse.uncategorised {
+        search["uncategorised"] = true.into();
     }
     (search, filters)
 }
@@ -69,6 +127,25 @@ impl BrowseSort {
         match self {
             Self::Recent => "recent",
             Self::Name => "name",
+        }
+    }
+}
+
+/// One line of the Browse sidebar.
+#[derive(Debug, PartialEq, Eq)]
+struct CategoryEntry {
+    name: String,
+    count: u64,
+    /// The catch-all for packages that list no category.
+    uncategorised: bool,
+}
+
+impl CategoryEntry {
+    fn from_value(item: &Value) -> Self {
+        Self {
+            name: value_str(item, "category"),
+            count: item.get("count").and_then(Value::as_u64).unwrap_or(0),
+            uncategorised: item.get("uncategorised").and_then(Value::as_bool) == Some(true),
         }
     }
 }
@@ -153,6 +230,11 @@ enum TrustChoice {
 
 pub struct NpackGuiApp {
     client: Arc<DaemonClient>,
+    remembered: crate::remember::Remembered,
+    /// When the search box was last edited, while a search is waiting for the
+    /// typing to pause.
+    search_edited_at: Option<Instant>,
+    focus_search: bool,
     socket_path_text: String,
     tab: Tab,
 
@@ -161,8 +243,10 @@ pub struct NpackGuiApp {
     search_relays: String,
     search_results: Vec<Value>,
     /// Categories present in the catalogue, most populous first.
-    categories: Vec<(String, u64)>,
+    categories: Vec<CategoryEntry>,
     selected_category: Option<String>,
+    /// The sidebar's "Uncategorised" entry is selected.
+    selected_uncategorised: bool,
     browse_sort: BrowseSort,
     only_trusted: bool,
     /// How many results to ask for; "Show more" raises it.
@@ -217,16 +301,26 @@ impl NpackGuiApp {
         let socket_path = DaemonClient::default_socket_path();
         let (tx, rx) = mpsc::channel();
         let tx = EventSender { tx, ctx };
+        let remembered = crate::remember::load();
+        let tab = remembered
+            .tab
+            .as_deref()
+            .and_then(Tab::from_name)
+            .unwrap_or(Tab::Installed);
         let app = Self {
+            remembered,
+            search_edited_at: None,
+            focus_search: false,
             socket_path_text: socket_path.display().to_string(),
             client: Arc::new(DaemonClient::new(socket_path)),
-            tab: Tab::Installed,
+            tab,
             installed: Vec::new(),
             search_query: String::new(),
             search_relays: String::new(),
             search_results: Vec::new(),
             categories: Vec::new(),
             selected_category: None,
+            selected_uncategorised: false,
             browse_sort: BrowseSort::Recent,
             only_trusted: false,
             browse_limit: BROWSE_PAGE,
@@ -510,6 +604,7 @@ impl NpackGuiApp {
             .map(str::to_owned)
             .collect();
         let category = self.selected_category.clone();
+        let uncategorised = self.selected_uncategorised;
         let sort = self.browse_sort.as_param();
         let limit = self.browse_limit;
         let only_trusted = self.only_trusted;
@@ -520,6 +615,7 @@ impl NpackGuiApp {
                 query,
                 relays,
                 category,
+                uncategorised,
                 sort,
                 limit,
                 only_trusted,
@@ -798,15 +894,7 @@ impl NpackGuiApp {
                     }
                 }
                 Event::Categories(Ok(items)) => {
-                    self.categories = items
-                        .iter()
-                        .map(|item| {
-                            (
-                                value_str(item, "category"),
-                                item.get("count").and_then(Value::as_u64).unwrap_or(0),
-                            )
-                        })
-                        .collect();
+                    self.categories = items.iter().map(CategoryEntry::from_value).collect();
                 }
                 // The sidebar is a convenience; results still show without it.
                 Event::Categories(Err(_)) => {}
@@ -1091,6 +1179,92 @@ fn app_text<'a>(item: &'a Value, field: &str) -> Option<&'a str> {
         .filter(|text| !text.is_empty())
 }
 
+/// "12 MB": decimal units, one decimal place below 10.
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if value < 10.0 {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.0} {}", UNITS[unit])
+    }
+}
+
+/// A size the publisher stated in the listing (`download_size`,
+/// `installed_size`), if any.
+fn app_size(item: &Value, field: &str) -> Option<u64> {
+    item.get("app")?
+        .get(field)?
+        .as_u64()
+        .filter(|size| *size > 0)
+}
+
+/// "Download 12 MB, about 40 MB once installed", from the listing.
+fn size_summary(item: &Value) -> Option<String> {
+    match (
+        app_size(item, "download_size"),
+        app_size(item, "installed_size"),
+    ) {
+        (Some(download), Some(installed)) => Some(format!(
+            "Download {}, about {} once installed",
+            format_size(download),
+            format_size(installed)
+        )),
+        (Some(download), None) => Some(format!("Download {}", format_size(download))),
+        (None, Some(installed)) => Some(format!("About {} once installed", format_size(installed))),
+        (None, None) => None,
+    }
+}
+
+/// What installing does besides copying files, in plain words, from the
+/// release's `details.post_install` entries ("action path").
+fn install_effects(item: &Value) -> Vec<String> {
+    item.get("details")
+        .and_then(|details| details.get("post_install"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|entry| {
+            let (action, path) = entry.split_once(' ').unwrap_or((entry, ""));
+            let file = path.rsplit('/').next().unwrap_or(path);
+            match action {
+                "register-service" => {
+                    format!("Adds a background service ({file}). It is not started automatically.")
+                }
+                "create-directory" => format!("Creates the folder {path}."),
+                _ => format!("Runs an install step: {entry}."),
+            }
+        })
+        .collect()
+}
+
+/// Where the code came from, if the release says: "repo at commit".
+fn source_line(item: &Value) -> Option<String> {
+    let details = item.get("details")?;
+    let repo = details.get("repo").and_then(Value::as_str)?;
+    match details.get("commit").and_then(Value::as_str) {
+        Some(commit) => Some(format!("Source: {repo} at commit {commit}")),
+        None => Some(format!("Source: {repo}")),
+    }
+}
+
+fn details_strings<'a>(item: &'a Value, field: &str) -> Vec<&'a str> {
+    item.get("details")
+        .and_then(|details| details.get(field))
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
 fn app_categories(item: &Value) -> Vec<&str> {
     item.get("app")
         .and_then(|app| app.get("categories"))
@@ -1122,9 +1296,8 @@ fn details_view(
     if let Some(summary) = app_text(value, "summary") {
         ui.strong(summary);
     }
-    ui.horizontal(|ui| {
-        trust_badge(ui, value.get("trust").and_then(Value::as_str));
-        ui.weak(publisher);
+    ui.horizontal_wrapped(|ui| {
+        publisher_line(ui, publisher, value.get("trust").and_then(Value::as_str));
     });
     if let Some(description) = app_text(value, "description") {
         ui.add_space(6.0);
@@ -1140,6 +1313,37 @@ fn details_view(
     }
     if let Some(date) = app_text(value, "release_date") {
         ui.label(format!("Released: {date}"));
+    }
+    if let Some(sizes) = size_summary(value) {
+        ui.label(format!("{sizes} (as stated by the publisher)"));
+    }
+    if let Some(notes) = app_text(value, "release_notes") {
+        ui.add_space(6.0);
+        ui.strong("What's new");
+        ui.label(notes);
+    }
+    let effects = install_effects(value);
+    if !effects.is_empty() {
+        ui.add_space(6.0);
+        ui.strong("What installing does");
+        for effect in &effects {
+            ui.label(effect);
+        }
+    }
+    let needs = details_strings(value, "requires");
+    if !needs.is_empty() {
+        ui.label(format!("Needs on your system: {}", needs.join(", ")));
+    }
+    if let Some(source) = source_line(value) {
+        ui.weak(source);
+    }
+    if let Some(support) = app_text(value, "support_url")
+        && (support.starts_with("https://") || support.starts_with("http://"))
+    {
+        ui.horizontal(|ui| {
+            ui.label("Get help:");
+            ui.hyperlink_to(support, support);
+        });
     }
     if let Some(homepage) = app_text(value, "homepage")
         && (homepage.starts_with("https://") || homepage.starts_with("http://"))
@@ -1191,13 +1395,26 @@ fn display_publisher(item: &Value) -> String {
         .map_or_else(|| value_str(item, "publisher"), str::to_owned)
 }
 
-fn trust_badge(ui: &mut egui::Ui, trust: Option<&str>) {
-    let (color, text) = match trust {
+/// The trust badge's colour and wording. It describes whether *you* have
+/// chosen to trust this publisher, never who they are: the name comes from
+/// the publisher's own profile and proves nothing about trust.
+fn trust_label(trust: Option<&str>) -> (egui::Color32, &'static str) {
+    match trust {
         Some("trusted") => (egui::Color32::from_rgb(40, 150, 70), "Trusted"),
-        _ => (egui::Color32::from_rgb(200, 130, 20), "Unknown publisher"),
-    };
+        _ => (egui::Color32::from_rgb(200, 130, 20), "Not trusted yet"),
+    }
+}
+
+fn trust_badge(ui: &mut egui::Ui, trust: Option<&str>) {
+    let (color, text) = trust_label(trust);
     status_dot(ui, color);
     ui.colored_label(color, text);
+}
+
+/// "by <best name available>" followed by the trust badge.
+fn publisher_line(ui: &mut egui::Ui, who: &str, trust: Option<&str>) {
+    ui.label(format!("by {who}"));
+    trust_badge(ui, trust);
 }
 
 /// Muted tile colours for the stand-in icon.
@@ -1252,6 +1469,32 @@ fn show_icon(ui: &mut egui::Ui, icon: Option<egui::Image<'static>>, name: &str) 
     }
 }
 
+/// Whether a catalogue entry is already on this computer.
+#[derive(Debug, PartialEq, Eq)]
+enum InstallState {
+    NotInstalled,
+    /// This exact version.
+    Installed,
+    /// The same publisher's package, at another version.
+    OtherVersion(String),
+}
+
+/// Matches on publisher and name (the identity of a package), so a package of
+/// the same name from someone else does not count as installed.
+fn install_state(installed: &[Value], item: &Value) -> InstallState {
+    let publisher = value_str(item, "publisher");
+    let name = value_str(item, "name");
+    let version = value_str(item, "version");
+    match installed.iter().find(|entry| {
+        value_str(entry, "name") == name
+            && value_str(entry, "publisher").eq_ignore_ascii_case(&publisher)
+    }) {
+        None => InstallState::NotInstalled,
+        Some(entry) if value_str(entry, "version") == version => InstallState::Installed,
+        Some(entry) => InstallState::OtherVersion(value_str(entry, "version")),
+    }
+}
+
 fn package_reference(value: &Value) -> String {
     format!(
         "{}/{}",
@@ -1263,6 +1506,8 @@ fn package_reference(value: &Value) -> String {
 impl eframe::App for NpackGuiApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.handle_shortcuts(ctx);
+        self.remember_changes(ctx);
         // Redraw regularly while a background call or transaction is in
         // flight, so polling results and progress show up promptly.
         if self.active_transaction.is_some() {
@@ -1342,6 +1587,83 @@ impl eframe::App for NpackGuiApp {
 }
 
 impl NpackGuiApp {
+    /// Keyboard shortcuts (see `shortcut_for`). Ignored on the welcome screen,
+    /// where there is nothing to switch to yet.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.is_first_run() {
+            return;
+        }
+        let keys = [
+            egui::Key::Num1,
+            egui::Key::Num2,
+            egui::Key::Num3,
+            egui::Key::Num4,
+            egui::Key::Num5,
+            egui::Key::F,
+            egui::Key::R,
+            egui::Key::F5,
+            egui::Key::Escape,
+        ];
+        let mut requested = Vec::new();
+        ctx.input_mut(|input| {
+            for key in keys {
+                for ctrl in [true, false] {
+                    let modifiers = if ctrl {
+                        egui::Modifiers::COMMAND
+                    } else {
+                        egui::Modifiers::NONE
+                    };
+                    // Escape only counts while there is something to close,
+                    // so it still cancels a text edit or dialog otherwise.
+                    if shortcut_for(key, ctrl).is_some()
+                        && (key != egui::Key::Escape || self.details.is_some())
+                        && input.consume_key(modifiers, key)
+                        && let Some(shortcut) = shortcut_for(key, ctrl)
+                    {
+                        requested.push(shortcut);
+                    }
+                }
+            }
+        });
+        for shortcut in requested {
+            match shortcut {
+                Shortcut::GoTo(tab) => self.tab = tab,
+                Shortcut::FocusSearch => {
+                    self.tab = Tab::Browse;
+                    self.focus_search = true;
+                }
+                Shortcut::CloseDetails => self.details = None,
+                Shortcut::Refresh => match self.tab {
+                    Tab::Installed => self.refresh_installed(),
+                    Tab::Browse => self.browse(false),
+                    Tab::Updates => self.refresh_updates(),
+                    Tab::Health => self.run_health_check(),
+                    Tab::Settings => self.refresh_config(),
+                },
+            }
+        }
+    }
+
+    /// Saves the current tab and window size when they change, so the next
+    /// start looks the same.
+    fn remember_changes(&mut self, ctx: &egui::Context) {
+        let size = ctx.input(|input| input.viewport().inner_rect.map(|r| [r.width(), r.height()]));
+        let mut changed = false;
+        if self.remembered.tab.as_deref() != Some(self.tab.name()) {
+            self.remembered.tab = Some(self.tab.name().to_owned());
+            changed = true;
+        }
+        if let Some(size) = size
+            && self.remembered.size_changed(size)
+        {
+            self.remembered.size = Some(size);
+            changed = true;
+        }
+        if changed {
+            crate::remember::save(&self.remembered);
+        }
+    }
+
     fn is_first_run(&self) -> bool {
         !self.welcome_dismissed
             && self
@@ -1694,6 +2016,17 @@ impl NpackGuiApp {
                     if !requires.is_empty() {
                         ui.label(format!("Needs on your system: {}", requires.join(", ")));
                     }
+                    if let Some(sizes) = size_summary(preview) {
+                        ui.label(sizes);
+                    }
+                    let effects = install_effects(preview);
+                    if !effects.is_empty() {
+                        ui.add_space(4.0);
+                        ui.strong("What installing does");
+                        for effect in &effects {
+                            ui.label(effect);
+                        }
+                    }
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -1773,12 +2106,13 @@ impl NpackGuiApp {
                             }
                         });
                     });
-                    ui.weak(
+                    ui.weak(format!(
+                        "by {}",
                         self.publisher_text(
                             &value_str(item, "publisher"),
-                            &display_publisher(item),
-                        ),
-                    );
+                            &display_publisher(item)
+                        )
+                    ));
                 });
             });
             ui.add_space(6.0);
@@ -1815,10 +2149,30 @@ impl NpackGuiApp {
         ui.horizontal(|ui| {
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.search_query)
-                    .hint_text("Search by name, summary or category"),
+                    .desired_width(340.0)
+                    .hint_text("Search by name, summary or category (Ctrl+F)"),
             );
+            if self.focus_search {
+                response.request_focus();
+                self.focus_search = false;
+            }
+            // Search as you type, once the typing pauses.
+            if response.changed() {
+                self.search_edited_at = Some(Instant::now());
+            }
+            if let Some(edited) = self.search_edited_at {
+                let waited = edited.elapsed();
+                if waited >= SEARCH_DELAY {
+                    self.search_edited_at = None;
+                    self.browse_limit = BROWSE_PAGE;
+                    rerun = true;
+                } else {
+                    ui.ctx().request_repaint_after(SEARCH_DELAY - waited);
+                }
+            }
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if ui.button("Search").clicked() || enter {
+                self.search_edited_at = None;
                 self.browse_limit = BROWSE_PAGE;
                 rerun = true;
             }
@@ -1854,7 +2208,9 @@ impl NpackGuiApp {
         });
         ui.separator();
 
-        let mut picked_category: Option<Option<String>> = None;
+        // None: nothing picked. Some(None): All. Some(Some(entry name)) with
+        // the flag: a category, or the Uncategorised entry.
+        let mut picked_category: Option<(Option<String>, bool)> = None;
         let mut to_install = None;
         let mut to_show = None;
         let mut show_more = false;
@@ -1868,21 +2224,35 @@ impl NpackGuiApp {
                         .id_salt("categories")
                         .show(ui, |ui| {
                             if ui
-                                .selectable_label(self.selected_category.is_none(), "All")
+                                .selectable_label(
+                                    self.selected_category.is_none()
+                                        && !self.selected_uncategorised,
+                                    "All",
+                                )
                                 .clicked()
                             {
-                                picked_category = Some(None);
+                                picked_category = Some((None, false));
                             }
-                            for (category, count) in &self.categories {
-                                let selected = self
-                                    .selected_category
-                                    .as_deref()
-                                    .is_some_and(|chosen| chosen.eq_ignore_ascii_case(category));
+                            for entry in &self.categories {
+                                let selected = if entry.uncategorised {
+                                    self.selected_uncategorised
+                                } else {
+                                    self.selected_category.as_deref().is_some_and(|chosen| {
+                                        chosen.eq_ignore_ascii_case(&entry.name)
+                                    })
+                                };
                                 if ui
-                                    .selectable_label(selected, format!("{category} ({count})"))
+                                    .selectable_label(
+                                        selected,
+                                        format!("{} ({})", entry.name, entry.count),
+                                    )
                                     .clicked()
                                 {
-                                    picked_category = Some(Some(category.clone()));
+                                    picked_category = Some(if entry.uncategorised {
+                                        (None, true)
+                                    } else {
+                                        (Some(entry.name.clone()), false)
+                                    });
                                 }
                             }
                             if self.categories.is_empty() {
@@ -1893,7 +2263,12 @@ impl NpackGuiApp {
             );
             ui.separator();
             ui.vertical(|ui| {
-                let heading = match (&self.selected_category, self.search_query.trim()) {
+                let chosen = match (&self.selected_category, self.selected_uncategorised) {
+                    (Some(category), _) => Some(category.as_str()),
+                    (None, true) => Some("Uncategorised"),
+                    (None, false) => None,
+                };
+                let heading = match (chosen, self.search_query.trim()) {
                     (Some(category), "") => category.to_string(),
                     (Some(category), query) => format!("{category}: \"{query}\""),
                     (None, "") => "All software".to_owned(),
@@ -1921,8 +2296,35 @@ impl NpackGuiApp {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
-                                                if ui.button("Install").clicked() {
-                                                    to_install = Some(item.clone());
+                                                match install_state(&self.installed, item) {
+                                                    InstallState::NotInstalled => {
+                                                        if ui
+                                                            .add(crate::style::primary_button(
+                                                                "Install",
+                                                            ))
+                                                            .clicked()
+                                                        {
+                                                            to_install = Some(item.clone());
+                                                        }
+                                                    }
+                                                    InstallState::Installed => {
+                                                        ui.add_enabled(
+                                                            false,
+                                                            egui::Button::new("Installed"),
+                                                        );
+                                                    }
+                                                    InstallState::OtherVersion(version) => {
+                                                        ui.add_enabled(
+                                                            false,
+                                                            egui::Button::new(format!(
+                                                                "Installed ({version})"
+                                                            )),
+                                                        )
+                                                        .on_disabled_hover_text(
+                                                            "A different version is installed. \
+                                                             Newer versions appear under Updates.",
+                                                        );
+                                                    }
                                                 }
                                                 if ui.button("Details").clicked() {
                                                     to_show = Some(reference.clone());
@@ -1938,11 +2340,18 @@ impl NpackGuiApp {
                                         if !categories.is_empty() {
                                             ui.weak(categories.join(" · "));
                                         }
-                                        trust_badge(ui, item.get("trust").and_then(Value::as_str));
-                                        ui.weak(self.publisher_text(
+                                        if let Some(size) = app_size(item, "download_size") {
+                                            ui.weak(format_size(size));
+                                        }
+                                        let who = self.publisher_text(
                                             &value_str(item, "publisher"),
                                             &display_publisher(item),
-                                        ));
+                                        );
+                                        publisher_line(
+                                            ui,
+                                            &who,
+                                            item.get("trust").and_then(Value::as_str),
+                                        );
                                     });
                                 });
                             });
@@ -1957,8 +2366,9 @@ impl NpackGuiApp {
             });
         });
 
-        if let Some(choice) = picked_category {
-            self.selected_category = choice;
+        if let Some((category, uncategorised)) = picked_category {
+            self.selected_category = category;
+            self.selected_uncategorised = uncategorised;
             self.browse_limit = BROWSE_PAGE;
             rerun = true;
         }
@@ -2021,7 +2431,9 @@ impl NpackGuiApp {
                 match &available {
                     Some(available) => {
                         ui.label(format!("to {available}"));
-                        if self.active_transaction.is_none() && ui.button("Update").clicked() {
+                        if self.active_transaction.is_none()
+                            && ui.add(crate::style::primary_button("Update")).clicked()
+                        {
                             to_update = Some(reference.clone());
                         }
                     }
@@ -2029,7 +2441,20 @@ impl NpackGuiApp {
                         ui.weak("up to date");
                     }
                 }
+                if available.is_some()
+                    && let Some(size) = item.get("download_size").and_then(Value::as_u64)
+                {
+                    ui.weak(format_size(size));
+                }
             });
+            if available.is_some()
+                && let Some(notes) = item.get("release_notes").and_then(Value::as_str)
+            {
+                ui.indent(("notes", &reference), |ui| {
+                    ui.weak("What's new:");
+                    ui.label(notes);
+                });
+            }
         }
         if update_all {
             self.update(None);
@@ -2135,6 +2560,32 @@ mod tests {
     }
 
     #[test]
+    fn shortcuts_map_to_actions_and_plain_keys_do_nothing() {
+        use egui::Key as K;
+        assert_eq!(
+            shortcut_for(K::Num2, true),
+            Some(Shortcut::GoTo(Tab::Browse))
+        );
+        assert_eq!(shortcut_for(K::F, true), Some(Shortcut::FocusSearch));
+        assert_eq!(shortcut_for(K::F5, false), Some(Shortcut::Refresh));
+        assert_eq!(shortcut_for(K::R, true), Some(Shortcut::Refresh));
+        assert_eq!(shortcut_for(K::Escape, false), Some(Shortcut::CloseDetails));
+        // Typing the letters or digits must never trigger anything.
+        for key in [K::Num1, K::Num5, K::F, K::R] {
+            assert_eq!(shortcut_for(key, false), None, "{key:?} without Ctrl");
+        }
+        assert_eq!(shortcut_for(K::Escape, true), None);
+    }
+
+    #[test]
+    fn tabs_round_trip_through_their_saved_names() {
+        for tab in Tab::ALL {
+            assert_eq!(Tab::from_name(tab.name()), Some(tab));
+        }
+        assert_eq!(Tab::from_name("nonsense"), None);
+    }
+
+    #[test]
     fn update_counts_separate_available_updates_from_revoked_installs() {
         let updates = vec![
             serde_json::json!({"reference": "a/x", "available_version": "2.0.0"}),
@@ -2165,11 +2616,94 @@ mod tests {
     }
 
     #[test]
+    fn sizes_are_shown_in_plain_units() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(999), "999 B");
+        assert_eq!(format_size(1_500), "1.5 KB");
+        assert_eq!(format_size(12_345_678), "12 MB");
+        assert_eq!(format_size(9_990_000), "10.0 MB");
+        assert_eq!(format_size(2_500_000_000), "2.5 GB");
+        assert_eq!(format_size(u64::MAX), "18446744074 GB");
+    }
+
+    #[test]
+    fn the_size_line_uses_whatever_the_publisher_stated() {
+        let item = |app: Value| serde_json::json!({ "app": app });
+        assert_eq!(
+            size_summary(&item(
+                serde_json::json!({"download_size": 12_000_000, "installed_size": 40_000_000})
+            )),
+            Some("Download 12 MB, about 40 MB once installed".into())
+        );
+        assert_eq!(
+            size_summary(&item(serde_json::json!({"download_size": 5_000}))),
+            Some("Download 5.0 KB".into())
+        );
+        assert_eq!(
+            size_summary(&item(serde_json::json!({"download_size": 0}))),
+            None
+        );
+        assert_eq!(size_summary(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn install_effects_say_what_the_package_does_in_plain_words() {
+        let item = serde_json::json!({"details": {"post_install": [
+            "register-service lib/systemd/user/hello.service",
+            "create-directory var/cache/hello",
+            "mystery thing"
+        ], "repo": "30617:ab:hello", "commit": "abc123"}});
+        let effects = install_effects(&item);
+        assert_eq!(effects.len(), 3);
+        assert!(effects[0].contains("background service (hello.service)"));
+        assert!(effects[0].contains("not started automatically"));
+        assert!(effects[1].contains("var/cache/hello"));
+        assert!(effects[2].contains("mystery thing"));
+        assert_eq!(
+            source_line(&item).as_deref(),
+            Some("Source: 30617:ab:hello at commit abc123")
+        );
+        assert!(install_effects(&serde_json::json!({})).is_empty());
+        assert_eq!(source_line(&serde_json::json!({"details": {}})), None);
+    }
+
+    #[test]
+    fn the_uncategorised_entry_filters_only_when_no_category_is_chosen() {
+        let query = |category: Option<&str>, uncategorised: bool| {
+            browse_requests(&BrowseQuery {
+                query: String::new(),
+                relays: vec![],
+                category: category.map(str::to_owned),
+                uncategorised,
+                sort: BrowseSort::Name.as_param(),
+                limit: 48,
+                only_trusted: false,
+                refresh: false,
+            })
+        };
+        let (search, filters) = query(None, true);
+        assert_eq!(search["uncategorised"], true);
+        // The sidebar list is never narrowed by it.
+        assert!(filters.get("uncategorised").is_none());
+        assert!(query(Some("Tools"), true).0.get("uncategorised").is_none());
+        assert!(query(None, false).0.get("uncategorised").is_none());
+        let entry = CategoryEntry::from_value(
+            &serde_json::json!({"category": "Uncategorised", "count": 3, "uncategorised": true}),
+        );
+        assert!(entry.uncategorised && entry.count == 3);
+        assert!(
+            !CategoryEntry::from_value(&serde_json::json!({"category": "Games", "count": 1}))
+                .uncategorised
+        );
+    }
+
+    #[test]
     fn browse_requests_filter_results_but_not_the_category_list() {
         let (search, categories) = browse_requests(&BrowseQuery {
             query: "edit".into(),
             relays: vec!["wss://r.example".into()],
             category: Some("Utility".into()),
+            uncategorised: false,
             sort: BrowseSort::Recent.as_param(),
             limit: 48,
             only_trusted: true,
@@ -2192,6 +2726,7 @@ mod tests {
             query: String::new(),
             relays: vec![],
             category: None,
+            uncategorised: false,
             sort: BrowseSort::Name.as_param(),
             limit: 48,
             only_trusted: false,
@@ -2296,6 +2831,45 @@ mod tests {
             for glyph in risky {
                 assert!(!body.contains(glyph), "file {index} contains {glyph:?}");
             }
+        }
+    }
+
+    #[test]
+    fn installed_apps_are_recognised_by_publisher_and_name() {
+        let installed = vec![serde_json::json!(
+            {"publisher": "AABB", "name": "notepad", "version": "1.0.0"}
+        )];
+        let item = |publisher: &str, name: &str, version: &str| serde_json::json!({"publisher": publisher, "name": name, "version": version});
+        assert_eq!(
+            install_state(&installed, &item("aabb", "notepad", "1.0.0")),
+            InstallState::Installed
+        );
+        assert_eq!(
+            install_state(&installed, &item("aabb", "notepad", "1.2.0")),
+            InstallState::OtherVersion("1.0.0".into())
+        );
+        // Same name from another publisher, or another name, is not installed.
+        assert_eq!(
+            install_state(&installed, &item("ccdd", "notepad", "1.0.0")),
+            InstallState::NotInstalled
+        );
+        assert_eq!(
+            install_state(&installed, &item("aabb", "other", "1.0.0")),
+            InstallState::NotInstalled
+        );
+        assert_eq!(
+            install_state(&[], &item("aabb", "notepad", "1.0.0")),
+            InstallState::NotInstalled
+        );
+    }
+
+    #[test]
+    fn the_trust_badge_is_about_trust_not_identity() {
+        assert_eq!(trust_label(Some("trusted")).1, "Trusted");
+        for status in [Some("unknown"), None, Some("something new")] {
+            let text = trust_label(status).1;
+            assert_eq!(text, "Not trusted yet");
+            assert!(!text.to_lowercase().contains("unknown"));
         }
     }
 
