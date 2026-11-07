@@ -64,3 +64,9 @@ jobs:
             cargo run --quiet -- verify "$manifest"
           done
           packaging/build-linux-packages.sh 0.0.0 target/debug /tmp/pkgs-ci
+      - name: Release version check
+        run: |
+          current=$(awk -F'"' '/^version *=/ { print $2; exit }' npack-cli/Cargo.toml)
+          packaging/check-release-version.sh "$current"
+          ! packaging/check-release-version.sh "v$current" 2>/dev/null
+          ! packaging/check-release-version.sh 99.99.99 2>/dev/null

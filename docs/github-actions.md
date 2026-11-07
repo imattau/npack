@@ -21,6 +21,19 @@ The native packages depend on the system C library and CA certificates. Their
 package manager metadata supports routine install and removal; npack's own
 `.npk` package format remains the source for Nostr-published releases.
 
+## Cutting a release without a local push
+
+Bump the version in both `Cargo.toml` files and `Cargo.lock`, and merge that to
+the default branch. Then run the `Create release` workflow from the Actions tab
+on that branch, entering the version (no `v` prefix) and a one-line summary. It
+checks the version against both crates (`packaging/check-release-version.sh`),
+refuses an existing tag or release, creates the annotated `v<version>` tag, and
+starts `Release package` on it. The dispatch is explicit because a tag pushed
+with the workflow's own token does not start other workflows.
+
+To rehearse, run `Release package` by hand on the default branch: it builds
+everything but skips the GitHub Release and the Nostr job.
+
 To add native packages to an existing GitHub Release, run the
 `Publish Linux packages` workflow from the Actions tab and enter the release
 version without its `v` prefix. It checks out that release's tag and uploads
