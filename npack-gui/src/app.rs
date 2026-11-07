@@ -1190,9 +1190,8 @@ fn details_view(
     if let Some(summary) = app_text(value, "summary") {
         ui.strong(summary);
     }
-    ui.horizontal(|ui| {
-        trust_badge(ui, value.get("trust").and_then(Value::as_str));
-        ui.weak(publisher);
+    ui.horizontal_wrapped(|ui| {
+        publisher_line(ui, publisher, value.get("trust").and_then(Value::as_str));
     });
     if let Some(description) = app_text(value, "description") {
         ui.add_space(6.0);
@@ -1259,13 +1258,26 @@ fn display_publisher(item: &Value) -> String {
         .map_or_else(|| value_str(item, "publisher"), str::to_owned)
 }
 
-fn trust_badge(ui: &mut egui::Ui, trust: Option<&str>) {
-    let (color, text) = match trust {
+/// The trust badge's colour and wording. It describes whether *you* have
+/// chosen to trust this publisher, never who they are: the name comes from
+/// the publisher's own profile and proves nothing about trust.
+fn trust_label(trust: Option<&str>) -> (egui::Color32, &'static str) {
+    match trust {
         Some("trusted") => (egui::Color32::from_rgb(40, 150, 70), "Trusted"),
-        _ => (egui::Color32::from_rgb(200, 130, 20), "Unknown publisher"),
-    };
+        _ => (egui::Color32::from_rgb(200, 130, 20), "Not trusted yet"),
+    }
+}
+
+fn trust_badge(ui: &mut egui::Ui, trust: Option<&str>) {
+    let (color, text) = trust_label(trust);
     status_dot(ui, color);
     ui.colored_label(color, text);
+}
+
+/// "by <best name available>" followed by the trust badge.
+fn publisher_line(ui: &mut egui::Ui, who: &str, trust: Option<&str>) {
+    ui.label(format!("by {who}"));
+    trust_badge(ui, trust);
 }
 
 /// Muted tile colours for the stand-in icon.
@@ -1920,12 +1932,13 @@ impl NpackGuiApp {
                             }
                         });
                     });
-                    ui.weak(
+                    ui.weak(format!(
+                        "by {}",
                         self.publisher_text(
                             &value_str(item, "publisher"),
-                            &display_publisher(item),
-                        ),
-                    );
+                            &display_publisher(item)
+                        )
+                    ));
                 });
             });
             ui.add_space(6.0);
@@ -2108,11 +2121,15 @@ impl NpackGuiApp {
                                         if !categories.is_empty() {
                                             ui.weak(categories.join(" · "));
                                         }
-                                        trust_badge(ui, item.get("trust").and_then(Value::as_str));
-                                        ui.weak(self.publisher_text(
+                                        let who = self.publisher_text(
                                             &value_str(item, "publisher"),
                                             &display_publisher(item),
-                                        ));
+                                        );
+                                        publisher_line(
+                                            ui,
+                                            &who,
+                                            item.get("trust").and_then(Value::as_str),
+                                        );
                                     });
                                 });
                             });
@@ -2494,6 +2511,16 @@ mod tests {
             for glyph in risky {
                 assert!(!body.contains(glyph), "file {index} contains {glyph:?}");
             }
+        }
+    }
+
+    #[test]
+    fn the_trust_badge_is_about_trust_not_identity() {
+        assert_eq!(trust_label(Some("trusted")).1, "Trusted");
+        for status in [Some("unknown"), None, Some("something new")] {
+            let text = trust_label(status).1;
+            assert_eq!(text, "Not trusted yet");
+            assert!(!text.to_lowercase().contains("unknown"));
         }
     }
 
