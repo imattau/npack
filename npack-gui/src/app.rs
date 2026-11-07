@@ -118,6 +118,23 @@ enum Event {
     },
 }
 
+/// Sends events to the UI thread *and wakes it*. egui only redraws on input,
+/// so without the wake-up a result that arrives while the mouse is still (a
+/// click, then waiting) would sit unseen until the mouse moved.
+#[derive(Clone)]
+struct EventSender {
+    tx: mpsc::Sender<Event>,
+    ctx: egui::Context,
+}
+
+impl EventSender {
+    fn send(&self, event: Event) -> Result<(), mpsc::SendError<Event>> {
+        let result = self.tx.send(event);
+        self.ctx.request_repaint();
+        result
+    }
+}
+
 /// An install the user must confirm because its publisher isn't trusted yet.
 struct PendingInstall {
     reference: String,
@@ -176,6 +193,9 @@ pub struct NpackGuiApp {
     icons_requested: HashSet<String>,
     /// The first automatic update check has been started.
     auto_checked: bool,
+    /// The installed list has arrived at least once (until then the tab says
+    /// "Loading", not "nothing installed").
+    installed_loaded: bool,
     /// reference -> version it can be switched back to.
     rollbacks: HashMap<String, String>,
     /// Findings from the last health check, in report order.
@@ -188,14 +208,15 @@ pub struct NpackGuiApp {
     relays_text: String,
     blossom_text: String,
 
-    tx: mpsc::Sender<Event>,
+    tx: EventSender,
     rx: mpsc::Receiver<Event>,
 }
 
 impl NpackGuiApp {
-    pub fn new() -> Self {
+    pub fn new(ctx: egui::Context) -> Self {
         let socket_path = DaemonClient::default_socket_path();
         let (tx, rx) = mpsc::channel();
+        let tx = EventSender { tx, ctx };
         let app = Self {
             socket_path_text: socket_path.display().to_string(),
             client: Arc::new(DaemonClient::new(socket_path)),
@@ -213,7 +234,7 @@ impl NpackGuiApp {
             auto_browsed: false,
             updates: Vec::new(),
             details: None,
-            status: "Not connected yet -- pick a tab to load data.".to_owned(),
+            status: "Connecting...".to_owned(),
             active_transaction: None,
             config: None,
             welcome_dismissed: false,
@@ -227,6 +248,7 @@ impl NpackGuiApp {
             icons: HashMap::new(),
             icons_requested: HashSet::new(),
             auto_checked: false,
+            installed_loaded: false,
             rollbacks: HashMap::new(),
             health: Vec::new(),
             health_running: false,
@@ -238,8 +260,35 @@ impl NpackGuiApp {
             tx,
             rx,
         };
-        app.refresh_config();
+        app.start_up();
         app
+    }
+
+    /// Starts the background service if it isn't running (a normal person
+    /// should never have to), then loads the settings. Off the UI thread.
+    fn start_up(&self) {
+        self.spawn(|client| {
+            if let Err(error) = client.ensure_daemon(Duration::from_secs(8)) {
+                return Event::Config(Err(UiError::from_anyhow(&error)));
+            }
+            Event::Config(
+                client
+                    .call("GetConfig", serde_json::json!({}))
+                    .map_err(|error| UiError::from_anyhow(&error)),
+            )
+        });
+    }
+
+    /// Reconnects using the socket path in Settings, and reruns the checks
+    /// that happen once at start.
+    fn reconnect(&mut self) {
+        self.client = Arc::new(DaemonClient::new(PathBuf::from(&self.socket_path_text)));
+        self.error = None;
+        self.status = "Connecting...".to_owned();
+        self.auto_checked = false;
+        self.auto_browsed = false;
+        self.auto_health = false;
+        self.start_up();
     }
 
     /// Records a failed action: a short status plus a banner with plain-language
@@ -689,7 +738,13 @@ impl NpackGuiApp {
             match event {
                 Event::Installed(Ok(items)) => {
                     self.status = format!("{} package(s) installed.", items.len());
+                    let publishers = items
+                        .iter()
+                        .map(|item| value_str(item, "publisher"))
+                        .collect();
                     self.installed = items;
+                    self.installed_loaded = true;
+                    self.request_profiles(publishers);
                     self.refresh_rollbacks_and_history();
                 }
                 Event::Rollbacks(Ok(items)) => {
@@ -790,6 +845,9 @@ impl NpackGuiApp {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    if self.status == "Connecting..." {
+                        self.status = "Ready.".to_owned();
+                    }
                     let first_run = value.get("first_run").and_then(Value::as_bool) == Some(true);
                     self.config = Some(value);
                     self.request_profiles(trusted);
@@ -797,6 +855,7 @@ impl NpackGuiApp {
                     // as soon as the app is actually set up.
                     if !first_run && !self.auto_checked {
                         self.auto_checked = true;
+                        self.refresh_installed();
                         self.refresh_updates();
                     }
                     if !first_run && !self.auto_browsed {
@@ -871,12 +930,6 @@ impl NpackGuiApp {
                 }
             }
         }
-    }
-}
-
-impl Default for NpackGuiApp {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -968,12 +1021,22 @@ fn group_findings_by_area(findings: &[Value]) -> Vec<(String, Vec<&Value>)> {
 
 /// The marker and colour for a finding's level.
 fn finding_marker(finding: &Value) -> (&'static str, egui::Color32) {
+    // A coloured dot is drawn; the word is for people who can't tell the
+    // colours apart, and only on the levels that need attention. (egui's
+    // built-in fonts have no tick, cross or arrow glyphs, so symbols are
+    // drawn or spelled out rather than typed.)
     match finding.get("level").and_then(Value::as_str) {
-        Some("ok") => ("✓", egui::Color32::from_rgb(40, 150, 70)),
-        Some("warn") => ("!", egui::Color32::from_rgb(200, 130, 20)),
-        Some("fail") => ("✗", egui::Color32::from_rgb(200, 50, 40)),
-        _ => ("·", egui::Color32::GRAY),
+        Some("ok") => ("", egui::Color32::from_rgb(40, 150, 70)),
+        Some("warn") => ("Warning", egui::Color32::from_rgb(200, 130, 20)),
+        Some("fail") => ("Problem", egui::Color32::from_rgb(200, 50, 40)),
+        _ => ("", egui::Color32::GRAY),
     }
+}
+
+/// A small filled circle, drawn rather than typed so it needs no font glyph.
+fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.5, color);
 }
 
 /// "5 minutes ago", "3 days ago".
@@ -988,7 +1051,7 @@ fn describe_age(now: u64, then: u64) -> String {
     format!("{count} {unit}{} ago", if count == 1 { "" } else { "s" })
 }
 
-/// One line of the history list, e.g. "2 hours ago: upgraded x/app 1.0.0 → 1.1.0".
+/// One line of the history list, e.g. "2 hours ago: upgraded x/app 1.0.0 to 1.1.0".
 fn history_line(entry: &Value, now: u64) -> String {
     let version = |field: &str| {
         entry
@@ -1010,7 +1073,7 @@ fn history_line(entry: &Value, now: u64) -> String {
         other => other,
     };
     let change = match (version("from"), version("to")) {
-        (Some(from), Some(to)) => format!("{from} → {to}"),
+        (Some(from), Some(to)) => format!("{from} to {to}"),
         (None, Some(to)) => to.to_owned(),
         (Some(from), None) => from.to_owned(),
         (None, None) => String::new(),
@@ -1050,9 +1113,7 @@ fn details_view(
     icon: Option<egui::Image<'static>>,
 ) {
     ui.horizontal(|ui| {
-        if let Some(icon) = icon {
-            ui.add(icon);
-        }
+        show_icon(ui, icon, &value_str(value, "name"));
         ui.vertical(|ui| {
             ui.heading(value_str(value, "name"));
             ui.label(value_str(value, "version"));
@@ -1111,14 +1172,14 @@ fn describe_publisher(identity: Option<&Value>, npub: &str) -> String {
     };
     let verified = identity.get("nip05_verified").and_then(Value::as_bool) == Some(true);
     if verified && let Some(label) = identity.get("label").and_then(Value::as_str) {
-        return format!("{label} ✓");
+        return format!("{label} (verified)");
     }
     let claimed = identity
         .get("claimed_name")
         .or_else(|| identity.get("nip05"))
         .and_then(Value::as_str);
     match claimed {
-        Some(claimed) => format!("“{claimed}” (unverified) · {short}"),
+        Some(claimed) => format!("\"{claimed}\" (unverified) · {short}"),
         None => short,
     }
 }
@@ -1131,12 +1192,62 @@ fn display_publisher(item: &Value) -> String {
 }
 
 fn trust_badge(ui: &mut egui::Ui, trust: Option<&str>) {
-    match trust {
-        Some("trusted") => {
-            ui.colored_label(egui::Color32::from_rgb(40, 150, 70), "● Trusted");
+    let (color, text) = match trust {
+        Some("trusted") => (egui::Color32::from_rgb(40, 150, 70), "Trusted"),
+        _ => (egui::Color32::from_rgb(200, 130, 20), "Unknown publisher"),
+    };
+    status_dot(ui, color);
+    ui.colored_label(color, text);
+}
+
+/// Muted tile colours for the stand-in icon.
+const TILE_COLORS: [(u8, u8, u8); 8] = [
+    (86, 116, 163),
+    (96, 140, 110),
+    (160, 110, 90),
+    (130, 100, 150),
+    (150, 130, 80),
+    (80, 140, 150),
+    (160, 95, 115),
+    (110, 120, 130),
+];
+
+/// Which tile colour a package gets: stable for a given name.
+fn tile_color_index(name: &str) -> usize {
+    name.bytes().fold(7u32, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(u32::from(byte))
+    }) as usize
+        % TILE_COLORS.len()
+}
+
+/// The letter shown on a stand-in icon.
+fn tile_letter(name: &str) -> String {
+    name.chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_else(|| "?".to_owned())
+}
+
+/// A package's icon, or a coloured tile with its initial when it has none (or
+/// it hasn't arrived yet), so rows line up and nothing is left as a blank gap.
+fn show_icon(ui: &mut egui::Ui, icon: Option<egui::Image<'static>>, name: &str) {
+    match icon {
+        Some(icon) => {
+            ui.add(icon);
         }
-        _ => {
-            ui.colored_label(egui::Color32::from_rgb(200, 130, 20), "● Unknown publisher");
+        None => {
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(ICON_SIZE, ICON_SIZE), egui::Sense::hover());
+            let (r, g, b) = TILE_COLORS[tile_color_index(name)];
+            ui.painter()
+                .rect_filled(rect, 8, egui::Color32::from_rgb(r, g, b));
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                tile_letter(name),
+                egui::FontId::proportional(22.0),
+                egui::Color32::WHITE,
+            );
         }
     }
 }
@@ -1160,35 +1271,36 @@ impl eframe::App for NpackGuiApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::Panel::top("connection").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("npackd socket:");
-                ui.text_edit_singleline(&mut self.socket_path_text);
-                if ui.button("Reconnect").clicked() {
-                    self.client =
-                        Arc::new(DaemonClient::new(PathBuf::from(&self.socket_path_text)));
-                    self.status = "Socket path updated.".to_owned();
-                }
-            });
-        });
-
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.label(&self.status);
         });
 
-        egui::Panel::right("details").show(ui, |ui| {
-            ui.heading("Details");
-            match &self.details {
-                Some(value) => {
-                    let publisher = self
-                        .publisher_text(&value_str(value, "publisher"), &display_publisher(value));
-                    details_view(ui, value, &publisher, self.icon_image(value));
-                }
-                None => {
-                    ui.label("Select a package and click Details.");
-                }
-            }
-        });
+        // The details pane only appears while a package is selected, and only
+        // on the tabs that list packages, so it never squeezes the others.
+        let mut close_details = false;
+        if self.details.is_some() && matches!(self.tab, Tab::Browse | Tab::Installed) {
+            egui::Panel::right("details")
+                .default_size(300.0)
+                .size_range(240.0..=460.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("Details");
+                        if ui.button("Close").clicked() {
+                            close_details = true;
+                        }
+                    });
+                    if let Some(value) = &self.details {
+                        let publisher = self.publisher_text(
+                            &value_str(value, "publisher"),
+                            &display_publisher(value),
+                        );
+                        details_view(ui, value, &publisher, self.icon_image(value));
+                    }
+                });
+        }
+        if close_details {
+            self.details = None;
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             self.show_error_banner(ui);
@@ -1209,7 +1321,7 @@ impl eframe::App for NpackGuiApp {
                 let health_label = match health_counts(&self.health) {
                     (0, 0) => "Health".to_owned(),
                     (0, warnings) => format!("Health ({warnings})"),
-                    _ => "Health ✗".to_owned(),
+                    _ => "Health (!)".to_owned(),
                 };
                 ui.selectable_value(&mut self.tab, Tab::Health, health_label);
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
@@ -1246,6 +1358,7 @@ impl NpackGuiApp {
         };
         let mut dismiss = false;
         let mut open_settings = false;
+        let mut reconnect = false;
         egui::Frame::new()
             .fill(egui::Color32::from_rgba_unmultiplied(200, 60, 40, 40))
             .inner_margin(egui::Margin::same(8))
@@ -1253,6 +1366,11 @@ impl NpackGuiApp {
             .show(ui, |ui| {
                 ui.label(error.headline());
                 ui.horizontal(|ui| {
+                    if error.code.as_deref() == Some("daemon_unreachable")
+                        && ui.button("Try again").clicked()
+                    {
+                        reconnect = true;
+                    }
                     if error.suggests_settings() && ui.button("Open Settings").clicked() {
                         open_settings = true;
                     }
@@ -1266,6 +1384,9 @@ impl NpackGuiApp {
                 }
             });
         ui.add_space(6.0);
+        if reconnect {
+            self.reconnect();
+        }
         if open_settings {
             self.tab = Tab::Settings;
             self.welcome_dismissed = true;
@@ -1341,7 +1462,7 @@ impl NpackGuiApp {
             .corner_radius(4)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("⚠ npack found a problem that stops it working properly.");
+                    ui.label("npack found a problem that stops it working properly.");
                     if ui.button("See what to do").clicked() {
                         open = true;
                     }
@@ -1383,9 +1504,12 @@ impl NpackGuiApp {
                     ui.add_space(6.0);
                     ui.strong(area);
                     for finding in findings {
-                        let (mark, color) = finding_marker(finding);
+                        let (word, color) = finding_marker(finding);
                         ui.horizontal_wrapped(|ui| {
-                            ui.colored_label(color, mark);
+                            status_dot(ui, color);
+                            if !word.is_empty() {
+                                ui.colored_label(color, word);
+                            }
                             ui.label(value_str(finding, "title"));
                         });
                         if let Some(detail) = finding.get("detail").and_then(Value::as_str) {
@@ -1397,7 +1521,7 @@ impl NpackGuiApp {
                         }
                         if let Some(fix) = finding.get("fix").and_then(Value::as_str) {
                             ui.indent(("fix", fix), |ui| {
-                                ui.label(format!("→ {fix}"));
+                                ui.label(format!("Fix: {fix}"));
                             });
                         }
                     }
@@ -1409,6 +1533,20 @@ impl NpackGuiApp {
     }
 
     fn show_settings_tab(&mut self, ui: &mut egui::Ui) {
+        let mut reconnect = false;
+        ui.collapsing("Advanced", |ui| {
+            ui.label("npack's background service listens on this socket.");
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(&mut self.socket_path_text);
+                if ui.button("Reconnect").clicked() {
+                    reconnect = true;
+                }
+            });
+        });
+        ui.add_space(8.0);
+        if reconnect {
+            self.reconnect();
+        }
         ui.heading("Trusted publishers");
         ui.label("npack only installs without asking from publishers on this list.");
         let publishers: Vec<(String, String)> = self
@@ -1523,10 +1661,16 @@ impl NpackGuiApp {
                     .and_then(Value::as_bool)
                     != Some(true)
                 {
-                    ui.label(
-                        "No verified name for this publisher. Any name shown above is \
-                         self-reported and could be someone else's.",
-                    );
+                    let claims_a_name = identity
+                        .and_then(|i| i.get("claimed_name").or_else(|| i.get("nip05")))
+                        .is_some();
+                    ui.label(if claims_a_name {
+                        "No verified name for this publisher. The name shown above is \
+                         self-reported and could be someone else's."
+                    } else {
+                        "This publisher has no verified name. If you know who it should \
+                         be, check that the key above matches."
+                    });
                 }
                 ui.add_space(4.0);
                 ui.label(
@@ -1589,29 +1733,55 @@ impl NpackGuiApp {
         let mut to_remove = None;
         let mut to_show = None;
         let mut to_rollback = None;
+        let mut go_browse = false;
+        if !self.installed_loaded {
+            ui.add_space(8.0);
+            ui.weak("Loading...");
+        } else if self.installed.is_empty() {
+            ui.add_space(8.0);
+            ui.label("Nothing is installed yet.");
+            if ui.button("Browse software").clicked() {
+                go_browse = true;
+            }
+        }
         for item in &self.installed {
             let reference = package_reference(item);
             ui.horizontal(|ui| {
-                ui.label(format!("{reference} {}", value_str(item, "version")));
-                if ui.button("Details").clicked() {
-                    to_show = Some(reference.clone());
-                }
-                if let Some(previous) = self.rollbacks.get(&reference)
-                    && self.active_transaction.is_none()
-                    && ui
-                        .button(format!("Switch back to {previous}"))
-                        .on_hover_text(
-                            "Reinstalls the version this one replaced, from the copy npack kept. \
-                             No download needed.",
-                        )
-                        .clicked()
-                {
-                    to_rollback = Some(reference.clone());
-                }
-                if ui.button("Remove").clicked() {
-                    to_remove = Some(reference.clone());
-                }
+                show_icon(ui, None, &value_str(item, "name"));
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(value_str(item, "name"));
+                        ui.label(value_str(item, "version"));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Remove").clicked() {
+                                to_remove = Some(reference.clone());
+                            }
+                            if let Some(previous) = self.rollbacks.get(&reference)
+                                && self.active_transaction.is_none()
+                                && ui
+                                    .button(format!("Switch back to {previous}"))
+                                    .on_hover_text(
+                                        "Reinstalls the version this one replaced, from the copy \
+                                         npack kept. No download needed.",
+                                    )
+                                    .clicked()
+                            {
+                                to_rollback = Some(reference.clone());
+                            }
+                            if ui.button("Details").clicked() {
+                                to_show = Some(reference.clone());
+                            }
+                        });
+                    });
+                    ui.weak(
+                        self.publisher_text(
+                            &value_str(item, "publisher"),
+                            &display_publisher(item),
+                        ),
+                    );
+                });
             });
+            ui.add_space(6.0);
         }
         if !self.history.is_empty() {
             ui.add_space(8.0);
@@ -1627,6 +1797,9 @@ impl NpackGuiApp {
         }
         if let Some(reference) = to_show {
             self.show_details(&reference);
+        }
+        if go_browse {
+            self.tab = Tab::Browse;
         }
         if let Some(reference) = to_rollback {
             self.rollback(&reference);
@@ -1722,9 +1895,9 @@ impl NpackGuiApp {
             ui.vertical(|ui| {
                 let heading = match (&self.selected_category, self.search_query.trim()) {
                     (Some(category), "") => category.to_string(),
-                    (Some(category), query) => format!("{category}: “{query}”"),
+                    (Some(category), query) => format!("{category}: \"{query}\""),
                     (None, "") => "All software".to_owned(),
-                    (None, query) => format!("Results for “{query}”"),
+                    (None, query) => format!("Results for \"{query}\""),
                 };
                 ui.heading(heading);
                 ui.weak(format!("{} shown", self.search_results.len()));
@@ -1737,40 +1910,43 @@ impl NpackGuiApp {
                         for item in &self.search_results {
                             let reference = package_reference(item);
                             ui.horizontal(|ui| {
-                                match self.icon_image(item) {
-                                    Some(icon) => {
-                                        ui.add(icon);
-                                    }
-                                    None => {
-                                        ui.allocate_space(egui::vec2(ICON_SIZE, ICON_SIZE));
-                                    }
-                                }
+                                show_icon(ui, self.icon_image(item), &value_str(item, "name"));
                                 ui.vertical(|ui| {
+                                    // The buttons sit at the right edge of the
+                                    // row so they stay visible however narrow
+                                    // the window is.
                                     ui.horizontal(|ui| {
                                         ui.strong(value_str(item, "name"));
                                         ui.label(value_str(item, "version"));
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.button("Install").clicked() {
+                                                    to_install = Some(item.clone());
+                                                }
+                                                if ui.button("Details").clicked() {
+                                                    to_show = Some(reference.clone());
+                                                }
+                                            },
+                                        );
+                                    });
+                                    if let Some(summary) = app_text(item, "summary") {
+                                        ui.label(summary);
+                                    }
+                                    ui.horizontal_wrapped(|ui| {
+                                        let categories = app_categories(item);
+                                        if !categories.is_empty() {
+                                            ui.weak(categories.join(" · "));
+                                        }
                                         trust_badge(ui, item.get("trust").and_then(Value::as_str));
                                         ui.weak(self.publisher_text(
                                             &value_str(item, "publisher"),
                                             &display_publisher(item),
                                         ));
-                                        if ui.button("Details").clicked() {
-                                            to_show = Some(reference.clone());
-                                        }
-                                        if ui.button("Install").clicked() {
-                                            to_install = Some(item.clone());
-                                        }
                                     });
-                                    if let Some(summary) = app_text(item, "summary") {
-                                        ui.label(summary);
-                                    }
-                                    let categories = app_categories(item);
-                                    if !categories.is_empty() {
-                                        ui.weak(categories.join(" · "));
-                                    }
                                 });
                             });
-                            ui.add_space(4.0);
+                            ui.add_space(6.0);
                         }
                         if self.search_results.len() >= self.browse_limit
                             && ui.button("Show more").clicked()
@@ -1821,7 +1997,11 @@ impl NpackGuiApp {
         });
         ui.separator();
         if self.updates.is_empty() {
-            ui.weak("Nothing checked yet, or nothing installed.");
+            if self.installed_loaded && self.installed.is_empty() {
+                ui.weak("Nothing is installed yet, so there are no updates to check.");
+            } else {
+                ui.weak("Not checked yet.");
+            }
         }
         for item in &self.updates {
             let reference = value_str(item, "reference");
@@ -1832,7 +2012,7 @@ impl NpackGuiApp {
                 .map(str::to_owned);
             ui.horizontal(|ui| {
                 if let Some(reason) = item.get("revoked").and_then(Value::as_str) {
-                    ui.colored_label(egui::Color32::from_rgb(200, 50, 40), "⚠ Revoked");
+                    ui.colored_label(egui::Color32::from_rgb(200, 50, 40), "Revoked");
                     ui.label(format!("{reference} {current}"));
                     ui.weak(format!("The publisher withdrew this version: {reason}"));
                 } else {
@@ -1840,7 +2020,7 @@ impl NpackGuiApp {
                 }
                 match &available {
                     Some(available) => {
-                        ui.label(format!("→ {available}"));
+                        ui.label(format!("to {available}"));
                         if self.active_transaction.is_none() && ui.button("Update").clicked() {
                             to_update = Some(reference.clone());
                         }
@@ -1873,7 +2053,7 @@ impl NpackGuiApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(format!(
-                        "⚠ {revoked} installed package(s) were revoked by their publisher. \
+                        "{revoked} installed package(s) were revoked by their publisher. \
                          Update or remove them."
                     ));
                     if ui.button("Review").clicked() {
@@ -1914,7 +2094,7 @@ mod tests {
         });
         assert_eq!(
             describe_publisher(Some(&verified), NPUB),
-            "alice@example.com ✓"
+            "alice@example.com (verified)"
         );
 
         let claim = serde_json::json!({
@@ -1922,11 +2102,11 @@ mod tests {
         });
         let text = describe_publisher(Some(&claim), NPUB);
         assert!(text.contains("(unverified)") && text.contains("Linus"));
-        assert!(!text.contains('✓'));
+        assert!(!text.contains("(verified)"));
 
         // An unverified record must never earn the tick, even with a label.
         let forged = serde_json::json!({"nip05_verified": false, "label": "x@y.com"});
-        assert!(!describe_publisher(Some(&forged), NPUB).contains('✓'));
+        assert!(!describe_publisher(Some(&forged), NPUB).contains("(verified)"));
     }
 
     #[test]
@@ -1978,7 +2158,7 @@ mod tests {
         });
         assert_eq!(
             history_line(&entry, 1000 + 120),
-            "2 minutes ago: switched back npub1x/app 2.0.0 → 1.0.0"
+            "2 minutes ago: switched back npub1x/app 2.0.0 to 1.0.0"
         );
         let removal = serde_json::json!({"at": 0, "action": "remove", "reference": "npub1x/app", "from": {"version": "1.0.0"}});
         assert!(history_line(&removal, 0).ends_with("removed npub1x/app 1.0.0"));
@@ -2066,12 +2246,57 @@ mod tests {
                 marker("info"),
                 marker("??")
             ),
-            ("✓", "!", "✗", "·", "·")
+            ("", "Warning", "Problem", "", "")
         );
         assert_ne!(
             finding_marker(&serde_json::json!({"level": "fail"})).1,
             finding_marker(&serde_json::json!({"level": "ok"})).1
         );
+    }
+
+    #[test]
+    fn stand_in_icons_are_stable_and_never_blank() {
+        assert_eq!(
+            tile_color_index("notepad-lite"),
+            tile_color_index("notepad-lite")
+        );
+        assert!(
+            ["a", "zebra", "", "\u{1F600}x"]
+                .iter()
+                .all(|n| tile_color_index(n) < TILE_COLORS.len())
+        );
+        assert_eq!(tile_letter("notepad-lite"), "N");
+        assert_eq!(tile_letter("9lives"), "9");
+        assert_eq!(tile_letter("--x"), "X", "skips punctuation");
+        assert_eq!(tile_letter(""), "?");
+        assert_eq!(
+            tile_letter("\u{df}"),
+            "SS",
+            "uppercasing can make two letters"
+        );
+    }
+
+    #[test]
+    fn no_text_in_the_gui_needs_a_glyph_egui_does_not_ship() {
+        // egui's built-in fonts lack ticks, crosses, arrows, dots and curly
+        // quotes: they render as empty boxes. This guards every string the GUI
+        // can show, so a symbol cannot sneak back in unseen.
+        let sources = [include_str!("app.rs"), include_str!("friendly.rs")];
+        let risky = [
+            '\u{2713}', '\u{2717}', '\u{25CF}', '\u{2192}', '\u{26A0}', '\u{201C}', '\u{201D}',
+            '\u{2018}', '\u{2019}',
+        ];
+        for (index, source) in sources.iter().enumerate() {
+            // Skip this test's own list of the characters it forbids.
+            let body: String = source
+                .lines()
+                .filter(|line| !line.contains("let risky"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for glyph in risky {
+                assert!(!body.contains(glyph), "file {index} contains {glyph:?}");
+            }
+        }
     }
 
     #[test]

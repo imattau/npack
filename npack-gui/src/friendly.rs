@@ -86,7 +86,7 @@ impl UiError {
                 "This app is newer than the npack background service. Update npack and restart the service."
             }
             Some("no_catalogue") => {
-                "The software catalogue hasn't been downloaded yet. Press “Refresh catalogue” to fetch it."
+                "The software catalogue hasn't been downloaded yet. Press \"Refresh catalogue\" to fetch it."
             }
             Some("no_rollback") => "There's no earlier version of this package to switch back to.",
             Some("rollback_blocked") => {

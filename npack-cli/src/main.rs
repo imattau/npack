@@ -5038,10 +5038,19 @@ impl DaemonState {
     /// lock is held across an await.
     fn config(&self) -> Config {
         self.reload_config_if_changed();
-        self.config
+        let mut config = self
+            .config
             .read()
             .map(|config| config.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // npackd-user runs as one person and serves that person's own prefix
+        // (`~/.local`). Without this it would fall back to the system store,
+        // which a normal user cannot write, unless their config said
+        // `[install].user = true`.
+        if self.role == DaemonRole::User {
+            config.install.user = true;
+        }
+        config
     }
 
     /// Registers a new transaction and spawns `make_work` (given a fresh
@@ -6515,7 +6524,18 @@ fn daemon_list_installed(config: &Config, params: serde_json::Value) -> Result<s
         serde_json::from_value(params).context("invalid ListInstalled params")?;
     let use_user = params.user || config.install.user;
     let root = install_paths(params.store.as_deref(), use_user).0;
-    Ok(serde_json::to_value(installed_packages(Some(&root))?)?)
+    let mut value = serde_json::to_value(installed_packages(Some(&root))?)?;
+    // Add the npub people recognise next to the hex key, as Search does.
+    for item in value.as_array_mut().into_iter().flatten() {
+        let npub = item
+            .get("publisher")
+            .and_then(serde_json::Value::as_str)
+            .map(display_publisher);
+        if let (Some(npub), Some(object)) = (npub, item.as_object_mut()) {
+            object.insert("npub".into(), npub.into());
+        }
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -14814,7 +14834,7 @@ mod tests {
         let dir = tempdir()?;
         let state = doctor_state(dir.path());
         let params = serde_json::json!({"offline": true, "store": dir.path().join("store")});
-        let key = (true, false, Some(dir.path().join("store")));
+        let key = (true, true, Some(dir.path().join("store")));
         let planted = vec![Finding::new(Level::Warn, "Planted", "from the cache")];
         let ask = || {
             dispatch_daemon_request(
@@ -14847,7 +14867,7 @@ mod tests {
         );
 
         // A different request (here: not offline) never gets another's result.
-        let other = (false, false, None);
+        let other = (false, true, None);
         *state.doctor_cache.lock().unwrap() = Some((std::time::Instant::now(), other, planted));
         let reply = ask().await?;
         assert_ne!(reply["findings"][0]["title"], "from the cache");
@@ -14883,5 +14903,40 @@ mod tests {
             required_authorization(DaemonRole::System, 1000, "RunDoctor"),
             None
         );
+    }
+
+    #[test]
+    fn the_user_daemon_serves_the_users_own_prefix_by_default() {
+        let user = DaemonState::with_config_path(Config::default(), DaemonRole::User, None);
+        assert!(
+            user.config().install.user,
+            "a normal user cannot write the system store"
+        );
+        let system = DaemonState::with_config_path(Config::default(), DaemonRole::System, None);
+        assert!(
+            !system.config().install.user,
+            "the system daemon keeps the system store"
+        );
+        // Without an explicit store, user mode picks the per-user state directory.
+        assert_eq!(install_paths(None, true).0, default_store());
+    }
+
+    #[test]
+    fn list_installed_adds_an_npub_next_to_the_hex_publisher() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("store");
+        let keys = Keys::generate();
+        install_test_version(dir.path(), &root, &keys, "1.0.0")?;
+        let state = Arc::new(DaemonState::with_config_path(
+            Config::default(),
+            DaemonRole::User,
+            None,
+        ));
+        let listed = call_daemon(&state, "ListInstalled", serde_json::json!({"store": root}))?;
+        let item = &listed[0];
+        assert_eq!(item["publisher"], keys.public_key().to_hex());
+        assert_eq!(item["npub"], display_publisher(&keys.public_key().to_hex()));
+        assert!(item["npub"].as_str().unwrap().starts_with("npub1"));
+        Ok(())
     }
 }
