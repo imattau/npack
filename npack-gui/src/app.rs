@@ -82,6 +82,8 @@ struct BrowseQuery {
     query: String,
     relays: Vec<String>,
     category: Option<String>,
+    /// Only packages that list no category (when no category is chosen).
+    uncategorised: bool,
     sort: &'static str,
     limit: usize,
     only_trusted: bool,
@@ -108,6 +110,8 @@ fn browse_requests(browse: &BrowseQuery) -> (Value, Value) {
     search["limit"] = browse.limit.into();
     if let Some(category) = &browse.category {
         search["category"] = category.clone().into();
+    } else if browse.uncategorised {
+        search["uncategorised"] = true.into();
     }
     (search, filters)
 }
@@ -123,6 +127,25 @@ impl BrowseSort {
         match self {
             Self::Recent => "recent",
             Self::Name => "name",
+        }
+    }
+}
+
+/// One line of the Browse sidebar.
+#[derive(Debug, PartialEq, Eq)]
+struct CategoryEntry {
+    name: String,
+    count: u64,
+    /// The catch-all for packages that list no category.
+    uncategorised: bool,
+}
+
+impl CategoryEntry {
+    fn from_value(item: &Value) -> Self {
+        Self {
+            name: value_str(item, "category"),
+            count: item.get("count").and_then(Value::as_u64).unwrap_or(0),
+            uncategorised: item.get("uncategorised").and_then(Value::as_bool) == Some(true),
         }
     }
 }
@@ -220,8 +243,10 @@ pub struct NpackGuiApp {
     search_relays: String,
     search_results: Vec<Value>,
     /// Categories present in the catalogue, most populous first.
-    categories: Vec<(String, u64)>,
+    categories: Vec<CategoryEntry>,
     selected_category: Option<String>,
+    /// The sidebar's "Uncategorised" entry is selected.
+    selected_uncategorised: bool,
     browse_sort: BrowseSort,
     only_trusted: bool,
     /// How many results to ask for; "Show more" raises it.
@@ -295,6 +320,7 @@ impl NpackGuiApp {
             search_results: Vec::new(),
             categories: Vec::new(),
             selected_category: None,
+            selected_uncategorised: false,
             browse_sort: BrowseSort::Recent,
             only_trusted: false,
             browse_limit: BROWSE_PAGE,
@@ -578,6 +604,7 @@ impl NpackGuiApp {
             .map(str::to_owned)
             .collect();
         let category = self.selected_category.clone();
+        let uncategorised = self.selected_uncategorised;
         let sort = self.browse_sort.as_param();
         let limit = self.browse_limit;
         let only_trusted = self.only_trusted;
@@ -588,6 +615,7 @@ impl NpackGuiApp {
                 query,
                 relays,
                 category,
+                uncategorised,
                 sort,
                 limit,
                 only_trusted,
@@ -866,15 +894,7 @@ impl NpackGuiApp {
                     }
                 }
                 Event::Categories(Ok(items)) => {
-                    self.categories = items
-                        .iter()
-                        .map(|item| {
-                            (
-                                value_str(item, "category"),
-                                item.get("count").and_then(Value::as_u64).unwrap_or(0),
-                            )
-                        })
-                        .collect();
+                    self.categories = items.iter().map(CategoryEntry::from_value).collect();
                 }
                 // The sidebar is a convenience; results still show without it.
                 Event::Categories(Err(_)) => {}
@@ -1159,6 +1179,92 @@ fn app_text<'a>(item: &'a Value, field: &str) -> Option<&'a str> {
         .filter(|text| !text.is_empty())
 }
 
+/// "12 MB": decimal units, one decimal place below 10.
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if value < 10.0 {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.0} {}", UNITS[unit])
+    }
+}
+
+/// A size the publisher stated in the listing (`download_size`,
+/// `installed_size`), if any.
+fn app_size(item: &Value, field: &str) -> Option<u64> {
+    item.get("app")?
+        .get(field)?
+        .as_u64()
+        .filter(|size| *size > 0)
+}
+
+/// "Download 12 MB, about 40 MB once installed", from the listing.
+fn size_summary(item: &Value) -> Option<String> {
+    match (
+        app_size(item, "download_size"),
+        app_size(item, "installed_size"),
+    ) {
+        (Some(download), Some(installed)) => Some(format!(
+            "Download {}, about {} once installed",
+            format_size(download),
+            format_size(installed)
+        )),
+        (Some(download), None) => Some(format!("Download {}", format_size(download))),
+        (None, Some(installed)) => Some(format!("About {} once installed", format_size(installed))),
+        (None, None) => None,
+    }
+}
+
+/// What installing does besides copying files, in plain words, from the
+/// release's `details.post_install` entries ("action path").
+fn install_effects(item: &Value) -> Vec<String> {
+    item.get("details")
+        .and_then(|details| details.get("post_install"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|entry| {
+            let (action, path) = entry.split_once(' ').unwrap_or((entry, ""));
+            let file = path.rsplit('/').next().unwrap_or(path);
+            match action {
+                "register-service" => {
+                    format!("Adds a background service ({file}). It is not started automatically.")
+                }
+                "create-directory" => format!("Creates the folder {path}."),
+                _ => format!("Runs an install step: {entry}."),
+            }
+        })
+        .collect()
+}
+
+/// Where the code came from, if the release says: "repo at commit".
+fn source_line(item: &Value) -> Option<String> {
+    let details = item.get("details")?;
+    let repo = details.get("repo").and_then(Value::as_str)?;
+    match details.get("commit").and_then(Value::as_str) {
+        Some(commit) => Some(format!("Source: {repo} at commit {commit}")),
+        None => Some(format!("Source: {repo}")),
+    }
+}
+
+fn details_strings<'a>(item: &'a Value, field: &str) -> Vec<&'a str> {
+    item.get("details")
+        .and_then(|details| details.get(field))
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
 fn app_categories(item: &Value) -> Vec<&str> {
     item.get("app")
         .and_then(|app| app.get("categories"))
@@ -1207,6 +1313,37 @@ fn details_view(
     }
     if let Some(date) = app_text(value, "release_date") {
         ui.label(format!("Released: {date}"));
+    }
+    if let Some(sizes) = size_summary(value) {
+        ui.label(format!("{sizes} (as stated by the publisher)"));
+    }
+    if let Some(notes) = app_text(value, "release_notes") {
+        ui.add_space(6.0);
+        ui.strong("What's new");
+        ui.label(notes);
+    }
+    let effects = install_effects(value);
+    if !effects.is_empty() {
+        ui.add_space(6.0);
+        ui.strong("What installing does");
+        for effect in &effects {
+            ui.label(effect);
+        }
+    }
+    let needs = details_strings(value, "requires");
+    if !needs.is_empty() {
+        ui.label(format!("Needs on your system: {}", needs.join(", ")));
+    }
+    if let Some(source) = source_line(value) {
+        ui.weak(source);
+    }
+    if let Some(support) = app_text(value, "support_url")
+        && (support.starts_with("https://") || support.starts_with("http://"))
+    {
+        ui.horizontal(|ui| {
+            ui.label("Get help:");
+            ui.hyperlink_to(support, support);
+        });
     }
     if let Some(homepage) = app_text(value, "homepage")
         && (homepage.starts_with("https://") || homepage.starts_with("http://"))
@@ -1879,6 +2016,17 @@ impl NpackGuiApp {
                     if !requires.is_empty() {
                         ui.label(format!("Needs on your system: {}", requires.join(", ")));
                     }
+                    if let Some(sizes) = size_summary(preview) {
+                        ui.label(sizes);
+                    }
+                    let effects = install_effects(preview);
+                    if !effects.is_empty() {
+                        ui.add_space(4.0);
+                        ui.strong("What installing does");
+                        for effect in &effects {
+                            ui.label(effect);
+                        }
+                    }
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -2060,7 +2208,9 @@ impl NpackGuiApp {
         });
         ui.separator();
 
-        let mut picked_category: Option<Option<String>> = None;
+        // None: nothing picked. Some(None): All. Some(Some(entry name)) with
+        // the flag: a category, or the Uncategorised entry.
+        let mut picked_category: Option<(Option<String>, bool)> = None;
         let mut to_install = None;
         let mut to_show = None;
         let mut show_more = false;
@@ -2074,21 +2224,35 @@ impl NpackGuiApp {
                         .id_salt("categories")
                         .show(ui, |ui| {
                             if ui
-                                .selectable_label(self.selected_category.is_none(), "All")
+                                .selectable_label(
+                                    self.selected_category.is_none()
+                                        && !self.selected_uncategorised,
+                                    "All",
+                                )
                                 .clicked()
                             {
-                                picked_category = Some(None);
+                                picked_category = Some((None, false));
                             }
-                            for (category, count) in &self.categories {
-                                let selected = self
-                                    .selected_category
-                                    .as_deref()
-                                    .is_some_and(|chosen| chosen.eq_ignore_ascii_case(category));
+                            for entry in &self.categories {
+                                let selected = if entry.uncategorised {
+                                    self.selected_uncategorised
+                                } else {
+                                    self.selected_category.as_deref().is_some_and(|chosen| {
+                                        chosen.eq_ignore_ascii_case(&entry.name)
+                                    })
+                                };
                                 if ui
-                                    .selectable_label(selected, format!("{category} ({count})"))
+                                    .selectable_label(
+                                        selected,
+                                        format!("{} ({})", entry.name, entry.count),
+                                    )
                                     .clicked()
                                 {
-                                    picked_category = Some(Some(category.clone()));
+                                    picked_category = Some(if entry.uncategorised {
+                                        (None, true)
+                                    } else {
+                                        (Some(entry.name.clone()), false)
+                                    });
                                 }
                             }
                             if self.categories.is_empty() {
@@ -2099,7 +2263,12 @@ impl NpackGuiApp {
             );
             ui.separator();
             ui.vertical(|ui| {
-                let heading = match (&self.selected_category, self.search_query.trim()) {
+                let chosen = match (&self.selected_category, self.selected_uncategorised) {
+                    (Some(category), _) => Some(category.as_str()),
+                    (None, true) => Some("Uncategorised"),
+                    (None, false) => None,
+                };
+                let heading = match (chosen, self.search_query.trim()) {
                     (Some(category), "") => category.to_string(),
                     (Some(category), query) => format!("{category}: \"{query}\""),
                     (None, "") => "All software".to_owned(),
@@ -2171,6 +2340,9 @@ impl NpackGuiApp {
                                         if !categories.is_empty() {
                                             ui.weak(categories.join(" · "));
                                         }
+                                        if let Some(size) = app_size(item, "download_size") {
+                                            ui.weak(format_size(size));
+                                        }
                                         let who = self.publisher_text(
                                             &value_str(item, "publisher"),
                                             &display_publisher(item),
@@ -2194,8 +2366,9 @@ impl NpackGuiApp {
             });
         });
 
-        if let Some(choice) = picked_category {
-            self.selected_category = choice;
+        if let Some((category, uncategorised)) = picked_category {
+            self.selected_category = category;
+            self.selected_uncategorised = uncategorised;
             self.browse_limit = BROWSE_PAGE;
             rerun = true;
         }
@@ -2268,7 +2441,20 @@ impl NpackGuiApp {
                         ui.weak("up to date");
                     }
                 }
+                if available.is_some()
+                    && let Some(size) = item.get("download_size").and_then(Value::as_u64)
+                {
+                    ui.weak(format_size(size));
+                }
             });
+            if available.is_some()
+                && let Some(notes) = item.get("release_notes").and_then(Value::as_str)
+            {
+                ui.indent(("notes", &reference), |ui| {
+                    ui.weak("What's new:");
+                    ui.label(notes);
+                });
+            }
         }
         if update_all {
             self.update(None);
@@ -2430,11 +2616,94 @@ mod tests {
     }
 
     #[test]
+    fn sizes_are_shown_in_plain_units() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(999), "999 B");
+        assert_eq!(format_size(1_500), "1.5 KB");
+        assert_eq!(format_size(12_345_678), "12 MB");
+        assert_eq!(format_size(9_990_000), "10.0 MB");
+        assert_eq!(format_size(2_500_000_000), "2.5 GB");
+        assert_eq!(format_size(u64::MAX), "18446744074 GB");
+    }
+
+    #[test]
+    fn the_size_line_uses_whatever_the_publisher_stated() {
+        let item = |app: Value| serde_json::json!({ "app": app });
+        assert_eq!(
+            size_summary(&item(
+                serde_json::json!({"download_size": 12_000_000, "installed_size": 40_000_000})
+            )),
+            Some("Download 12 MB, about 40 MB once installed".into())
+        );
+        assert_eq!(
+            size_summary(&item(serde_json::json!({"download_size": 5_000}))),
+            Some("Download 5.0 KB".into())
+        );
+        assert_eq!(
+            size_summary(&item(serde_json::json!({"download_size": 0}))),
+            None
+        );
+        assert_eq!(size_summary(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn install_effects_say_what_the_package_does_in_plain_words() {
+        let item = serde_json::json!({"details": {"post_install": [
+            "register-service lib/systemd/user/hello.service",
+            "create-directory var/cache/hello",
+            "mystery thing"
+        ], "repo": "30617:ab:hello", "commit": "abc123"}});
+        let effects = install_effects(&item);
+        assert_eq!(effects.len(), 3);
+        assert!(effects[0].contains("background service (hello.service)"));
+        assert!(effects[0].contains("not started automatically"));
+        assert!(effects[1].contains("var/cache/hello"));
+        assert!(effects[2].contains("mystery thing"));
+        assert_eq!(
+            source_line(&item).as_deref(),
+            Some("Source: 30617:ab:hello at commit abc123")
+        );
+        assert!(install_effects(&serde_json::json!({})).is_empty());
+        assert_eq!(source_line(&serde_json::json!({"details": {}})), None);
+    }
+
+    #[test]
+    fn the_uncategorised_entry_filters_only_when_no_category_is_chosen() {
+        let query = |category: Option<&str>, uncategorised: bool| {
+            browse_requests(&BrowseQuery {
+                query: String::new(),
+                relays: vec![],
+                category: category.map(str::to_owned),
+                uncategorised,
+                sort: BrowseSort::Name.as_param(),
+                limit: 48,
+                only_trusted: false,
+                refresh: false,
+            })
+        };
+        let (search, filters) = query(None, true);
+        assert_eq!(search["uncategorised"], true);
+        // The sidebar list is never narrowed by it.
+        assert!(filters.get("uncategorised").is_none());
+        assert!(query(Some("Tools"), true).0.get("uncategorised").is_none());
+        assert!(query(None, false).0.get("uncategorised").is_none());
+        let entry = CategoryEntry::from_value(
+            &serde_json::json!({"category": "Uncategorised", "count": 3, "uncategorised": true}),
+        );
+        assert!(entry.uncategorised && entry.count == 3);
+        assert!(
+            !CategoryEntry::from_value(&serde_json::json!({"category": "Games", "count": 1}))
+                .uncategorised
+        );
+    }
+
+    #[test]
     fn browse_requests_filter_results_but_not_the_category_list() {
         let (search, categories) = browse_requests(&BrowseQuery {
             query: "edit".into(),
             relays: vec!["wss://r.example".into()],
             category: Some("Utility".into()),
+            uncategorised: false,
             sort: BrowseSort::Recent.as_param(),
             limit: 48,
             only_trusted: true,
@@ -2457,6 +2726,7 @@ mod tests {
             query: String::new(),
             relays: vec![],
             category: None,
+            uncategorised: false,
             sort: BrowseSort::Name.as_param(),
             limit: 48,
             only_trusted: false,

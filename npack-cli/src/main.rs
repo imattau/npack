@@ -1013,6 +1013,10 @@ struct ResolvedRelease {
     /// Store-listing metadata published with the release, already sanitised.
     #[serde(skip_serializing_if = "Option::is_none")]
     app: Option<AppListing>,
+    /// What installing does (post-install actions, requirements, source),
+    /// read from the signed event, for an install confirmation to show.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<ReleaseDetails>,
     verification: VerificationResult,
 }
 
@@ -3493,6 +3497,7 @@ async fn finish_resolved_release(
         release_event_id: release.id.to_hex(),
         artifact_event_id: artifact_event.id.to_hex(),
         app,
+        details: release_details(&release),
         verification: VerificationResult {
             release_signature_valid: true,
             artifact_event_signature_valid: true,
@@ -7036,6 +7041,12 @@ struct UpdateStatus {
     /// text is the publisher's stated reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     revoked: Option<String>,
+    /// The publisher's "what's new" for the available version, when listed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release_notes: Option<String>,
+    /// The publisher's stated download size of the available version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    download_size: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -7112,7 +7123,14 @@ async fn check_updates_core(
         )
         .await
         {
-            Ok(resolved) => Some(resolved.version),
+            Ok(resolved) => Some((
+                resolved.version,
+                resolved
+                    .app
+                    .as_ref()
+                    .and_then(|app| app.release_notes.clone()),
+                resolved.app.as_ref().and_then(|app| app.download_size),
+            )),
             Err(error)
                 if error.to_string()
                     == format!("no verified release found for {}", package.name) =>
@@ -7127,8 +7145,10 @@ async fn check_updates_core(
         statuses.push(UpdateStatus {
             reference: installed_package_reference(package),
             current_version: package.version.clone(),
-            available_version: available,
+            available_version: available.as_ref().map(|(version, ..)| version.clone()),
             revoked: None,
+            release_notes: available.as_ref().and_then(|(_, notes, _)| notes.clone()),
+            download_size: available.as_ref().and_then(|(.., size)| *size),
         });
     }
     // Best effort: failing to read revocations must not hide the update list.
@@ -7540,7 +7560,7 @@ fn listing_warnings(manifest: &Manifest) -> Vec<String> {
     let app = &manifest.app;
     let mut missing = Vec::new();
     if app.summary.as_deref().is_none_or(|s| s.trim().is_empty()) {
-        missing.push("a summary");
+        missing.push("summary");
     }
     if app.categories.is_empty() {
         missing.push("categories");
@@ -11798,6 +11818,7 @@ mod tests {
             release_event_id: "release-id".into(),
             artifact_event_id: "artifact-id".into(),
             app: None,
+            details: None,
             verification: VerificationResult {
                 release_signature_valid: true,
                 artifact_event_signature_valid: true,
@@ -11835,6 +11856,7 @@ mod tests {
             release_event_id: "release-id".into(),
             artifact_event_id: "artifact-id".into(),
             app: None,
+            details: None,
             verification: VerificationResult {
                 release_signature_valid: true,
                 artifact_event_signature_valid: true,
@@ -13843,7 +13865,7 @@ mod tests {
         };
         let warnings = listing_warnings(&manifest(AppMetadata::default(), None));
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("a summary or categories"));
+        assert!(warnings[0].contains("no summary or categories"));
         let only_summary = AppMetadata {
             summary: Some("x".into()),
             ..AppMetadata::default()
@@ -14242,6 +14264,8 @@ mod tests {
             current_version: current.into(),
             available_version: available.map(str::to_owned),
             revoked: revoked.map(str::to_owned),
+            release_notes: None,
+            download_size: None,
         }
     }
 

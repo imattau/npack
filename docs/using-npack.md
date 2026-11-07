@@ -905,6 +905,15 @@ different instance, change the socket path under Settings, Advanced.
 A daemon started this way (or by plain `npack daemon`) is npackd-user, so it
 installs into your own prefix (`~/.local`), never the system one.
 
+Browse shows each app's stated download size, an "Uncategorised" entry for
+releases that list no category, and, in the details pane and the install
+confirmation, what the release says installing does (for example "adds a
+background service"), what it needs on your system, where the source is, the
+publisher's release notes and a support link. Updates shows the release notes
+and download size of the new version. All of this comes from the signed
+release event, so nothing is downloaded to show it; sizes and notes are the
+publisher's statements.
+
 Keyboard shortcuts: Ctrl+1 to Ctrl+5 switch tabs, Ctrl+F jumps to the search
 box (results update as you type, a moment after you pause), F5 or Ctrl+R
 refreshes the current tab, and Escape closes the details pane. The app
