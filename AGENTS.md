@@ -39,8 +39,9 @@ Key facts to keep in mind:
   revocations (kind 9901). Signatures and hashes prove who published which bytes,
   not that the package is safe.
 - Protocol details: `docs/package-protocol-v1.md` (wire format, tags),
-  `docs/package-event-fixtures.md`, `docs/release-key-model.md` (proposed, not
-  implemented), `docs/package-setup.md` (install inputs).
+  `docs/package-event-fixtures.md`, `docs/release-key-model.md` and
+  `docs/attestations.md` (both proposed, not implemented), `docs/package-setup.md`
+  (install inputs).
 
 ## Workspace and code map
 
