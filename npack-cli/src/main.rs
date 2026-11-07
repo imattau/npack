@@ -2119,13 +2119,32 @@ async fn check_single_update(
 }
 
 async fn connect_with_timeout(client: &Client) -> Result<()> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(NETWORK_TIMEOUT_SECS),
-        client.connect(),
-    )
-    .await
-    .context("timed out connecting to configured Nostr relays")?;
-    Ok(())
+    let wait = std::time::Duration::from_secs(NETWORK_TIMEOUT_SECS);
+    tokio::time::timeout(wait, client.connect())
+        .await
+        .context("timed out connecting to configured Nostr relays")?;
+    // `connect` only starts the connections and returns at once, so an
+    // unreachable relay does not fail here: it just answers every question
+    // with nothing, which looks like "no updates" or "no software". Wait for
+    // at least one relay to actually connect, and say so when none does.
+    if client.relays().await.is_empty() {
+        return Ok(());
+    }
+    let started = Instant::now();
+    loop {
+        let connected = client
+            .relays()
+            .await
+            .values()
+            .any(|relay| relay.status() == RelayStatus::Connected);
+        if connected {
+            return Ok(());
+        }
+        if started.elapsed() >= wait {
+            bail!("timed out connecting to configured Nostr relays");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 const KEYRING_SERVICE: &str = "npack";
@@ -15057,6 +15076,13 @@ mod tests {
         )?)
         .is_empty());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn connecting_with_no_relays_added_does_not_wait() {
+        let started = Instant::now();
+        connect_with_timeout(&Client::default()).await.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]
