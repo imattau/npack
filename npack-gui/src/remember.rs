@@ -23,6 +23,10 @@ pub struct Remembered {
     /// to the whole computer.
     #[serde(default)]
     pub scope: Option<String>,
+    /// The app version that last ran, so the first start after an update can
+    /// refresh the software list once.
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 impl Remembered {
@@ -107,6 +111,7 @@ mod tests {
             tab: Some("browse".into()),
             size: Some([1200.0, 800.0]),
             scope: Some("system".into()),
+            version: Some("0.7.0".into()),
         };
         save_to(&path, &state);
         assert_eq!(load_from(&path), state);
@@ -120,20 +125,37 @@ mod tests {
             tab: None,
             size: Some([10.0, 10.0]),
             scope: None,
+            version: None,
         };
         assert_eq!(tiny.window_size(), MIN_SIZE);
         let huge = Remembered {
             tab: None,
             size: Some([1e9, 1e9]),
             scope: None,
+            version: None,
         };
         assert_eq!(huge.window_size(), [MAX_SIZE, MAX_SIZE]);
         let nan = Remembered {
             tab: None,
             size: Some([f32::NAN, 500.0]),
             scope: None,
+            version: None,
         };
         assert_eq!(nan.window_size(), DEFAULT_SIZE);
+    }
+
+    #[test]
+    fn the_last_version_is_remembered_and_old_files_without_it_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, r#"{"tab":"browse","scope":"user"}"#).unwrap();
+        assert_eq!(load_from(&path).version, None);
+        let state = Remembered {
+            version: Some("0.7.0".into()),
+            ..Remembered::default()
+        };
+        save_to(&path, &state);
+        assert_eq!(load_from(&path).version.as_deref(), Some("0.7.0"));
     }
 
     #[test]
@@ -142,6 +164,7 @@ mod tests {
             tab: None,
             size: Some([1000.0, 700.0]),
             scope: None,
+            version: None,
         };
         assert!(!state.size_changed([1001.0, 699.0]));
         assert!(state.size_changed([1040.0, 700.0]));
