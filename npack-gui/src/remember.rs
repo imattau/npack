@@ -19,6 +19,10 @@ pub struct Remembered {
     pub tab: Option<String>,
     #[serde(default)]
     pub size: Option<[f32; 2]>,
+    /// "user" or "system": whether installs go to this person's own prefix or
+    /// to the whole computer.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 impl Remembered {
@@ -102,6 +106,7 @@ mod tests {
         let state = Remembered {
             tab: Some("browse".into()),
             size: Some([1200.0, 800.0]),
+            scope: Some("system".into()),
         };
         save_to(&path, &state);
         assert_eq!(load_from(&path), state);
@@ -114,16 +119,19 @@ mod tests {
         let tiny = Remembered {
             tab: None,
             size: Some([10.0, 10.0]),
+            scope: None,
         };
         assert_eq!(tiny.window_size(), MIN_SIZE);
         let huge = Remembered {
             tab: None,
             size: Some([1e9, 1e9]),
+            scope: None,
         };
         assert_eq!(huge.window_size(), [MAX_SIZE, MAX_SIZE]);
         let nan = Remembered {
             tab: None,
             size: Some([f32::NAN, 500.0]),
+            scope: None,
         };
         assert_eq!(nan.window_size(), DEFAULT_SIZE);
     }
@@ -133,6 +141,7 @@ mod tests {
         let state = Remembered {
             tab: None,
             size: Some([1000.0, 700.0]),
+            scope: None,
         };
         assert!(!state.size_changed([1001.0, 699.0]));
         assert!(state.size_changed([1040.0, 700.0]));
