@@ -92,6 +92,12 @@ impl UiError {
             Some("rollback_blocked") => {
                 "Couldn't switch back safely. The saved copy is missing or has changed, or something installed needs the newer version. Nothing was changed."
             }
+            Some("not_a_package") => {
+                "That file isn't an npack package. It needs to be a .npk file made with npack."
+            }
+            Some("unsupported_here") => {
+                "Installing a file isn't available for everyone yet. Switch to \"Just me\" in Settings and try again."
+            }
             Some("nip05_failed") => {
                 "Couldn't verify that name. Check the spelling, or paste the publisher's npub instead."
             }

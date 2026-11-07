@@ -5025,6 +5025,10 @@ fn daemon_error_code(message: &str) -> &'static str {
         "invalid_input"
     } else if has("not authorized") || has("cannot authorize") {
         "not_authorized"
+    } else if has("does not contain .npack/manifest.json") || has("is not a .npk file") {
+        "not_a_package"
+    } else if has("isn't available for everyone") {
+        "unsupported_here"
     } else if has("no relays configured") {
         "no_relays"
     } else if has("no blossom servers configured") {
@@ -5116,6 +5120,8 @@ fn current_uid() -> Option<u32> {
 fn polkit_action_for_method(method: &str) -> Option<&'static str> {
     match method {
         "Install" => Some("io.npack.install"),
+        // A file on this computer is installed like any other package.
+        "InstallLocal" => Some("io.npack.install"),
         "Remove" => Some("io.npack.remove"),
         "Update" => Some("io.npack.update"),
         // Switching to another stored version is a package change like an update.
@@ -5457,6 +5463,11 @@ async fn dispatch_daemon_request(
     request: DaemonRequest,
     peer: Option<&tokio::net::unix::UCred>,
 ) -> Result<serde_json::Value> {
+    // Refuse before asking anyone for an administrator password for something
+    // this service will not do.
+    if matches!(request.method.as_str(), "InspectLocal" | "InstallLocal") {
+        require_user_daemon(state)?;
+    }
     match peer {
         Some(peer) => {
             if let Some(action_id) = required_authorization(state.role, peer.uid(), &request.method)
@@ -5479,6 +5490,8 @@ async fn dispatch_daemon_request(
         "GetPackage" => daemon_get_package(&state.config(), request.params).await,
         "ListInstalled" => daemon_list_installed(&state.config(), request.params),
         "Install" => daemon_install(state, request.params).await,
+        "InspectLocal" => daemon_inspect_local(state, request.params).await,
+        "InstallLocal" => daemon_install_local(state, request.params).await,
         "Remove" => daemon_remove(&state.config(), request.params),
         "Update" => daemon_update(state, request.params).await,
         "CheckUpdates" => daemon_check_updates(&state.config(), request.params).await,
@@ -7008,6 +7021,152 @@ async fn daemon_install(
         return Ok(serde_json::json!({ "transaction_id": id }));
     }
     daemon_install_sync(&state.config(), params, None).await
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalFileParams {
+    /// Absolute path of a `.npk` on this computer.
+    path: PathBuf,
+    /// Capabilities the person approved for this install (for example
+    /// `service-manager`, for a package that adds a background service).
+    #[serde(default)]
+    allow_capability: Vec<String>,
+    #[serde(default)]
+    store: Option<PathBuf>,
+    #[serde(default, rename = "async")]
+    background: bool,
+}
+
+/// A local file is read and installed with the caller's own permissions, so it
+/// is only offered by the per-user service. The system-wide one runs as root
+/// and would read whatever path any local user names.
+fn require_user_daemon(state: &DaemonState) -> Result<()> {
+    if state.role == DaemonRole::System {
+        bail!(
+            "installing a file isn't available for everyone yet; switch to installing for just you"
+        );
+    }
+    Ok(())
+}
+
+/// Reads a `.npk` from disk and checks it is what it says it is: a package
+/// file with an embedded description, and whole (its recorded hash matches).
+/// Nothing in it is run.
+fn local_package(path: &Path) -> Result<Manifest> {
+    if !path.is_absolute() {
+        bail!("the file path must be absolute");
+    }
+    let is_npk = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("npk"));
+    if !is_npk {
+        bail!("{} is not a .npk file", path.display());
+    }
+    if !fs::metadata(path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .is_file()
+    {
+        bail!("{} is not a file", path.display());
+    }
+    let manifest = load_embedded_manifest(path)?;
+    verify_manifest(&manifest, path)?;
+    Ok(manifest)
+}
+
+/// What a person should see before installing a package from a file: who it
+/// says it is from (not verified: nothing signs a file), what it does, and
+/// whether it can be installed right now.
+fn local_preview(
+    manifest: &Manifest,
+    path: &Path,
+    store: Option<&Path>,
+) -> Result<serde_json::Value> {
+    let root = install_paths(store, true).0;
+    let blocked_by = ensure_dependencies_available(manifest, &root)
+        .err()
+        .map(|error| format!("{error:#}"));
+    let post_install: Vec<String> = manifest
+        .post_install
+        .iter()
+        .map(|action| format!("{} {}", action.action, action.path.display()))
+        .collect();
+    let needs_service = manifest
+        .post_install
+        .iter()
+        .any(|action| action.action == "register-service");
+    Ok(serde_json::json!({
+        "path": path,
+        "file_name": path.file_name().map(|name| name.to_string_lossy().into_owned()),
+        "size": fs::metadata(path)?.len(),
+        "name": manifest.name,
+        "version": manifest.version,
+        "publisher": manifest.publisher,
+        "npub": display_publisher(&manifest.publisher),
+        // A file carries no signature, so the publisher is only what the
+        // package says about itself.
+        "signed": false,
+        "sha256": manifest.sha256,
+        "format": manifest.format,
+        "compatible": (manifest.os == "any" || manifest.os == OS)
+            && (manifest.arch == "any" || manifest.arch == ARCH),
+        "dependencies": manifest.dependencies,
+        "runtime_requires": manifest.runtime_requires,
+        "post_install": post_install,
+        "required_capabilities": if needs_service {
+            vec!["service-manager"]
+        } else {
+            Vec::new()
+        },
+        "app": Some(AppListing::from_app(&manifest.app)).filter(|listing| !listing.is_empty()),
+        "blocked_by": blocked_by,
+    }))
+}
+
+/// `InspectLocal`: reads a dropped `.npk` and describes it, installing nothing.
+async fn daemon_inspect_local(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    require_user_daemon(state)?;
+    let params: LocalFileParams =
+        serde_json::from_value(params).context("invalid InspectLocal params")?;
+    tokio::task::spawn_blocking(move || {
+        let manifest = local_package(&params.path)?;
+        local_preview(&manifest, &params.path, params.store.as_deref())
+    })
+    .await?
+}
+
+fn install_local_blocking(params: &LocalFileParams, user: bool) -> Result<serde_json::Value> {
+    let manifest = local_package(&params.path)?;
+    let installed = install_with_capabilities(
+        &manifest,
+        &params.path,
+        params.store.as_deref(),
+        user,
+        &params.allow_capability,
+    )?;
+    Ok(serde_json::to_value(installed)?)
+}
+
+/// `InstallLocal`: installs a `.npk` from this computer, like `npack install
+/// ./file.npk`. With `"async": true` it returns a transaction id to poll.
+async fn daemon_install_local(
+    state: &Arc<DaemonState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    require_user_daemon(state)?;
+    let params: LocalFileParams =
+        serde_json::from_value(params).context("invalid InstallLocal params")?;
+    let user = state.config().install.user;
+    if params.background {
+        let id = state.start_transaction(move |_cancel| async move {
+            tokio::task::spawn_blocking(move || install_local_blocking(&params, user)).await?
+        });
+        return Ok(serde_json::json!({ "transaction_id": id }));
+    }
+    tokio::task::spawn_blocking(move || install_local_blocking(&params, user)).await?
 }
 
 async fn daemon_install_sync(
@@ -15118,6 +15277,158 @@ mod tests {
         };
         save_refreshed_catalogue(dir.path(), &newer)?;
         assert_eq!(load_catalogue(dir.path())?.unwrap().created_at, 3);
+        Ok(())
+    }
+
+    /// A packed `.npk` with an embedded description, for the local-file calls.
+    fn local_npk(dir: &Path, name: &str, post_install: Vec<PostInstallAction>) -> Result<PathBuf> {
+        let source = dir.join(format!("{name}-src"));
+        fs::create_dir_all(source.join(".npack"))?;
+        fs::create_dir_all(source.join("bin"))?;
+        fs::write(source.join("bin").join(name), b"#!/bin/sh\n")?;
+        let mut manifest = sample_manifest_with_app(AppMetadata {
+            summary: Some("A local package".into()),
+            ..AppMetadata::default()
+        });
+        manifest.name = name.into();
+        manifest.version = "1.0.0".into();
+        manifest.post_install = post_install;
+        fs::write(
+            source.join(".npack/manifest.json"),
+            serde_json::to_vec(&manifest)?,
+        )?;
+        let archive = dir.join(format!("{name}.npk"));
+        pack_npk(&source, &archive)?;
+        Ok(archive)
+    }
+
+    #[test]
+    fn a_dropped_package_is_described_before_anything_is_installed() -> Result<()> {
+        let dir = tempdir()?;
+        let state = user_state();
+        let store = dir.path().join("store");
+        let npk = local_npk(
+            dir.path(),
+            "hello",
+            vec![PostInstallAction {
+                action: "register-service".into(),
+                path: "lib/systemd/user/hello.service".into(),
+            }],
+        )?;
+        let preview = call_daemon(
+            &state,
+            "InspectLocal",
+            serde_json::json!({"path": npk, "store": store}),
+        )?;
+        assert_eq!(preview["name"], "hello");
+        assert_eq!(preview["version"], "1.0.0");
+        assert_eq!(preview["signed"], false, "a file carries no signature");
+        assert_eq!(preview["file_name"], "hello.npk");
+        assert_eq!(preview["app"]["summary"], "A local package");
+        assert_eq!(
+            preview["post_install"][0],
+            "register-service lib/systemd/user/hello.service"
+        );
+        assert_eq!(preview["required_capabilities"][0], "service-manager");
+        assert_eq!(preview["sha256"], hash_file(&npk)?);
+        assert!(preview["blocked_by"].is_null());
+        // Inspecting installs nothing.
+        assert!(installed_packages(Some(&store))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn bad_local_files_are_refused_with_clear_codes() -> Result<()> {
+        let dir = tempdir()?;
+        let state = user_state();
+        let inspect =
+            |path: &Path| call_daemon(&state, "InspectLocal", serde_json::json!({"path": path}));
+        // Not a .npk by name.
+        let text = dir.path().join("notes.txt");
+        fs::write(&text, "x")?;
+        let error = inspect(&text).unwrap_err();
+        assert_eq!(daemon_error_code(&error.to_string()), "not_a_package");
+        // A .npk with no embedded description.
+        let source = dir.path().join("src");
+        fs::create_dir_all(source.join("bin"))?;
+        fs::write(source.join("bin/x"), "x")?;
+        let bare = dir.path().join("bare.npk");
+        pack_npk(&source, &bare)?;
+        let error = inspect(&bare).unwrap_err();
+        assert_eq!(daemon_error_code(&error.to_string()), "not_a_package");
+        // Not even an archive.
+        let junk = dir.path().join("junk.npk");
+        fs::write(&junk, "not an archive")?;
+        assert!(inspect(&junk).is_err());
+        // Missing, relative and directory paths.
+        assert!(inspect(&dir.path().join("gone.npk")).is_err());
+        assert!(inspect(Path::new("relative.npk")).is_err());
+        let folder = dir.path().join("folder.npk");
+        fs::create_dir_all(&folder)?;
+        assert!(inspect(&folder).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_package_installs_into_the_store_and_a_service_needs_approval() -> Result<()> {
+        let dir = tempdir()?;
+        let state = user_state();
+        let store = dir.path().join("store");
+        let npk = local_npk(dir.path(), "hello", vec![])?;
+        let installed = call_daemon(
+            &state,
+            "InstallLocal",
+            serde_json::json!({"path": npk, "store": store}),
+        )?;
+        assert_eq!(installed["name"], "hello");
+        let listed = installed_packages(Some(&store))?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "hello");
+
+        // A package that adds a service is refused until it is approved.
+        let service = local_npk(
+            dir.path(),
+            "svc",
+            vec![PostInstallAction {
+                action: "register-service".into(),
+                path: "lib/systemd/user/svc.service".into(),
+            }],
+        )?;
+        let refused = call_daemon(
+            &state,
+            "InstallLocal",
+            serde_json::json!({"path": service, "store": store}),
+        );
+        assert!(refused.is_err());
+        assert_eq!(
+            installed_packages(Some(&store))?.len(),
+            1,
+            "nothing was added"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn installing_a_file_is_only_offered_by_the_per_user_service() -> Result<()> {
+        let dir = tempdir()?;
+        let system = Arc::new(DaemonState::with_config_path(
+            Config::default(),
+            DaemonRole::System,
+            None,
+        ));
+        let npk = local_npk(dir.path(), "hello", vec![])?;
+        for method in ["InspectLocal", "InstallLocal"] {
+            let error = call_daemon(&system, method, serde_json::json!({"path": npk})).unwrap_err();
+            assert_eq!(
+                daemon_error_code(&error.to_string()),
+                "unsupported_here",
+                "{method}"
+            );
+        }
+        assert_eq!(
+            polkit_action_for_method("InstallLocal"),
+            Some("io.npack.install")
+        );
         Ok(())
     }
 
