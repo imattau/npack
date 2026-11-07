@@ -905,6 +905,18 @@ different instance, change the socket path under Settings, Advanced.
 A daemon started this way (or by plain `npack daemon`) is npackd-user, so it
 installs into your own prefix (`~/.local`), never the system one.
 
+**Installing for everyone.** The app installs for you alone by default. If the
+system-wide service (`npack daemon --system`, usually `npackd-system.service`
+started by an administrator) is running, Settings gains an "Install software
+for" choice with "Everyone on this computer". Choosing it points the app at
+`/run/npackd.sock`; every install, update and removal then asks for an
+administrator password through PolicyKit, and a blue strip says so on every tab.
+The two services are separate: each has its own installed list, updates,
+catalogue, trusted publishers and relays. The choice is remembered, but the app
+never starts the system-wide service (it needs root) and falls back to "just me"
+when it stops running. The option is hidden while that service is not running.
+To set it up: `sudo systemctl enable --now npackd-system`.
+
 Browse shows each app's stated download size, an "Uncategorised" entry for
 releases that list no category, and, in the details pane and the install
 confirmation, what the release says installing does (for example "adds a
