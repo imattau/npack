@@ -538,6 +538,11 @@ enum Command {
             help = "Use this already-hosted URL for the artifact (e.g. a GitHub raw file or release asset) instead of, or in addition to, uploading it to a Blossom server; repeatable"
         )]
         artifact_urls: Vec<String>,
+        #[arg(
+            long = "icon-url",
+            help = "Use this already-hosted URL for the store icon instead of uploading it to a Blossom server; its SHA-256 is taken from the icon inside the package. Must be a direct https URL (no redirect), e.g. a raw.githubusercontent.com file at the release tag"
+        )]
+        icon_url: Option<String>,
         #[arg(long, help = "Nostr pubkey whose NIP-65 write relays should be used")]
         pubkey: Option<String>,
     },
@@ -1379,6 +1384,7 @@ async fn main() -> Result<()> {
             relays,
             servers,
             artifact_urls,
+            icon_url,
             pubkey,
         } => {
             let secret_key = resolve_secret_key(secret_key.as_deref())?;
@@ -1395,6 +1401,7 @@ async fn main() -> Result<()> {
                 &relays,
                 &servers,
                 &artifact_urls,
+                icon_url.as_deref(),
                 pubkey.or_else(|| config.identity.pubkey.clone()).as_deref(),
             )
             .await?
@@ -7998,12 +8005,30 @@ async fn publish_icon(
     archive_path: &Path,
     icon_path: &Path,
     servers: &[String],
+    icon_url: Option<&str>,
     keys: &Keys,
 ) -> Result<IconBlob> {
     let bytes = read_npk_file(archive_path, icon_path, MAX_ICON_BYTES)?;
     let mime = icon_media_type(&bytes)?;
+    if let Some(url) = icon_url {
+        return hosted_icon(url, &bytes);
+    }
     let (url, sha256) = upload_to_blossom(servers, &bytes, mime, keys, "the icon").await?;
     Ok(IconBlob { url, sha256 })
+}
+
+/// An icon the publisher already hosts at `url` (nothing is uploaded). The
+/// signed hash is of the icon inside the package, so a file at `url` that
+/// differs is rejected by every client rather than shown.
+fn hosted_icon(url: &str, bytes: &[u8]) -> Result<IconBlob> {
+    let parsed = Url::parse(url).context("--icon-url is not a valid URL")?;
+    if parsed.scheme() != "https" || !is_http_url(url) {
+        bail!("--icon-url must be an https URL");
+    }
+    Ok(IconBlob {
+        url: url.to_string(),
+        sha256: hex::encode(Sha256::digest(bytes)),
+    })
 }
 
 async fn publish_release(
@@ -8012,6 +8037,7 @@ async fn publish_release(
     relays: &[String],
     servers: &[String],
     artifact_urls: &[String],
+    icon_url: Option<&str>,
     user_pubkey: Option<&str>,
 ) -> Result<()> {
     let manifest = load_manifest(manifest_path)?;
@@ -8073,7 +8099,7 @@ async fn publish_release(
         // The icon is also published on its own so a store can show it before
         // the package is downloaded. A failure here costs the listing its
         // icon, not the release, so it warns instead of aborting.
-        match publish_icon(&artifact_path, icon_path, servers, &keys).await {
+        match publish_icon(&artifact_path, icon_path, servers, icon_url, &keys).await {
             Ok(icon) => release_manifest.app.icon_blob = Some(icon),
             Err(error) => eprintln!("warning: release published without a store icon: {error:#}"),
         }
@@ -14676,6 +14702,19 @@ mod tests {
         .into_bytes();
         response.extend_from_slice(body);
         response
+    }
+
+    #[test]
+    fn hosted_icon_signs_the_hash_of_the_packaged_icon() -> Result<()> {
+        let icon = hosted_icon("https://raw.githubusercontent.com/o/r/v1/icon.svg", PNG)?;
+        assert_eq!(
+            icon.url,
+            "https://raw.githubusercontent.com/o/r/v1/icon.svg"
+        );
+        assert_eq!(icon.sha256, hex::encode(Sha256::digest(PNG)));
+        assert!(hosted_icon("http://example.com/icon.png", PNG).is_err());
+        assert!(hosted_icon("not a url", PNG).is_err());
+        Ok(())
     }
 
     fn icon_for(base: &str, bytes: &[u8]) -> IconBlob {

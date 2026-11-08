@@ -47,6 +47,13 @@ the repository variables `NOSTR_RELAYS` and `NOSTR_BLOSSOM_SERVERS`, one URL
 per line. The tag-only publish job downloads the attested bundle and invokes
 `npack publish` with those values.
 
+Each artifact event lists the package's GitHub Release asset URL
+(`--artifact-url`) as its primary download location, and the Blossom servers as
+mirrors. Before signing, the job downloads each asset and refuses to continue
+unless it is byte-identical to the package it built. The store icon is not
+uploaded to Blossom: it is served from the tagged source on
+`raw.githubusercontent.com` (`--icon-url`), checked the same way.
+
 This first implementation uses GitHub Secrets because it is the simplest
 working deployment. The private key is available to the isolated release job
 only; it is not exposed to pull requests or printed in logs. Use a dedicated
