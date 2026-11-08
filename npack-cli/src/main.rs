@@ -533,6 +533,11 @@ enum Command {
             help = "Blossom server URL to upload the artifact to; repeatable"
         )]
         servers: Vec<String>,
+        #[arg(
+            long = "artifact-url",
+            help = "Use this already-hosted URL for the artifact (e.g. a GitHub raw file or release asset) instead of, or in addition to, uploading it to a Blossom server; repeatable"
+        )]
+        artifact_urls: Vec<String>,
         #[arg(long, help = "Nostr pubkey whose NIP-65 write relays should be used")]
         pubkey: Option<String>,
     },
@@ -1373,16 +1378,23 @@ async fn main() -> Result<()> {
             secret_key,
             relays,
             servers,
+            artifact_urls,
             pubkey,
         } => {
             let secret_key = resolve_secret_key(secret_key.as_deref())?;
             let relays = configured_relays(relays, &config)?;
-            let servers = configured_servers(servers, &config)?;
+            // Unlike install/update, publishing with no Blossom server at
+            // all is valid here as long as --artifact-url makes up for
+            // it -- configured_servers() itself always errors on empty,
+            // so its result is only used when non-fatal, same as the
+            // install-side `.unwrap_or_default()` callers.
+            let servers = configured_servers(servers, &config).unwrap_or_default();
             publish_release(
                 &manifest,
                 &secret_key,
                 &relays,
                 &servers,
+                &artifact_urls,
                 pubkey.or_else(|| config.identity.pubkey.clone()).as_deref(),
             )
             .await?
@@ -2276,18 +2288,40 @@ fn init_package(
     Ok(())
 }
 
-/// Origin (scheme + host) of an artifact URL; Blossom blobs are addressed by
-/// hash at the server root.
-fn blossom_origins(urls: &[String]) -> Vec<Url> {
-    urls.iter()
-        .filter_map(|url| {
-            let mut server_url = Url::parse(url).ok()?;
-            server_url.set_path("/");
-            server_url.set_query(None);
-            server_url.set_fragment(None);
-            Some(server_url)
-        })
-        .collect()
+/// Where to try fetching an artifact's bytes from: a specific URL, used
+/// exactly as given, or a Blossom server origin, resolved against the
+/// expected SHA-256 (BUD-01: `{origin}/{sha256}`) at fetch time.
+enum DownloadTarget {
+    Direct(Url),
+    BlossomOrigin(Url),
+}
+
+/// Candidate download targets for an artifact's URLs. Each URL is tried
+/// both ways: directly, since the protocol doc says "Its URL tags
+/// identify candidate download locations" -- not necessarily a Blossom
+/// server -- and as a Blossom origin, the pre-existing behavior. This
+/// adds no risk: `download_matching_blob` still verifies every
+/// candidate's bytes against the signed SHA-256 before accepting them,
+/// so an extra attempt that doesn't match is simply skipped. It only
+/// adds availability: a `.npk` hosted at a fixed URL (a GitHub raw file
+/// or release asset, an S3 object, a plain web server) now works the
+/// same way a Blossom-uploaded one already did, and existing
+/// Blossom-only releases are unaffected (their origin-form candidate is
+/// unchanged).
+fn artifact_download_targets(urls: &[String]) -> Vec<DownloadTarget> {
+    let mut targets = Vec::new();
+    for url in urls {
+        let Ok(direct) = Url::parse(url) else {
+            continue;
+        };
+        let mut origin = direct.clone();
+        origin.set_path("/");
+        origin.set_query(None);
+        origin.set_fragment(None);
+        targets.push(DownloadTarget::Direct(direct));
+        targets.push(DownloadTarget::BlossomOrigin(origin));
+    }
+    targets
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2366,9 +2400,9 @@ async fn unpack_command(
         );
     }
     let expected: Sha256Hash = resolved.sha256.parse()?;
-    let mut candidates = blossom_origins(&resolved.artifact_urls);
+    let mut candidates = artifact_download_targets(&resolved.artifact_urls);
     for server in configured_servers(servers, config).unwrap_or_default() {
-        candidates.push(Url::parse(&server)?);
+        candidates.push(DownloadTarget::BlossomOrigin(Url::parse(&server)?));
     }
     let bar = download_progress_bar(format!(
         "Downloading {} {}",
@@ -2677,7 +2711,7 @@ async fn fetch_blob(sha256: &str, servers: &[String], output: &Path) -> Result<(
     }
     let server_urls = servers
         .iter()
-        .map(|server| Url::parse(server))
+        .map(|server| Url::parse(server).map(DownloadTarget::BlossomOrigin))
         .collect::<Result<Vec<_>, _>>()?;
     let bar = download_progress_bar(format!("Fetching {sha256} ({} mirror(s))", servers.len()));
     let bytes = download_matching_blob(&server_urls, expected, &bar).await;
@@ -2716,13 +2750,16 @@ fn download_bar_style_indeterminate() -> ProgressStyle {
 /// (`BlossomClient`'s own redirect handling is just `reqwest`'s default
 /// `Policy::limited(10)`, which `reqwest` already follows transparently).
 async fn download_blob_with_progress(
-    server_url: &Url,
+    target: &DownloadTarget,
     sha256: Sha256Hash,
     bar: &ProgressBar,
 ) -> Result<Vec<u8>> {
-    let url = server_url
-        .join(&sha256.to_string())
-        .context("building blob URL")?;
+    let url = match target {
+        DownloadTarget::Direct(url) => url.clone(),
+        DownloadTarget::BlossomOrigin(origin) => origin
+            .join(&sha256.to_string())
+            .context("building blob URL")?,
+    };
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()
@@ -2756,12 +2793,12 @@ async fn download_blob_with_progress(
 /// flight. Mirrors that error or return the wrong hash are skipped, same as
 /// the previous `BlossomClient::get_blob`-based retry loop.
 async fn download_matching_blob(
-    candidates: &[Url],
+    candidates: &[DownloadTarget],
     expected: Sha256Hash,
     bar: &ProgressBar,
 ) -> Option<Vec<u8>> {
-    for server_url in candidates {
-        let candidate = match download_blob_with_progress(server_url, expected, bar).await {
+    for target in candidates {
+        let candidate = match download_blob_with_progress(target, expected, bar).await {
             Ok(candidate) => candidate,
             Err(_) => continue,
         };
@@ -3997,16 +4034,7 @@ fn install_remote_package<'a, 'b>(
                 );
             }
             let started = Instant::now();
-            let server_urls: Vec<Url> = urls
-                .iter()
-                .filter_map(|url| {
-                    let mut server_url = Url::parse(url).ok()?;
-                    server_url.set_path("/");
-                    server_url.set_query(None);
-                    server_url.set_fragment(None);
-                    Some(server_url)
-                })
-                .collect();
+            let server_urls = artifact_download_targets(&urls);
             let bar = download_progress_bar(download_message.clone());
             let bytes = download_matching_blob(&server_urls, expected, &bar).await;
             bar.finish_and_clear();
@@ -7983,6 +8011,7 @@ async fn publish_release(
     secret_hex: &str,
     relays: &[String],
     servers: &[String],
+    artifact_urls: &[String],
     user_pubkey: Option<&str>,
 ) -> Result<()> {
     let manifest = load_manifest(manifest_path)?;
@@ -7995,9 +8024,24 @@ async fn publish_release(
     }
     let artifact_path = artifact_path(&manifest, manifest_path);
     let bytes = fs::read(&artifact_path)?;
-    let (artifact_url, _) =
-        upload_to_blossom(servers, &bytes, "application/zstd", &keys, "the artifact").await?;
-    let artifact_event = sign_artifact_event(&manifest, &artifact_url, bytes.len(), &keys)?;
+    // `--artifact-url` lets a publisher reference a `.npk` already hosted
+    // somewhere else (a GitHub raw file or release asset, an S3 object, a
+    // plain web server), skipping the Blossom upload entirely; the two are
+    // not exclusive -- uploading to a Blossom server as well as naming
+    // direct URLs publishes a release with every location as a mirror.
+    let mut urls: Vec<String> = Vec::new();
+    if !servers.is_empty() {
+        let (artifact_url, _) =
+            upload_to_blossom(servers, &bytes, "application/zstd", &keys, "the artifact").await?;
+        urls.push(artifact_url);
+    }
+    urls.extend(artifact_urls.iter().cloned());
+    if urls.is_empty() {
+        bail!(
+            "no artifact location: pass --server to upload to a Blossom server, --artifact-url for an artifact already hosted elsewhere, or both"
+        );
+    }
+    let artifact_event = sign_artifact_event(&manifest, &urls, bytes.len(), &keys)?;
     let mut release_manifest = manifest.clone();
     release_manifest.artifact_event = Some(artifact_event.id.to_hex());
     for warning in listing_warnings(&manifest) {
@@ -8131,13 +8175,20 @@ async fn publish_announcement(
     Ok(())
 }
 
-fn sign_artifact_event(manifest: &Manifest, url: &str, size: usize, keys: &Keys) -> Result<Event> {
-    let tags = vec![
-        Tag::parse(vec!["url".to_owned(), url.to_owned()])?,
+fn sign_artifact_event(
+    manifest: &Manifest,
+    urls: &[String],
+    size: usize,
+    keys: &Keys,
+) -> Result<Event> {
+    let mut tags = vec![
         Tag::parse(vec!["m".to_owned(), "application/zstd".to_owned()])?,
         Tag::parse(vec!["x".to_owned(), manifest.sha256.to_ascii_lowercase()])?,
         Tag::parse(vec!["size".to_owned(), size.to_string()])?,
     ];
+    for url in urls {
+        tags.push(Tag::parse(vec!["url".to_owned(), url.clone()])?);
+    }
     EventBuilder::new(Kind::Custom(1063), manifest.name.clone())
         .tags(tags)
         .finalize(keys)
@@ -11268,6 +11319,92 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn artifact_download_targets_tries_each_url_directly_and_as_a_blossom_origin() {
+        let targets = artifact_download_targets(&[
+            "https://cdn.example/releases/hello-1.0.0.npk".to_string(),
+            "https://blossom.example/".to_string(),
+        ]);
+        assert_eq!(targets.len(), 4);
+        match &targets[0] {
+            DownloadTarget::Direct(url) => {
+                assert_eq!(url.as_str(), "https://cdn.example/releases/hello-1.0.0.npk")
+            }
+            DownloadTarget::BlossomOrigin(_) => panic!("expected a Direct target first"),
+        }
+        match &targets[1] {
+            DownloadTarget::BlossomOrigin(url) => assert_eq!(url.as_str(), "https://cdn.example/"),
+            DownloadTarget::Direct(_) => panic!("expected a BlossomOrigin target second"),
+        }
+        match &targets[2] {
+            DownloadTarget::Direct(url) => assert_eq!(url.as_str(), "https://blossom.example/"),
+            DownloadTarget::BlossomOrigin(_) => panic!("expected a Direct target third"),
+        }
+        match &targets[3] {
+            DownloadTarget::BlossomOrigin(url) => {
+                assert_eq!(url.as_str(), "https://blossom.example/")
+            }
+            DownloadTarget::Direct(_) => panic!("expected a BlossomOrigin target fourth"),
+        }
+    }
+
+    #[test]
+    fn artifact_download_targets_skips_an_unparseable_url_but_keeps_the_rest() {
+        let targets = artifact_download_targets(&[
+            "not a url".to_string(),
+            "https://cdn.example/a.npk".to_string(),
+        ]);
+        assert_eq!(targets.len(), 2);
+        assert!(
+            matches!(&targets[0], DownloadTarget::Direct(url) if url.as_str() == "https://cdn.example/a.npk")
+        );
+    }
+
+    #[test]
+    fn artifact_download_targets_of_no_urls_is_empty() {
+        assert!(artifact_download_targets(&[]).is_empty());
+    }
+
+    #[test]
+    fn sign_artifact_event_emits_one_url_tag_per_candidate_location() -> Result<()> {
+        let keys = Keys::parse(&"22".repeat(32))?;
+        let manifest = Manifest {
+            app: AppMetadata::default(),
+            publisher: keys.public_key().to_hex(),
+            name: "hello".into(),
+            version: "1.0.0".into(),
+            artifact: "hello.npk".into(),
+            sha256: "a".repeat(64),
+            dependencies: vec![],
+            conflicts: vec![],
+            artifact_event: None,
+            repo: None,
+            commit: None,
+            os: default_os(),
+            arch: default_arch(),
+            format: "npk".into(),
+            kind: None,
+            fork_of: None,
+            runtime_requires: vec![],
+            provides: vec![],
+            post_install: vec![],
+        };
+        let urls = vec![
+            "https://blossom.example/a".to_string(),
+            "https://raw.githubusercontent.com/owner/repo/main/hello-1.0.0.npk".to_string(),
+        ];
+        let event = sign_artifact_event(&manifest, &urls, 42, &keys)?;
+        let found: Vec<&str> = event
+            .tags
+            .iter()
+            .filter(|tag| tag.kind() == "url")
+            .filter_map(Tag::content)
+            .collect();
+        assert_eq!(found, urls.iter().map(String::as_str).collect::<Vec<_>>());
+        validate_artifact_event(&event, &keys.public_key(), &manifest.sha256)?;
+        Ok(())
+    }
+
+    #[test]
     fn hashes_and_installs_verified_artifact() -> Result<()> {
         let dir = tempdir()?;
         let artifact = dir.path().join("hello.tar.gz");
@@ -11907,7 +12044,12 @@ mod tests {
             provides: vec![],
             post_install: vec![],
         };
-        let event = sign_artifact_event(&manifest, "https://blob.example/00", 1, &keys)?;
+        let event = sign_artifact_event(
+            &manifest,
+            &["https://blob.example/00".to_string()],
+            1,
+            &keys,
+        )?;
         validate_artifact_event(&event, &keys.public_key(), &manifest.sha256)?;
         Ok(())
     }
@@ -11940,8 +12082,12 @@ mod tests {
             provides: vec![],
             post_install: vec![],
         };
-        let artifact_event =
-            sign_artifact_event(&manifest, "https://blossom.example/artifact", 42, &keys)?;
+        let artifact_event = sign_artifact_event(
+            &manifest,
+            &["https://blossom.example/artifact".to_string()],
+            42,
+            &keys,
+        )?;
         let mut release_manifest = manifest.clone();
         release_manifest.artifact_event = Some(artifact_event.id.to_hex());
         let release = sign_release_event(&release_manifest, &"11".repeat(32), 1_700_000_000)?;
@@ -11983,7 +12129,8 @@ mod tests {
     fn kind_tag_round_trips_through_release_event() -> Result<()> {
         let keys = Keys::parse(&"11".repeat(32))?;
         let manifest = recipe_manifest(&keys, Some("nix-recipe"));
-        let artifact_event = sign_artifact_event(&manifest, "https://b.example/a", 42, &keys)?;
+        let artifact_event =
+            sign_artifact_event(&manifest, &["https://b.example/a".to_string()], 42, &keys)?;
         let mut release_manifest = manifest.clone();
         release_manifest.artifact_event = Some(artifact_event.id.to_hex());
         let release = sign_release_event(&release_manifest, &"11".repeat(32), 1_700_000_000)?;
@@ -12160,7 +12307,7 @@ mod tests {
         };
         let artifact_event = sign_artifact_event(
             &manifest,
-            "https://blossom.example/artifact",
+            &["https://blossom.example/artifact".to_string()],
             42,
             &other_keys,
         )?;

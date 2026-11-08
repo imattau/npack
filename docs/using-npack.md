@@ -1179,6 +1179,25 @@ npack publish ./myapp.manifest.json \
 `npack publish` uploads the `.npk`, creates the NIP-94 artifact event, creates
 the package release event, and sends both events to the configured relays.
 
+A `.npk` already hosted somewhere else -- a GitHub raw file or release
+asset, an S3 object, a plain web server -- does not need a Blossom
+upload at all: pass its URL with `--artifact-url` instead of (or
+together with) `--server`:
+
+```bash
+npack publish ./myapp.manifest.json \
+  --relay wss://relay.example \
+  --artifact-url https://github.com/<owner>/<repo>/releases/download/v1.0.0/myapp-1.0.0.npk
+```
+
+Repeat `--artifact-url` to list more than one, and combine it with
+`--server` to also upload to Blossom; every location becomes a `url` tag
+on the artifact event, and a client tries each in turn until the
+downloaded bytes match the signed SHA-256 (`npack` has always verified
+the hash this way -- artifact URLs were only ever transport, so the
+protocol does not change). At least one of `--server`/`--artifact-url`
+is required.
+
 To revoke a published release:
 
 ```bash
