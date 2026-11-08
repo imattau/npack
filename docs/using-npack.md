@@ -1198,6 +1198,14 @@ the hash this way -- artifact URLs were only ever transport, so the
 protocol does not change). At least one of `--server`/`--artifact-url`
 is required.
 
+The store icon is uploaded to a Blossom server too unless it is already hosted:
+`--icon-url <https-url>` skips that upload and signs the URL together with the
+SHA-256 of the icon inside the package. The URL must serve the file directly,
+because clients never follow a redirect when fetching an icon (a GitHub release
+asset URL redirects; `https://raw.githubusercontent.com/<owner>/<repo>/<tag>/<path>`
+does not). A file at the URL that differs from the packaged icon is rejected by
+clients.
+
 To revoke a published release:
 
 ```bash

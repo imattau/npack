@@ -178,13 +178,34 @@ jobs:
           test -n "$manifests"
           # npack must be published before npack-gui, which depends on it.
           ordered=$(printf '%s\n' "$manifests" | grep -v 'npack-gui' ; printf '%s\n' "$manifests" | grep 'npack-gui' || true)
+          # The GitHub Release (created by the package job) is the primary
+          # download location: each artifact event lists its release asset URL,
+          # and the Blossom servers above are kept as mirrors. The store icon is
+          # served from the tagged source on raw.githubusercontent.com, which
+          # answers directly (the release download URL redirects, and clients
+          # never follow a redirect for an icon).
+          release_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          icon_source="packaging/desktop/io.npack.Gui.svg"
+          icon_url="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/${icon_source}"
           while IFS= read -r manifest; do
             [[ -z "$manifest" ]] && continue
+            artifact=$(jq -r '.artifact' "$manifest")
+            artifact_url="${release_base}/${artifact}"
+            # Never sign a URL that does not serve exactly the bytes we built.
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/check.npk" "$artifact_url"
+            cmp "$RUNNER_TEMP/check.npk" "package-output/$artifact"
+            publish_args=(--artifact-url "$artifact_url")
+            if [[ -n "$(jq -r '.app.icon // empty' "$manifest")" ]]; then
+              curl -fsSL --retry 3 -o "$RUNNER_TEMP/check-icon" "$icon_url"
+              cmp "$RUNNER_TEMP/check-icon" "$icon_source"
+              publish_args+=(--icon-url "$icon_url")
+            fi
             echo "Publishing $manifest"
             cargo run --quiet -- publish "$manifest" \
               --secret-key "$NOSTR_SECRET_KEY" \
               "${relay_args[@]}" \
-              "${server_args[@]}"
+              "${server_args[@]}" \
+              "${publish_args[@]}"
           done <<< "$ordered"
 
       - name: Confirm publication boundary
