@@ -3398,8 +3398,16 @@ async fn fetch_verified_release(
     target_os: &str,
     target_arch: &str,
 ) -> Result<Event> {
+    // Ask the relay only for the wanted publisher's releases when known: an
+    // unfiltered query returns just the newest 500 events of everything, so on
+    // a busy relay a newer release of this package can fall outside the window
+    // and be missed (update checks then report "up to date").
+    let mut filter = Filter::new().kind(Kind::Custom(RELEASE_KIND)).limit(500);
+    if let Some(author) = publisher.and_then(|publisher| PublicKey::parse(publisher).ok()) {
+        filter = filter.author(author);
+    }
     let releases = client
-        .fetch_events(Filter::new().kind(Kind::Custom(RELEASE_KIND)).limit(500))
+        .fetch_events(filter)
         .timeout(std::time::Duration::from_secs(10))
         .await?;
     let revoked = fetch_revoked_release_ids(client).await?;
