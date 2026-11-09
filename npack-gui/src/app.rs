@@ -1570,6 +1570,10 @@ impl NpackGuiApp {
                     self.status = "Software list updated.".to_owned();
                     // Show the new list (and categories) right away.
                     self.browse(false);
+                    // Updates are read from this list, so look again.
+                    if !self.updates_checking {
+                        self.refresh_updates();
+                    }
                 }
                 Event::CatalogueRefreshed(Err(_)) => {
                     self.catalogue_refreshing = false;

@@ -7537,6 +7537,27 @@ async fn check_updates_core(
             bail!("{package} is not installed");
         }
     }
+    // Read the same catalogue Browse shows, so the two never disagree. Only a
+    // person with no catalogue yet falls back to asking the relays directly.
+    let catalogue_root = params.store.clone().unwrap_or_else(default_store);
+    if let Some(catalogue) = load_catalogue(&catalogue_root)? {
+        let mut statuses = catalogue_updates(&catalogue, &installed, OS, ARCH);
+        // Best effort: fresher revocations than the catalogue holds.
+        let mut revocations = catalogue.revocations.clone();
+        let client = Client::default();
+        let mut reachable = false;
+        for relay in &relays {
+            reachable |= client.add_relay(relay).await.is_ok();
+        }
+        if reachable && connect_with_timeout(&client).await.is_ok() {
+            revocations.extend(fetch_revocation_events(&client, &installed).await);
+        }
+        client.disconnect().await;
+        for (status, package) in statuses.iter_mut().zip(&installed) {
+            status.revoked = installed_revocation_reason(package, &revocations);
+        }
+        return Ok(statuses);
+    }
     let client = Client::default();
     for relay in &relays {
         client.add_relay(relay).await?;
@@ -7593,6 +7614,58 @@ async fn check_updates_core(
         status.revoked = installed_revocation_reason(package, &revocations);
     }
     Ok(statuses)
+}
+
+/// The newest release of each installed package that the catalogue knows of:
+/// same publisher and name, valid, installable, not revoked, for this
+/// os/arch, and newer than what is installed. Pure, so it is tested directly.
+/// Trust is not applied here: the publisher is the one already installed from.
+fn catalogue_updates(
+    catalogue: &Catalogue,
+    installed: &[InstalledPackage],
+    target_os: &str,
+    target_arch: &str,
+) -> Vec<UpdateStatus> {
+    let revoked = revocation_pairs(&catalogue.revocations);
+    installed
+        .iter()
+        .map(|package| {
+            let current = Version::parse(&package.version).ok();
+            let publisher = PublicKey::parse(&package.publisher)
+                .map(|key| key.to_hex())
+                .unwrap_or_else(|_| package.publisher.clone());
+            let best = catalogue
+                .releases
+                .iter()
+                .filter(|event| event.pubkey.to_hex() == publisher)
+                .filter(|event| tag_value(event, "name") == Some(package.name.as_str()))
+                .filter(|event| matches!(tag_value(event, "kind"), None | Some("package")))
+                .filter(|event| release_matches_target(event, target_os, target_arch))
+                .filter(|event| event.verify().is_ok() && release_event_is_v1(event))
+                .filter(|event| {
+                    !revoked
+                        .iter()
+                        .any(|(who, id)| who == &event.pubkey.to_hex() && id == &event.id.to_hex())
+                })
+                .filter_map(|event| {
+                    let version = Version::parse(tag_value(event, "version")?).ok()?;
+                    Some((version, event))
+                })
+                .filter(|(version, _)| current.as_ref().is_some_and(|current| version > current))
+                .max_by_key(|(version, event)| (version.clone(), event.created_at, event.id));
+            let app = best
+                .as_ref()
+                .map(|(_, event)| app_metadata_from_event(event));
+            UpdateStatus {
+                reference: installed_package_reference(package),
+                current_version: package.version.clone(),
+                available_version: best.as_ref().map(|(version, _)| version.to_string()),
+                revoked: None,
+                release_notes: app.as_ref().and_then(|app| app.release_notes.clone()),
+                download_size: app.as_ref().and_then(|app| app.download_size),
+            }
+        })
+        .collect()
 }
 
 /// The revocation events (kind 9901) published by the authors of the
@@ -11954,6 +12027,61 @@ mod tests {
             post_install: vec![],
         };
         sign_release_event(&manifest, secret_hex, 1_700_000_000)
+    }
+
+    #[test]
+    fn catalogue_updates_find_the_newest_release_from_the_installed_publisher() -> Result<()> {
+        let secret = "11".repeat(32);
+        let publisher = Keys::parse(&secret)?.public_key().to_hex();
+        let other = "22".repeat(32);
+        let installed = |name: &str, version: &str| InstalledPackage {
+            publisher: publisher.clone(),
+            name: name.into(),
+            version: version.into(),
+            sha256: "00".repeat(32),
+            artifact: PathBuf::from("artifact"),
+            dependencies: vec![],
+            conflicts: vec![],
+            files: vec![],
+            runtime_requires: vec![],
+            provides: vec![],
+        };
+        let v2 = sample_release_event(&secret, "hello", "2.0.0")?;
+        let v3 = sample_release_event(&secret, "hello", "3.0.0")?;
+        let catalogue = Catalogue {
+            created_at: 0,
+            releases: vec![
+                sample_release_event(&secret, "hello", "1.0.0")?,
+                v2.clone(),
+                v3.clone(),
+                // Another publisher's newer package of the same name is not an update.
+                sample_release_event(&other, "hello", "9.0.0")?,
+                sample_release_event(&secret, "current", "1.0.0")?,
+            ],
+            revocations: vec![],
+        };
+        let statuses = catalogue_updates(
+            &catalogue,
+            &[installed("hello", "1.0.0"), installed("current", "1.0.0")],
+            "linux",
+            "x86_64",
+        );
+        assert_eq!(statuses[0].available_version.as_deref(), Some("3.0.0"));
+        assert_eq!(statuses[1].available_version, None);
+
+        // A revoked newest release falls back to the next one.
+        let revoked = Catalogue {
+            revocations: vec![sign_revocation_event(&v3, &secret, "bad", 1_700_000_001)?],
+            ..catalogue
+        };
+        let statuses =
+            catalogue_updates(&revoked, &[installed("hello", "1.0.0")], "linux", "x86_64");
+        assert_eq!(statuses[0].available_version.as_deref(), Some("2.0.0"));
+        // Nothing for a different platform.
+        let statuses =
+            catalogue_updates(&revoked, &[installed("hello", "1.0.0")], "macos", "aarch64");
+        assert_eq!(statuses[0].available_version, None);
+        Ok(())
     }
 
     #[test]
