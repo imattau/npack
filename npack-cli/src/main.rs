@@ -3480,24 +3480,21 @@ fn select_release(
     target_os: &str,
     target_arch: &str,
 ) -> Option<Event> {
+    // Cheap string checks first and the signature last: every filter is a pure
+    // predicate, so the order does not change the result, but verifying every
+    // event of a large catalogue before looking at its name made each call
+    // take as long as the catalogue is big.
     releases
         .into_iter()
-        .filter(|event| event.verify().is_ok())
-        .filter(release_event_is_v1)
+        .filter(|event| tag_value(event, "name") == Some(name))
+        .filter(|event| release_matches_target(event, target_os, target_arch))
+        .filter(|event| publisher.is_none_or(|publisher| event.pubkey.to_hex() == publisher))
         .filter(|event| {
             trusted_publishers.is_empty()
                 || trusted_publishers
                     .iter()
                     .any(|trusted| trusted == &event.pubkey.to_hex())
         })
-        .filter(|event| {
-            !revoked.iter().any(|(publisher, release_id)| {
-                publisher == &event.pubkey.to_hex() && release_id == &event.id.to_hex()
-            })
-        })
-        .filter(|event| tag_value(event, "name") == Some(name))
-        .filter(|event| release_matches_target(event, target_os, target_arch))
-        .filter(|event| publisher.is_none_or(|publisher| event.pubkey.to_hex() == publisher))
         .filter(|event| {
             locked_package.is_none_or(|package| {
                 event.pubkey.to_hex() == package.publisher
@@ -3514,6 +3511,12 @@ fn select_release(
                     .unwrap_or(false)
             })
         })
+        .filter(|event| {
+            !revoked.iter().any(|(publisher, release_id)| {
+                publisher == &event.pubkey.to_hex() && release_id == &event.id.to_hex()
+            })
+        })
+        .filter(|event| release_event_is_v1(event) && event.verify().is_ok())
         .max_by_key(|event| {
             (
                 tag_value(event, "version")
@@ -7092,17 +7095,25 @@ async fn daemon_get_package(
     let local = if params.live {
         None
     } else {
+        // Disk and CPU work: keep it off the async workers so other daemon
+        // requests (icons, search) are not held up while the catalogue loads.
         let catalogue_root = params.store.clone().unwrap_or_else(default_store);
-        resolve_release_locally(
-            &catalogue_root,
-            &root,
-            name,
-            publisher.as_deref(),
-            params.requirement.as_deref(),
-            &trusted_publishers,
-            os,
-            arch,
-        )
+        let (root, name, publisher) = (root.clone(), name.to_owned(), publisher.clone());
+        let (requirement, trusted) = (params.requirement.clone(), trusted_publishers.clone());
+        let (os, arch) = (os.to_owned(), arch.to_owned());
+        tokio::task::spawn_blocking(move || {
+            resolve_release_locally(
+                &catalogue_root,
+                &root,
+                &name,
+                publisher.as_deref(),
+                requirement.as_deref(),
+                &trusted,
+                &os,
+                &arch,
+            )
+        })
+        .await?
     };
     let resolved = if let Some(local) = local {
         Ok(local)
@@ -12491,6 +12502,38 @@ mod tests {
         let revocation = sign_revocation_event(&release, &secret, "bad", 1_700_000_100)?;
         save_catalogue(dir.path(), &catalogue(vec![revocation]))?;
         assert!(resolve().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn select_release_still_rejects_a_tampered_event_after_the_cheap_filters() -> Result<()> {
+        let secret = "11".repeat(32);
+        let good = sample_release_event(&secret, "hello", "1.0.0")?;
+        let newer = sample_release_event(&secret, "hello", "2.0.0")?;
+        // Same id and signature, but the content no longer matches them.
+        let mut tampered = newer.clone();
+        tampered
+            .tags
+            .push(Tag::parse(vec!["note".to_owned(), "changed".to_owned()])?);
+        let other = sample_release_event(&secret, "other", "9.0.0")?;
+        let pick = |events: Vec<Event>| {
+            select_release(
+                events,
+                &[],
+                "hello",
+                None,
+                None,
+                &[],
+                None,
+                "linux",
+                "x86_64",
+            )
+        };
+        assert_eq!(
+            pick(vec![good.clone(), tampered, other.clone()]),
+            Some(good)
+        );
+        assert_eq!(pick(vec![other]), None);
         Ok(())
     }
 
