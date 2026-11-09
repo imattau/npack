@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Builds the .npk archives and their manifests that a release publishes to
-# Nostr: `npack` and `npack-gui`. The GUI's manifest carries a full store
-# listing (summary, categories, icon, desktop entry), so the app shows up in
-# npack's own Browse view the way any other app does.
+# Nostr: `npack` and `npack-gui`. Both manifests carry a store listing (summary,
+# description, categories) so they show up in npack's own Browse view the way any
+# other app does; the GUI's also has an icon and desktop entry.
 #
 # Usage: packaging/build-npk.sh VERSION PUBLISHER BIN_DIR OUT_DIR
 #   VERSION    release version without a leading "v", e.g. 0.5.0
@@ -71,10 +71,19 @@ install -m 0755 "$BIN/npack" "$root/bin/npack"
 jq -n \
   --arg publisher "$PUBLISHER" --arg version "$VERSION" \
   --arg artifact "npack-${VERSION}-linux-x86_64.npk" \
+  --arg date "$RELEASE_DATE" \
   --argjson runtime_requires "$(needed "$BIN/npack")" \
   '{publisher:$publisher,name:"npack",version:$version,artifact:$artifact,sha256:"",
     dependencies:[],conflicts:[],os:"linux",arch:"x86_64",format:"npk",
-    runtime_requires:$runtime_requires,provides:[]}' > "$WORK/npack.json"
+    runtime_requires:$runtime_requires,provides:[],
+    app:{
+      summary:"Find, install and update software published by people you trust",
+      description:"npack installs software that publishers have signed and announced on Nostr. Every download is checked against a signed checksum before anything is installed, and nobody is trusted until you say so.",
+      homepage:"https://github.com/imattau/npack",
+      license:"MIT",
+      categories:["System","PackageManager"],
+      release_date:$date
+    }}' > "$WORK/npack.json"
 finish npack "$WORK/npack.json" "$root"
 
 # --- npack-gui ---------------------------------------------------------------
