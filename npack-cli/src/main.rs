@@ -3371,18 +3371,61 @@ fn load_cached_artifact(root: &Path, event_id: EventId) -> Result<Event> {
     Ok(event)
 }
 
+/// Events per relay request and the most pages read for one query. Relays cap
+/// how many events one request returns, so a single query only ever sees the
+/// newest slice of everything published.
+const EVENT_PAGE_SIZE: usize = 500;
+const EVENT_MAX_PAGES: usize = 40;
+
+/// Every event matching `filter`, reading older and older pages until a relay
+/// has nothing more to give (or `EVENT_MAX_PAGES`). Without this a busy relay
+/// hides older releases behind the newest few hundred events of all publishers.
+async fn fetch_events_paged(client: &Client, filter: Filter) -> Result<Vec<Event>> {
+    let mut seen = HashSet::<EventId>::new();
+    let mut events = Vec::new();
+    let mut until: Option<Timestamp> = None;
+    for _ in 0..EVENT_MAX_PAGES {
+        let mut page_filter = filter.clone().limit(EVENT_PAGE_SIZE);
+        if let Some(until) = until {
+            page_filter = page_filter.until(until);
+        }
+        let page = client
+            .fetch_events(page_filter)
+            .timeout(std::time::Duration::from_secs(10))
+            .await?;
+        let page_len = page.len();
+        let oldest = page.iter().map(|event| event.created_at).min();
+        let before = events.len();
+        for event in page {
+            if seen.insert(event.id) {
+                events.push(event);
+            }
+        }
+        // A short page means the relays are out of older events; a page with
+        // nothing new means they keep repeating the same ones.
+        if page_len < EVENT_PAGE_SIZE || events.len() == before {
+            break;
+        }
+        match oldest {
+            Some(oldest) => until = Some(oldest),
+            None => break,
+        }
+    }
+    Ok(events)
+}
+
 async fn fetch_revoked_release_ids(client: &Client) -> Result<Vec<(String, String)>> {
-    Ok(client
-        .fetch_events(Filter::new().kind(Kind::Custom(REVOCATION_KIND)).limit(500))
-        .timeout(std::time::Duration::from_secs(10))
-        .await?
-        .into_iter()
-        .filter(|event| event.verify().is_ok())
-        .filter(revocation_event_is_v1)
-        .filter_map(|event| {
-            tag_value(&event, "e").map(|release| (event.pubkey.to_hex(), release.to_owned()))
-        })
-        .collect())
+    Ok(
+        fetch_events_paged(client, Filter::new().kind(Kind::Custom(REVOCATION_KIND)))
+            .await?
+            .into_iter()
+            .filter(|event| event.verify().is_ok())
+            .filter(revocation_event_is_v1)
+            .filter_map(|event| {
+                tag_value(&event, "e").map(|release| (event.pubkey.to_hex(), release.to_owned()))
+            })
+            .collect(),
+    )
 }
 
 /// Queries relays for the highest-version, verified, non-revoked release
@@ -3402,14 +3445,11 @@ async fn fetch_verified_release(
     // unfiltered query returns just the newest 500 events of everything, so on
     // a busy relay a newer release of this package can fall outside the window
     // and be missed (update checks then report "up to date").
-    let mut filter = Filter::new().kind(Kind::Custom(RELEASE_KIND)).limit(500);
+    let mut filter = Filter::new().kind(Kind::Custom(RELEASE_KIND));
     if let Some(author) = publisher.and_then(|publisher| PublicKey::parse(publisher).ok()) {
         filter = filter.author(author);
     }
-    let releases = client
-        .fetch_events(filter)
-        .timeout(std::time::Duration::from_secs(10))
-        .await?;
+    let releases = fetch_events_paged(client, filter).await?;
     let revoked = fetch_revoked_release_ids(client).await?;
     releases
         .into_iter()
@@ -4501,7 +4541,24 @@ fn save_refreshed_catalogue(root: &Path, fresh: &Catalogue) -> Result<()> {
     {
         bail!("the relays returned no releases (are they reachable?); keeping the previous list");
     }
-    save_catalogue(root, fresh)
+    // Keep what an earlier download found: relays drop old events, and a
+    // release should not vanish from the list just because they did.
+    let mut merged = Catalogue {
+        created_at: fresh.created_at,
+        releases: fresh.releases.clone(),
+        revocations: fresh.revocations.clone(),
+    };
+    if let Ok(Some(old)) = load_catalogue(root) {
+        merge_events(&mut merged.releases, old.releases);
+        merge_events(&mut merged.revocations, old.revocations);
+    }
+    save_catalogue(root, &merged)
+}
+
+/// Appends the events of `extra` that `events` does not already hold.
+fn merge_events(events: &mut Vec<Event>, extra: Vec<Event>) {
+    let known: HashSet<EventId> = events.iter().map(|event| event.id).collect();
+    events.extend(extra.into_iter().filter(|event| !known.contains(&event.id)));
 }
 
 fn save_catalogue(root: &Path, catalogue: &Catalogue) -> Result<()> {
@@ -4532,25 +4589,21 @@ async fn fetch_catalogue_from_relays(
     }
     connect_with_timeout(&client).await?;
     add_user_relays(&client, user_pubkey).await?;
-    let filter = Filter::new().kind(Kind::Custom(RELEASE_KIND)).limit(500);
-    let events = client
-        .fetch_events(filter)
-        .timeout(std::time::Duration::from_secs(10))
+    let events = fetch_events_paged(&client, Filter::new().kind(Kind::Custom(RELEASE_KIND)))
         .await
         .context("querying Nostr relays")?;
-    let revocation_events = client
-        .fetch_events(Filter::new().kind(Kind::Custom(REVOCATION_KIND)).limit(500))
-        .timeout(std::time::Duration::from_secs(10))
-        .await?
-        .into_iter()
-        .filter(|event| event.verify().is_ok())
-        .filter(revocation_event_is_v1)
-        .collect::<Vec<_>>();
+    let revocation_events =
+        fetch_events_paged(&client, Filter::new().kind(Kind::Custom(REVOCATION_KIND)))
+            .await?
+            .into_iter()
+            .filter(|event| event.verify().is_ok())
+            .filter(revocation_event_is_v1)
+            .collect::<Vec<_>>();
     spinner.finish(&format!(" done in {:.1}s", started.elapsed().as_secs_f32()));
     client.disconnect().await;
     Ok(Catalogue {
         created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-        releases: events.into_iter().collect(),
+        releases: events,
         revocations: revocation_events,
     })
 }
@@ -15599,6 +15652,50 @@ mod tests {
         };
         save_refreshed_catalogue(dir.path(), &newer)?;
         assert_eq!(load_catalogue(dir.path())?.unwrap().created_at, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn a_refresh_keeps_releases_the_relays_no_longer_return() -> Result<()> {
+        let dir = tempdir()?;
+        let secret = "11".repeat(32);
+        let old = sample_release_event(&secret, "hello", "1.0.0")?;
+        let new = sample_release_event(&secret, "hello", "2.0.0")?;
+        save_refreshed_catalogue(
+            dir.path(),
+            &Catalogue {
+                created_at: 1,
+                releases: vec![old.clone()],
+                revocations: vec![],
+            },
+        )?;
+        // The relays now only return the newer release (and repeat nothing).
+        save_refreshed_catalogue(
+            dir.path(),
+            &Catalogue {
+                created_at: 2,
+                releases: vec![new.clone(), old.clone()],
+                revocations: vec![],
+            },
+        )?;
+        let kept = load_catalogue(dir.path())?.unwrap();
+        assert_eq!(kept.created_at, 2);
+        assert_eq!(kept.releases.len(), 2, "no duplicate of the repeated event");
+        save_refreshed_catalogue(
+            dir.path(),
+            &Catalogue {
+                created_at: 3,
+                releases: vec![new.clone()],
+                revocations: vec![],
+            },
+        )?;
+        let ids: Vec<_> = load_catalogue(dir.path())?
+            .unwrap()
+            .releases
+            .iter()
+            .map(|event| event.id)
+            .collect();
+        assert!(ids.contains(&old.id) && ids.contains(&new.id));
         Ok(())
     }
 
