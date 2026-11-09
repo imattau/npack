@@ -104,10 +104,13 @@ pub fn install(ctx: &egui::Context) {
         apply_style(&mut style);
         ctx.set_style_of(theme, style);
     }
-    // Dark-first per the design note; a future theme toggle can call
-    // `ctx.set_theme(ThemePreference::System)` to go back to following
-    // the OS.
-    ctx.set_theme(egui::ThemePreference::Dark);
+    // Both DARK and LIGHT are Evermore's own palettes (not egui's stock
+    // Visuals::dark()/light() with a tweak or two) -- "dark-first" here
+    // means dark is the primary design target, not that this GUI should
+    // override the person's own light/dark preference. Deliberately not
+    // touching ctx.set_theme: it already defaults to
+    // ThemePreference::System, so whichever theme the OS is in just
+    // gets Evermore's matching palette instead of egui's defaults.
 }
 
 fn apply_palette(visuals: &mut egui::Visuals, palette: &Palette) {
@@ -336,5 +339,32 @@ mod tests {
                 "body text on chrome must clear WCAG AA"
             );
         }
+    }
+
+    /// `install()` sets `visuals.override_text_color` globally (every
+    /// unstyled text widget reads `palette.text`, same as
+    /// `evermore-panel`'s own approach). `primary_button`'s explicit
+    /// `RichText::color(ACCENT_INK)` must still win over that override --
+    /// otherwise button text silently becomes `palette.text` (light grey)
+    /// on the light `ACCENT` fill, unreadable, and neither contrast test
+    /// above would catch it since they only check the constants, not
+    /// what a real `Style` actually resolves a `RichText`'s colour to.
+    /// This goes through egui's own public `WidgetText::into_layout_job`
+    /// rather than asserting a precedence rule by reading egui's source,
+    /// so it would fail if a future egui version ever changed that
+    /// precedence.
+    #[test]
+    fn primary_buttons_explicit_text_colour_beats_the_global_override() {
+        let mut style = egui::Style::default();
+        style.visuals.override_text_color = Some(DARK.text);
+
+        let widget_text: egui::WidgetText = egui::RichText::new("Install").color(ACCENT_INK).into();
+        let job =
+            widget_text.into_layout_job(&style, egui::FontSelection::Default, egui::Align::Center);
+
+        assert_eq!(
+            job.sections[0].format.color, ACCENT_INK,
+            "the override_text_color must not flatten an explicitly-coloured RichText"
+        );
     }
 }
