@@ -3451,6 +3451,35 @@ async fn fetch_verified_release(
     }
     let releases = fetch_events_paged(client, filter).await?;
     let revoked = fetch_revoked_release_ids(client).await?;
+    select_release(
+        releases,
+        &revoked,
+        name,
+        publisher,
+        requirement,
+        trusted_publishers,
+        locked_package,
+        target_os,
+        target_arch,
+    )
+    .with_context(|| format!("no verified release found for {name}"))
+}
+
+/// Picks the highest-version, verified, non-revoked release among `releases`
+/// that matches the name and the trust/lockfile/semver/os-arch constraints.
+/// Pure: shared by live discovery and the catalogue-first lookup.
+#[allow(clippy::too_many_arguments)]
+fn select_release(
+    releases: Vec<Event>,
+    revoked: &[(String, String)],
+    name: &str,
+    publisher: Option<&str>,
+    requirement: Option<&str>,
+    trusted_publishers: &[String],
+    locked_package: Option<&LockedPackage>,
+    target_os: &str,
+    target_arch: &str,
+) -> Option<Event> {
     releases
         .into_iter()
         .filter(|event| event.verify().is_ok())
@@ -3494,7 +3523,6 @@ async fn fetch_verified_release(
                 event.id.to_hex(),
             )
         })
-        .with_context(|| format!("no verified release found for {name}"))
 }
 
 /// Fetches and verifies the NIP-94 artifact event referenced by `release`.
@@ -3662,8 +3690,59 @@ async fn finish_resolved_release(
     cache_release(root, &release)?;
     let artifact_event = fetch_verified_artifact_event(client, &release).await?;
     cache_artifact(root, &artifact_event)?;
-    let (_, manifest) = resolved_manifest(&release, &artifact_event)?;
     let artifact_urls = collect_artifact_urls(client, &release.pubkey, &artifact_event, &[]).await;
+    build_resolved_release(&release, &artifact_event, artifact_urls, trusted_publishers)
+}
+
+/// Resolves `name` from what is already on disk: the local catalogue for the
+/// release and its revocations, and the artifact event cached by an earlier
+/// live resolve. Returns `None` (never an error) when anything is missing, so
+/// the caller falls back to the relays. Artifact URLs are only the NIP-94 `url`
+/// tags, since publisher Blossom servers need a relay query; a caller that
+/// downloads must resolve live.
+#[allow(clippy::too_many_arguments)]
+fn resolve_release_locally(
+    catalogue_root: &Path,
+    root: &Path,
+    name: &str,
+    publisher: Option<&str>,
+    requirement: Option<&str>,
+    trusted_publishers: &[String],
+    target_os: &str,
+    target_arch: &str,
+) -> Option<ResolvedRelease> {
+    let catalogue = load_catalogue(catalogue_root).ok().flatten()?;
+    let revoked = revocation_pairs(&catalogue.revocations);
+    let release = select_release(
+        catalogue.releases,
+        &revoked,
+        name,
+        publisher,
+        requirement,
+        trusted_publishers,
+        None,
+        target_os,
+        target_arch,
+    )?;
+    let artifact_id = tag_value(&release, "artifact")?.parse::<EventId>().ok()?;
+    let artifact_event = load_cached_artifact(root, artifact_id).ok()?;
+    let artifact_urls = artifact_event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind() == "url")
+        .filter_map(Tag::content)
+        .map(str::to_owned)
+        .collect();
+    build_resolved_release(&release, &artifact_event, artifact_urls, trusted_publishers).ok()
+}
+
+fn build_resolved_release(
+    release: &Event,
+    artifact_event: &Event,
+    artifact_urls: Vec<String>,
+    trusted_publishers: &[String],
+) -> Result<ResolvedRelease> {
+    let (_, manifest) = resolved_manifest(release, artifact_event)?;
     let publisher_trusted = trusted_publishers.is_empty()
         || trusted_publishers
             .iter()
@@ -3688,7 +3767,7 @@ async fn finish_resolved_release(
         release_event_id: release.id.to_hex(),
         artifact_event_id: artifact_event.id.to_hex(),
         app,
-        details: release_details(&release),
+        details: release_details(release),
         verification: VerificationResult {
             release_signature_valid: true,
             artifact_event_signature_valid: true,
@@ -6983,6 +7062,9 @@ struct GetPackageParams {
     /// carries `"trust": "unknown"` instead of the request failing.
     #[serde(default)]
     include_untrusted: bool,
+    /// Skip the local catalogue and ask the relays, as an install must.
+    #[serde(default)]
+    live: bool,
 }
 
 async fn daemon_get_package(
@@ -7005,24 +7087,46 @@ async fn daemon_get_package(
         });
     let use_user = params.user || config.install.user;
     let root = install_paths(params.store.as_deref(), use_user).0;
-    let client = Client::default();
-    for relay in &relays {
-        client.add_relay(relay).await?;
-    }
-    connect_with_timeout(&client).await?;
-    let resolved = resolve_release(
-        &client,
-        &root,
-        name,
-        publisher.as_deref(),
-        params.requirement.as_deref(),
-        &trusted_publishers,
-        None,
-        params.os.as_deref().unwrap_or(OS),
-        params.arch.as_deref().unwrap_or(ARCH),
-    )
-    .await;
-    client.disconnect().await;
+    let os = params.os.as_deref().unwrap_or(OS);
+    let arch = params.arch.as_deref().unwrap_or(ARCH);
+    let local = if params.live {
+        None
+    } else {
+        let catalogue_root = params.store.clone().unwrap_or_else(default_store);
+        resolve_release_locally(
+            &catalogue_root,
+            &root,
+            name,
+            publisher.as_deref(),
+            params.requirement.as_deref(),
+            &trusted_publishers,
+            os,
+            arch,
+        )
+    };
+    let resolved = if let Some(local) = local {
+        Ok(local)
+    } else {
+        let client = Client::default();
+        for relay in &relays {
+            client.add_relay(relay).await?;
+        }
+        connect_with_timeout(&client).await?;
+        let live = resolve_release(
+            &client,
+            &root,
+            name,
+            publisher.as_deref(),
+            params.requirement.as_deref(),
+            &trusted_publishers,
+            None,
+            os,
+            arch,
+        )
+        .await;
+        client.disconnect().await;
+        live
+    };
     let mut value = serde_json::to_value(resolved?)?;
     let status = value
         .get("publisher")
@@ -7287,6 +7391,7 @@ async fn daemon_install_sync(
             "relay": params.relay.clone(),
             "user": params.user,
             "store": params.store.clone(),
+            "live": true,
         }),
     )
     .await?;
@@ -12313,6 +12418,79 @@ mod tests {
         assert_eq!(resolved.name, "hello");
         assert_eq!(resolved.version, "1.0.0");
         assert_eq!(resolved.dependencies, manifest.dependencies);
+        Ok(())
+    }
+
+    #[test]
+    fn local_resolve_uses_catalogue_and_cached_artifact_without_relays() -> Result<()> {
+        let secret = "11".repeat(32);
+        let keys = Keys::parse(&secret)?;
+        let manifest = Manifest {
+            app: AppMetadata::default(),
+            publisher: keys.public_key().to_hex(),
+            name: "hello".into(),
+            version: "1.0.0".into(),
+            artifact: "hello.npk".into(),
+            sha256: "ab".repeat(32),
+            dependencies: vec![],
+            conflicts: vec![],
+            artifact_event: None,
+            repo: None,
+            commit: None,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            format: "npk".into(),
+            kind: None,
+            fork_of: None,
+            runtime_requires: vec![],
+            provides: vec![],
+            post_install: vec![],
+        };
+        let artifact_event = sign_artifact_event(
+            &manifest,
+            &["https://blossom.example/artifact".to_string()],
+            42,
+            &keys,
+        )?;
+        let mut release_manifest = manifest.clone();
+        release_manifest.artifact_event = Some(artifact_event.id.to_hex());
+        let release = sign_release_event(&release_manifest, &secret, 1_700_000_000)?;
+        let dir = tempfile::tempdir()?;
+        let catalogue = |revocations| Catalogue {
+            created_at: 1,
+            releases: vec![release.clone()],
+            revocations,
+        };
+        let resolve = || {
+            resolve_release_locally(
+                dir.path(),
+                dir.path(),
+                "hello",
+                None,
+                None,
+                &[],
+                "linux",
+                "x86_64",
+            )
+        };
+
+        // No catalogue, and a catalogue without the cached artifact event, both
+        // fall back to the relays.
+        assert!(resolve().is_none());
+        save_catalogue(dir.path(), &catalogue(vec![]))?;
+        assert!(resolve().is_none());
+
+        cache_artifact(dir.path(), &artifact_event)?;
+        let resolved = resolve().context("expected a local resolve")?;
+        assert_eq!(resolved.name, "hello");
+        assert_eq!(resolved.release_event_id, release.id.to_hex());
+        assert_eq!(resolved.artifact_event_id, artifact_event.id.to_hex());
+        assert_eq!(resolved.artifact_urls, ["https://blossom.example/artifact"]);
+
+        // A revoked release is never served from the catalogue.
+        let revocation = sign_revocation_event(&release, &secret, "bad", 1_700_000_100)?;
+        save_catalogue(dir.path(), &catalogue(vec![revocation]))?;
+        assert!(resolve().is_none());
         Ok(())
     }
 
