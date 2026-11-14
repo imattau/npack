@@ -12863,7 +12863,6 @@ mod tests {
             artifact_event_id: "artifact-id".into(),
             app: None,
             details: None,
-            provides: vec![],
             verification: VerificationResult {
                 release_signature_valid: true,
                 artifact_event_signature_valid: true,
@@ -12902,7 +12901,6 @@ mod tests {
             artifact_event_id: "artifact-id".into(),
             app: None,
             details: None,
-            provides: vec![],
             verification: VerificationResult {
                 release_signature_valid: true,
                 artifact_event_signature_valid: true,
@@ -14969,6 +14967,7 @@ mod tests {
             published_at: 0,
             compatible: true,
             details: None,
+            provides: vec![],
         };
         let all = vec![result("a", &["Tools"]), result("b", &[]), result("c", &[])];
         assert_eq!(uncategorised_count(&all), 2);
@@ -16290,6 +16289,7 @@ mod tests {
             published_at: 0,
             compatible: true,
             details: None,
+            provides: vec![],
         };
         let counts = category_counts(&[
             result("a", &["Tools"]),
