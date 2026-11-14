@@ -323,6 +323,10 @@ enum Command {
             help = "List packages installed in the system prefix"
         )]
         system: bool,
+        #[arg(long, help = "Only packages declaring this provided capability")]
+        provides: Option<String>,
+        #[arg(long, help = "Emit machine-readable JSON results")]
+        json: bool,
     },
     /// Check that npack is set up and working, and say how to fix what isn't.
     ///
@@ -459,6 +463,10 @@ enum Command {
         sort: Option<String>,
         #[arg(long, help = "Show at most this many results")]
         limit: Option<usize>,
+        #[arg(long, help = "Only packages declaring this provided capability")]
+        provides: Option<String>,
+        #[arg(long, help = "Emit machine-readable JSON results")]
+        json: bool,
     },
     /// List the software categories in the local catalogue, with how many
     /// packages are in each.
@@ -1177,15 +1185,30 @@ async fn main() -> Result<()> {
             store,
             user,
             system,
+            provides,
+            json,
         } => {
             let user = user || (!system && config.install.user);
-            for package in installed_packages(Some(&install_paths(store.as_deref(), user).0))? {
-                println!(
-                    "{}/{} {}",
-                    display_publisher(&package.publisher),
-                    package.name,
-                    package.version
-                );
+            let mut packages = installed_packages(Some(&install_paths(store.as_deref(), user).0))?;
+            if let Some(capability) = provides {
+                packages.retain(|package| {
+                    package
+                        .provides
+                        .iter()
+                        .any(|provided| provided == &capability)
+                });
+            }
+            if json {
+                println!("{}", serde_json::to_string(&packages)?);
+            } else {
+                for package in packages {
+                    println!(
+                        "{}/{} {}",
+                        display_publisher(&package.publisher),
+                        package.name,
+                        package.version
+                    );
+                }
             }
         }
         Command::Doctor {
@@ -1287,6 +1310,8 @@ async fn main() -> Result<()> {
             uncategorised,
             sort,
             limit,
+            provides,
+            json,
         } => {
             let relays = normalize_relays(relays, &config);
             let trusted_publishers = configured_publishers(trusted_publishers, &config)?;
@@ -1298,6 +1323,7 @@ async fn main() -> Result<()> {
                 sort: SearchSort::parse(sort.as_deref())?,
                 limit,
                 offset: 0,
+                provides,
             };
             search_releases(
                 &query,
@@ -1309,6 +1335,7 @@ async fn main() -> Result<()> {
                 kind.as_deref(),
                 &options,
                 &root,
+                json,
             )
             .await?
         }
@@ -4838,6 +4865,7 @@ struct SearchResult {
     publisher: String,
     name: String,
     version: String,
+    sha256: String,
     content: String,
     kind: Option<String>,
     fork_of: Option<ForkOf>,
@@ -4856,6 +4884,8 @@ struct SearchResult {
     /// when the release declares none.
     #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<ReleaseDetails>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    provides: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
@@ -4981,6 +5011,7 @@ async fn search_releases(
     kind: Option<&str>,
     options: &SearchOptions,
     root: &Path,
+    json_output: bool,
 ) -> Result<()> {
     let matched: Vec<SearchResult> = search_matching_releases(
         query,
@@ -4995,7 +5026,12 @@ async fn search_releases(
     .into_iter()
     .filter(|result| kind.is_none_or(|kind| result.kind.as_deref().unwrap_or("package") == kind))
     .collect();
-    for result in apply_search_options(matched, options) {
+    let results = apply_search_options(matched, options);
+    if json_output {
+        println!("{}", serde_json::to_string(&results)?);
+        return Ok(());
+    }
+    for result in results {
         let mut line = format!(
             "{} {} {}",
             result.release_event_id,
@@ -5135,6 +5171,7 @@ async fn search_matching_releases(
                 publisher: event.pubkey.to_hex(),
                 name: name.to_owned(),
                 version: version.to_owned(),
+                sha256: tag_value(&event, "x").unwrap_or_default().to_owned(),
                 content: event.content.clone(),
                 kind: tag_value(&event, "kind").map(str::to_owned),
                 fork_of: parse_fork_of(&event).ok().flatten(),
@@ -5143,6 +5180,13 @@ async fn search_matching_releases(
                 published_at: event.created_at.as_secs(),
                 compatible: release_matches_target(&event, OS, ARCH),
                 details: release_details(&event),
+                provides: event
+                    .tags
+                    .iter()
+                    .filter(|tag| tag.kind() == "provides")
+                    .filter_map(Tag::content)
+                    .map(str::to_owned)
+                    .collect(),
             });
         }
     }
@@ -6710,6 +6754,7 @@ struct SearchOptions {
     sort: SearchSort,
     limit: Option<usize>,
     offset: usize,
+    provides: Option<String>,
 }
 
 /// Narrows, orders and pages already-matched results. Pure, so the CLI and
@@ -6734,6 +6779,9 @@ fn apply_search_options(
                 .as_ref()
                 .is_none_or(|app| app.categories.is_empty())
         });
+    }
+    if let Some(capability) = options.provides.as_deref() {
+        results.retain(|result| result.provides.iter().any(|value| value == capability));
     }
     match options.sort {
         SearchSort::Catalogue => {}
@@ -6895,6 +6943,7 @@ async fn daemon_search(config: &Config, params: serde_json::Value) -> Result<ser
         sort: SearchSort::parse(params.sort.as_deref())?,
         limit: params.limit,
         offset: params.offset,
+        provides: None,
     };
     let results = apply_search_options(daemon_search_results(config, &params).await?, &options);
     let mut value = serde_json::to_value(results)?;
@@ -12814,6 +12863,7 @@ mod tests {
             artifact_event_id: "artifact-id".into(),
             app: None,
             details: None,
+            provides: vec![],
             verification: VerificationResult {
                 release_signature_valid: true,
                 artifact_event_signature_valid: true,
@@ -12852,6 +12902,7 @@ mod tests {
             artifact_event_id: "artifact-id".into(),
             app: None,
             details: None,
+            provides: vec![],
             verification: VerificationResult {
                 release_signature_valid: true,
                 artifact_event_signature_valid: true,
@@ -14907,6 +14958,7 @@ mod tests {
             publisher: "p".into(),
             name: name.into(),
             version: "1.0.0".into(),
+            sha256: String::new(),
             content: String::new(),
             kind: None,
             fork_of: None,
@@ -16227,6 +16279,7 @@ mod tests {
             publisher: "p".into(),
             name: name.into(),
             version: "1.0.0".into(),
+            sha256: String::new(),
             content: String::new(),
             kind: None,
             fork_of: None,
