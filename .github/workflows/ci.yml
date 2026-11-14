@@ -18,7 +18,7 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Install PolicyKit tooling
-        run: sudo apt-get update && sudo apt-get install -y policykit-1
+        run: sudo apt-get update && sudo apt-get install -y polkitd pkexec
       - name: Run tests
         run: cargo test --all-targets --all-features
       - name: Run Clippy
