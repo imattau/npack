@@ -4,52 +4,51 @@
 #   npack          the command line tool and the npackd service, with the man
 #                  page, systemd units and the PolicyKit policy. No graphics
 #                  libraries: it installs on servers and containers.
-#   npack-gui      the desktop app, its launcher entry, icon and AppStream
-#                  description. Depends on the matching npack.
+#   npack-gui      the desktop app (an Electron window around the npack web
+#                  store), its launcher entry, icon and AppStream description.
+#                  Depends on the matching npack.
 #   npack-desktop  an empty meta-package that pulls in both, for desktop
 #                  installers and documentation to point at.
 #
-# Usage: packaging/build-linux-packages.sh VERSION BIN_DIR OUT_DIR
+# Usage: packaging/build-linux-packages.sh VERSION BIN_DIR OUT_DIR GUI_DIR
 #   VERSION  the release version without a leading "v", e.g. 0.5.0
-#   BIN_DIR  a directory holding the built `npack` and `npack-gui` binaries
+#   BIN_DIR  a directory holding the built `npack` binary
 #   OUT_DIR  where the .deb and .rpm files are written
+#   GUI_DIR  the unpacked Electron app (npack-electron/release/linux-unpacked)
 #
 # Run it locally with debug binaries to check packaging changes before a
 # release; the release workflows call it with the release binaries.
 set -euo pipefail
 
-if [[ $# -ne 3 ]]; then
-  sed -n '2,20p' "$0" >&2
+if [[ $# -ne 4 ]]; then
+  sed -n '2,22p' "$0" >&2
   exit 2
 fi
 VERSION=$1
 BIN=$(cd "$2" && pwd)
 mkdir -p "$3"
 OUT=$(cd "$3" && pwd)
+GUI=$(cd "$4" && pwd)
 HERE=$(cd "$(dirname "$0")" && pwd)
 RPM_VERSION=${VERSION//-/_}
 RELEASE_DATE=${RELEASE_DATE:-$(date -u +%F)}
 # rpm wants "Sat Nov 07 2026" and rejects a date whose weekday is wrong.
 CHANGELOG_DATE=$(date -u -d "$RELEASE_DATE" '+%a %b %d %Y')
 
-for binary in npack npack-gui; do
-  [[ -x "$BIN/$binary" ]] || { echo "missing $BIN/$binary" >&2; exit 1; }
-done
+[[ -x "$BIN/npack" ]] || { echo "missing $BIN/npack" >&2; exit 1; }
+[[ -x "$GUI/npack-gui" ]] || { echo "missing $GUI/npack-gui (build npack-electron first)" >&2; exit 1; }
 
 WORK=$(mktemp -d)
 cleanup() { [[ -n "${WORK:-}" && -d "$WORK" ]] && rm -rf -- "$WORK"; }
 trap cleanup EXIT
 
-# Libraries the desktop app loads at run time (found by running it and
-# listing what it opened). They never show up as ordinary linker
-# dependencies, so they have to be declared by hand.
-GUI_DEB_DEPENDS="libc6, libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libegl1, libvulkan1"
-GUI_DEB_RECOMMENDS="mesa-vulkan-drivers, libgl1-mesa-dri"
-GUI_RPM_SONAMES=(
-  "libX11.so.6()(64bit)" "libX11-xcb.so.1()(64bit)" "libxcb.so.1()(64bit)"
-  "libXcursor.so.1()(64bit)" "libXi.so.6()(64bit)" "libxkbcommon.so.0()(64bit)"
-  "libxkbcommon-x11.so.0()(64bit)" "libwayland-client.so.0()(64bit)"
-  "libEGL.so.1()(64bit)" "libvulkan.so.1()(64bit)"
+# What Electron needs from the system. The app itself bundles Chromium, so
+# these are the GTK/NSS/audio libraries it loads, plus xdg-utils to open links.
+GUI_DEB_DEPENDS="libc6, libgtk-3-0t64 | libgtk-3-0, libnss3, libnotify4, libxss1, libxtst6, libatspi2.0-0t64 | libatspi2.0-0, libgbm1, libasound2t64 | libasound2, libuuid1, xdg-utils"
+GUI_DEB_RECOMMENDS="libsecret-1-0"
+GUI_RPM_REQUIRES=(
+  "gtk3" "nss" "libnotify" "libXScrnSaver" "libXtst" "at-spi2-core"
+  "mesa-libgbm" "alsa-lib" "libuuid" "xdg-utils"
 )
 
 # --- stage the files of each package under $WORK/<package>/ -----------------
@@ -77,10 +76,14 @@ stage_npack() {
 
 stage_gui() {
   local root=$WORK/npack-gui
-  install -d -m 0755 "$root/usr/bin" "$root/usr/share/applications" \
+  install -d -m 0755 "$root/usr/bin" "$root/usr/lib" "$root/usr/share/applications" \
     "$root/usr/share/icons/hicolor/scalable/apps" "$root/usr/share/metainfo"
-  install -m 0755 "$BIN/npack-gui" "$root/usr/bin/npack-gui"
-  strip_binary "$root/usr/bin/npack-gui"
+  cp -a "$GUI" "$root/usr/lib/npack-gui"
+  # Chromium's sandbox helper must be setuid root for the app to start on
+  # systems that restrict unprivileged user namespaces. The packages are built
+  # with root ownership, so the mode is what carries it.
+  chmod 4755 "$root/usr/lib/npack-gui/chrome-sandbox"
+  ln -s ../lib/npack-gui/npack-gui "$root/usr/bin/npack-gui"
   install -m 0644 "$HERE/desktop/io.npack.Gui.desktop" "$root/usr/share/applications/"
   install -m 0644 "$HERE/desktop/io.npack.Gui.svg" \
     "$root/usr/share/icons/hicolor/scalable/apps/io.npack.Gui.svg"
@@ -188,7 +191,7 @@ build_rpm npack "$WORK/npack" "A Nostr-native package manager" \
   "glibc" "ca-certificates" "recommends:libnotify"
 build_rpm npack-gui "$WORK/npack-gui" "Desktop app for the npack package manager" \
   "Browse, install and update software published by people you trust, from a desktop window." \
-  "npack = ${RPM_VERSION}" "${GUI_RPM_SONAMES[@]}" "recommends:mesa-vulkan-drivers"
+  "npack = ${RPM_VERSION}" "${GUI_RPM_REQUIRES[@]}"
 build_rpm npack-desktop "$WORK/npack-desktop" "npack with its desktop app" \
   "Installs npack and its desktop app together." \
   "npack = ${RPM_VERSION}" "npack-gui = ${RPM_VERSION}" "recommends:libnotify"

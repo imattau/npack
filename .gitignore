@@ -3,3 +3,5 @@
 .DS_Store
 .env
 *.log
+/npack-electron/node_modules/
+/npack-electron/release/

@@ -14,7 +14,9 @@ permissions:
 jobs:
   package:
     name: Build packages
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest: binaries link against the build host's glibc, and a
+    # newer runner produces packages that fail to start on older distributions.
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -22,9 +24,23 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # Builds both the command line tool and the desktop app.
-      - name: Build npack and npack-gui
+      - name: Build npack
         run: cargo build --release --locked
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: npack-electron/package-lock.json
+
+      # The desktop app is an Electron window around the web store that the npack
+      # daemon serves, so it needs no Rust build of its own.
+      - name: Build the desktop app
+        working-directory: npack-electron
+        run: |
+          npm ci
+          npm run dist
 
       - name: Determine release version
         id: release
@@ -46,14 +62,13 @@ jobs:
           VERSION: ${{ steps.release.outputs.version }}
         run: |
           built=$(target/release/npack --version | awk '{print $2}')
-          gui=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "npack-gui") | .version')
+          gui=$(jq -r .version npack-electron/package.json)
           test "$built" = "$VERSION" || {
             echo "Tag v$VERSION does not match npack $built in Cargo.toml" >&2
             exit 1
           }
           test "$gui" = "$VERSION" || {
-            echo "Tag v$VERSION does not match npack-gui $gui in Cargo.toml" >&2
+            echo "Tag v$VERSION does not match npack-gui $gui in npack-electron/package.json" >&2
             exit 1
           }
 
@@ -66,7 +81,7 @@ jobs:
             PUBLISHER="manual-test-publisher"
           fi
           mkdir -p package-output
-          packaging/build-npk.sh "$VERSION" "$PUBLISHER" target/release package-output
+          packaging/build-npk.sh "$VERSION" "$PUBLISHER" target/release package-output npack-electron/release/linux-unpacked
 
       # npack (CLI and service, no graphics libraries), npack-gui (the desktop
       # app) and npack-desktop (installs both). See packaging/build-linux-packages.sh.
@@ -76,7 +91,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y dpkg-dev rpm
-          packaging/build-linux-packages.sh "$VERSION" target/release package-output
+          packaging/build-linux-packages.sh "$VERSION" target/release package-output npack-electron/release/linux-unpacked
 
       - name: Stage the dependency lockfile for the SBOM
         run: |
@@ -158,22 +173,19 @@ jobs:
             echo "The repository must define NOSTR_RELAYS" >&2
             exit 1
           }
-          test -n "$NOSTR_BLOSSOM_SERVERS" || {
-            echo "The repository must define NOSTR_BLOSSOM_SERVERS" >&2
-            exit 1
-          }
           relay_args=()
           while IFS= read -r relay; do
             [[ -z "${relay//[[:space:]]/}" ]] && continue
             relay_args+=(--relay "$relay")
           done <<< "$NOSTR_RELAYS"
+          # Blossom servers are optional mirrors: the desktop app's package is far
+          # larger than most servers accept, and the release asset URL is enough.
           server_args=()
           while IFS= read -r server; do
             [[ -z "${server//[[:space:]]/}" ]] && continue
             server_args+=(--server "$server")
           done <<< "$NOSTR_BLOSSOM_SERVERS"
           test "${#relay_args[@]}" -gt 0
-          test "${#server_args[@]}" -gt 0
           manifests=$(find package-output -maxdepth 1 -name '*.manifest.json' | sort)
           test -n "$manifests"
           # npack must be published before npack-gui, which depends on it.

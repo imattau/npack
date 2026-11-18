@@ -1,0 +1,18 @@
+{
+  "name": "npack-gui",
+  "productName": "npack",
+  "version": "0.11.0",
+  "description": "Desktop window for the npack web store",
+  "license": "MIT",
+  "private": true,
+  "main": "main.js",
+  "author": "npack contributors",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --linux dir --x64 --publish never"
+  },
+  "devDependencies": {
+    "electron": "^39.0.0",
+    "electron-builder": "^26.0.0"
+  }
+}

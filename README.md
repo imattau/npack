@@ -45,9 +45,10 @@ See:
 
 ## Build
 
-This is a Cargo workspace: `npack-cli` (the `npack` CLI and npackd daemon)
-and `npack-gui` (a small reference GUI, see below). The commands below build
-and check both from the repo root.
+This is a Cargo workspace with one crate, `npack-cli` (the `npack` CLI and
+npackd daemon), plus `npack-web` (the React store the daemon embeds) and
+`npack-electron` (the desktop window, see below). The commands below build and
+check the Rust side from the repo root.
 
 ```bash
 cargo build --release
@@ -57,23 +58,25 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ## Desktop app
 
-`npack-gui` is a small `egui`/`eframe` desktop app: browse by category, install
-with a clear "do you trust this publisher?" step, update, switch back to the
-previous version, and a health check. It is a plain client of npackd's
-documented Unix-socket protocol -- it has no special access to `npack-cli`'s
-internals, proving `npackd` is frontend-independent. It starts the background
-service itself if it is not running.
+`npack-gui` is an Electron window around the local web store (`npack-web`): browse
+by category, install with a clear "do you trust this publisher?" step, update and
+switch back to the previous version. It starts `npack daemon --web` on a free
+loopback port, shows that page and stops the daemon when the window closes, so
+it is only a viewer; the store, trust and verification logic all stay in the
+`npack` daemon. Because it bundles its own Chromium it does not depend on the
+distribution's glibc beyond what Electron itself needs.
 
 ```bash
-cargo run --release -p npack-gui
+(cd npack-web && npm ci && npm run build)   # only after changing the web UI
+cargo build --release
+(cd npack-electron && npm ci && npm start)  # NPACK_BIN=... picks the npack binary
 ```
 
 Releases ship three Linux packages (`.deb` and `.rpm`): `npack` (command line
 and service, no graphics libraries), `npack-gui` (the app) and `npack-desktop`
 (installs both). See [Install npack](docs/using-npack.md#install-npack).
 
-There is also an optional local web store built on the Soapbox MKStack React
-and Nostrify foundations. Start it with `npack daemon --web`; see
+The same store is available in any browser: start it with `npack daemon --web`; see
 [Local web store](docs/using-npack.md#local-web-store) for its loopback-only
 security model and frontend build steps.
 

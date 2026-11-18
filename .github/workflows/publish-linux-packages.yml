@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Existing GitHub release version, without the v prefix (0.5.0 or later, which is when the desktop app was added)
+        description: Existing GitHub release version, without the v prefix (0.11.0 or later, which is when the desktop app became an Electron app)
         required: true
         default: "0.5.0"
         type: string
@@ -20,7 +20,7 @@ permissions:
 jobs:
   packages:
     name: Build and upload .deb and .rpm
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Validate version and release
         env:
@@ -39,18 +39,33 @@ jobs:
         with:
           ref: v${{ inputs.version }}
 
-      - name: Check this release has the desktop app and packaging scripts
+      - name: Check this release has the Electron desktop app and packaging scripts
         run: |
-          test -f npack-gui/Cargo.toml -a -x packaging/build-linux-packages.sh || {
-            echo "This release predates the desktop app and the shared packaging script; use 0.5.0 or later." >&2
+          test -f npack-electron/package.json -a -x packaging/build-linux-packages.sh || {
+            echo "This release predates the Electron desktop app; use 0.11.0 or later." >&2
             exit 1
           }
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build npack and npack-gui
-        run: cargo build -p npack -p npack-gui --release --locked
+      - name: Build npack
+        run: cargo build -p npack --release --locked
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: npack-electron/package-lock.json
+
+      # The desktop app is an Electron window around the web store that the npack
+      # daemon serves, so it needs no Rust build of its own.
+      - name: Build the desktop app
+        working-directory: npack-electron
+        run: |
+          npm ci
+          npm run dist
 
       - name: Build Debian and RPM packages
         env:
@@ -58,7 +73,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y dpkg-dev rpm
-          packaging/build-linux-packages.sh "$VERSION" target/release package-output
+          packaging/build-linux-packages.sh "$VERSION" target/release package-output npack-electron/release/linux-unpacked
 
       - name: Upload packages to GitHub Release
         env:

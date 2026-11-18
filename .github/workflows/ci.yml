@@ -50,6 +50,16 @@ jobs:
           appstreamcli validate --no-net /tmp/appstream-ci/ci.metainfo.xml
       - name: Install packaging tooling
         run: sudo apt-get install -y dpkg-dev rpm desktop-file-utils
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: npack-electron/package-lock.json
+      - name: Build the desktop app
+        working-directory: npack-electron
+        run: |
+          npm ci
+          npm run dist
       - name: Validate the desktop app's launcher and AppStream files
         run: |
           desktop-file-validate packaging/desktop/io.npack.Gui.desktop
@@ -59,11 +69,11 @@ jobs:
       - name: Packaging smoke test
         run: |
           cargo build --locked
-          packaging/build-npk.sh 0.0.0 manual-test-publisher target/debug /tmp/npk-ci
+          packaging/build-npk.sh 0.0.0 manual-test-publisher target/debug /tmp/npk-ci npack-electron/release/linux-unpacked
           for manifest in /tmp/npk-ci/*.manifest.json; do
             cargo run --quiet -- verify "$manifest"
           done
-          packaging/build-linux-packages.sh 0.0.0 target/debug /tmp/pkgs-ci
+          packaging/build-linux-packages.sh 0.0.0 target/debug /tmp/pkgs-ci npack-electron/release/linux-unpacked
       - name: Release version check
         run: |
           current=$(awk -F'"' '/^version *=/ { print $2; exit }' npack-cli/Cargo.toml)

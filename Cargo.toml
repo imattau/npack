@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["npack-cli", "npack-gui"]
+members = ["npack-cli"]
 
 [workspace.package]
 edition = "2024"

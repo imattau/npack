@@ -1,0 +1,16 @@
+# Only the unpacked app directory is built here: packaging/build-linux-packages.sh
+# and packaging/build-npk.sh wrap it into the .deb, .rpm and .npk packages.
+appId: io.npack.Gui
+productName: npack
+executableName: npack-gui
+directories:
+  output: release
+files:
+  - main.js
+  - package.json
+asar: true
+compression: normal
+npmRebuild: false
+linux:
+  target: dir
+electronLanguages: en-US

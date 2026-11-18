@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Checks that VERSION is a stable semantic version (no leading "v") and that
-# both crates' Cargo.toml files are at exactly that version.
+# npack-cli/Cargo.toml and npack-electron/package.json are at exactly that version.
 #
 # Usage: packaging/check-release-version.sh VERSION
 #
@@ -21,11 +21,14 @@ ROOT=$(dirname "$HERE")
 }
 
 status=0
-for crate in npack-cli npack-gui; do
-  found=$(awk -F'"' '/^version *=/ { print $2; exit }' "$ROOT/$crate/Cargo.toml")
-  if [[ "$found" != "$VERSION" ]]; then
-    echo "$crate/Cargo.toml is at version '$found', not '$VERSION'" >&2
-    status=1
-  fi
-done
+found=$(awk -F'"' '/^version *=/ { print $2; exit }' "$ROOT/npack-cli/Cargo.toml")
+if [[ "$found" != "$VERSION" ]]; then
+  echo "npack-cli/Cargo.toml is at version '$found', not '$VERSION'" >&2
+  status=1
+fi
+found=$(awk -F'"' '/^ *"version":/ { print $4; exit }' "$ROOT/npack-electron/package.json")
+if [[ "$found" != "$VERSION" ]]; then
+  echo "npack-electron/package.json is at version '$found', not '$VERSION'" >&2
+  status=1
+fi
 exit $status

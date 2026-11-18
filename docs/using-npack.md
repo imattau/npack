@@ -19,7 +19,7 @@ npack itself can install). There are three:
 | Package | What it is |
 | --- | --- |
 | `npack` | The command line tool, the `npackd` service, the man page, the systemd units and the PolicyKit policy. No graphics libraries, so it installs on servers and containers. |
-| `npack-gui` | The desktop app, with its launcher entry, icon and AppStream description. Needs the matching `npack`. |
+| `npack-gui` | The desktop app (an Electron window around the local web store), with its launcher entry, icon and AppStream description. Needs the matching `npack`. |
 | `npack-desktop` | An empty package that installs the other two. This is the one to pick for a desktop. |
 
 ```bash
@@ -946,72 +946,27 @@ PolicyKit agent their session runs) the first time they ask npackd-system to
 install, remove, or update something. `GetTransaction`, `CancelTransaction`,
 and the read-only methods are never gated.
 
-### Reference GUI
+### Desktop app
 
-`npack-gui` (its own crate in this workspace) is a small `egui`/`eframe`
-desktop app that exercises this API -- Search, Details, Install, Installed,
-Updates, Remove -- purely as a client of the protocol documented above, with
-no dependency on `npack-cli`'s internals:
+`npack-gui` (`npack-electron/` in this repository) is an Electron window around
+the [local web store](#local-web-store). It runs `npack daemon --web --web-port 0`
+with its own socket (`$XDG_RUNTIME_DIR/npackd-gui-<pid>.sock`), waits for the
+launch URL the daemon prints, loads it in a sandboxed window and stops the daemon
+when the window closes. Links to other sites open in your browser; the window
+never navigates away from the store.
 
-```bash
-cargo run --release -p npack-gui
-```
+It finds `npack` through `NPACK_BIN`, then next to a user-local install
+(`<prefix>/bin/npack`), `/usr/bin`, `/usr/local/bin`, `~/.local/bin` and `PATH`.
 
-If nothing is listening on the socket, the app starts `npack daemon` for you
-(found next to the app's own executable, otherwise on `PATH`) in its own
-process group, so closing the window does not stop it. It only ever does this
-when nothing is listening: `npack daemon` replaces an existing socket, so a
-second one would orphan the first. If it cannot start the service it says so and
-offers "Try again".
+Because the store is served by the per-user daemon, the app installs into your
+own prefix (`~/.local`); the system-wide service is not reachable from it (HTTP
+requests carry no Unix peer credentials for PolicyKit). Use `npack install` with
+`sudo` for system-wide installs.
 
-It reads and writes `$XDG_RUNTIME_DIR/npackd.sock` by default. To talk to a
-different instance, change the socket path under Settings, Advanced.
-
-A daemon started this way (or by plain `npack daemon`) is npackd-user, so it
-installs into your own prefix (`~/.local`), never the system one.
-
-**Installing for everyone.** The app installs for you alone by default. If the
-system-wide service (`npack daemon --system`, usually `npackd-system.service`
-started by an administrator) is running, Settings gains an "Install software
-for" choice with "Everyone on this computer". Choosing it points the app at
-`/run/npackd.sock`; every install, update and removal then asks for an
-administrator password through PolicyKit, and a blue strip says so on every tab.
-The two services are separate: each has its own installed list, updates,
-catalogue, trusted publishers and relays. The choice is remembered, but the app
-never starts the system-wide service (it needs root) and falls back to "just me"
-when it stops running. The option is hidden while that service is not running.
-To set it up: `sudo systemctl enable --now npackd-system`.
-
-Browse shows each app's stated download size, an "Uncategorised" entry for
-releases that list no category, and, in the details pane and the install
-confirmation, what the release says installing does (for example "adds a
-background service"), what it needs on your system, where the source is, the
-publisher's release notes and a support link. Updates shows the release notes
-and download size of the new version. All of this comes from the signed
-release event, so nothing is downloaded to show it; sizes and notes are the
-publisher's statements.
-
-The software list (the catalogue) is kept up to date quietly: when the app
-starts and the list is more than 6 hours old, or the first time it starts after
-the app itself was updated, it downloads a fresh one in the background. The old
-list stays on screen until the new one is in, "Software list updated 3 hours
-ago" under the Browse heading says how fresh it is, and if the download fails
-(offline, relays down) the old list is kept and a note says so, with no error
-banner. A window left open looks again every 30 minutes. "Refresh catalogue"
-still refreshes on demand. `npack search` reads the same saved list and says how
-old it is, and suggests `npack refresh` once it is more than 6 hours old.
-
-Keyboard shortcuts: Ctrl+1 to Ctrl+5 switch tabs, Ctrl+F jumps to the search
-box (results update as you type, a moment after you pause), F5 or Ctrl+R
-refreshes the current tab, and Escape closes the details pane. The app
-follows the system light or dark setting and remembers the last tab and the
-window size in `~/.config/npack/gui-state.json`; delete that file to reset
-them.
-
-Text from publishers is shown with system fonts as fallbacks (Noto Sans, Noto
-CJK, DejaVu Sans, when installed), so other scripts display instead of empty
-boxes. egui does not do right-to-left layout yet, so Hebrew and Arabic text
-appears in the wrong order.
+The `.deb` and `.rpm` packages install the app under `/usr/lib/npack-gui` with
+Chromium's sandbox helper setuid root. A user-local `.npk` install cannot do
+that, so its launcher (`bin/npack-gui`) adds `--no-sandbox` only when the system
+forbids unprivileged user namespaces (for example Ubuntu 24.04's default).
 
 ### Local web store
 
