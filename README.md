@@ -72,6 +72,11 @@ Releases ship three Linux packages (`.deb` and `.rpm`): `npack` (command line
 and service, no graphics libraries), `npack-gui` (the app) and `npack-desktop`
 (installs both). See [Install npack](docs/using-npack.md#install-npack).
 
+There is also an optional local web store built on the Soapbox MKStack React
+and Nostrify foundations. Start it with `npack daemon --web`; see
+[Local web store](docs/using-npack.md#local-web-store) for its loopback-only
+security model and frontend build steps.
+
 ## Bootstrap installation
 
 The first `npack` package is `npack` itself. A bootstrap binary can be built

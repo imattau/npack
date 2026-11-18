@@ -884,13 +884,12 @@ enum Command {
         output: Option<PathBuf>,
     },
     /// Run npackd, a local JSON-RPC service over a Unix socket that exposes
-    /// Search/GetPackage/ListInstalled/Install/Remove/Update/CheckUpdates to
-    /// the CLI, GUI store plugins, and other tools without them needing to
-    /// understand Nostr, Blossom, or .npk internals.
+    /// package discovery and lifecycle operations. With --web, also serve the
+    /// local browser store from an authenticated loopback HTTP listener.
     Daemon {
         #[arg(
             long,
-            help = "Unix socket path to listen on; defaults to $XDG_RUNTIME_DIR/npackd.sock, or /run/npackd.sock with --system"
+            help = "Unix socket path to listen on; defaults to $XDG_RUNTIME_DIR/npackd.sock (npackd-web.sock with --web), or /run/npackd.sock with --system"
         )]
         socket: Option<PathBuf>,
         #[arg(
@@ -898,6 +897,10 @@ enum Command {
             help = "Run as npackd-system: must run as root, binds a world-connectable socket, and requires PolicyKit authorization from non-root peers for Install/Remove/Update"
         )]
         system: bool,
+        #[arg(long, help = "Serve the local npack web store over loopback (user daemon only)")]
+        web: bool,
+        #[arg(long, default_value_t = 8765, help = "Loopback web-store port (0 chooses a free port)")]
+        web_port: u16,
     },
 }
 
@@ -1667,7 +1670,7 @@ async fn main() -> Result<()> {
         Command::Manifest { artifact, output } => write_manifest(&artifact, &output)?,
         Command::Appstream { artifact, output } => appstream_command(&artifact, output.as_deref())?,
         Command::Trust { action } => trust_command(action, &config).await?,
-        Command::Daemon { socket, system } => {
+        Command::Daemon { socket, system, web, web_port } => {
             let role = if system {
                 if current_uid() != Some(0) {
                     bail!("`npack daemon --system` must run as root");
@@ -1676,7 +1679,7 @@ async fn main() -> Result<()> {
             } else {
                 DaemonRole::User
             };
-            run_daemon(socket, config, role).await?
+            run_daemon(socket, config, role, web, web_port).await?
         }
     }
     Ok(())
@@ -5497,6 +5500,18 @@ struct DaemonState {
     role: DaemonRole,
     transactions: std::sync::Mutex<HashMap<u64, TransactionEntry>>,
     next_transaction_id: AtomicU64,
+    web_uploads: std::sync::Mutex<HashMap<String, PathBuf>>,
+    web_uploads_in_use: std::sync::Mutex<HashSet<String>>,
+}
+
+impl Drop for DaemonState {
+    fn drop(&mut self) {
+        if let Ok(uploads) = self.web_uploads.get_mut() {
+            for path in uploads.values() {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
 }
 
 impl DaemonState {
@@ -5517,6 +5532,8 @@ impl DaemonState {
             role,
             transactions: std::sync::Mutex::new(HashMap::new()),
             next_transaction_id: AtomicU64::new(1),
+            web_uploads: std::sync::Mutex::new(HashMap::new()),
+            web_uploads_in_use: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -5613,10 +5630,46 @@ fn is_cancellation_error(error: &anyhow::Error) -> bool {
     )
 }
 
-async fn run_daemon(socket: Option<PathBuf>, config: Config, role: DaemonRole) -> Result<()> {
-    let socket_path = daemon_socket_path(socket, role);
+async fn run_daemon(
+    socket: Option<PathBuf>,
+    config: Config,
+    role: DaemonRole,
+    web: bool,
+    web_port: u16,
+) -> Result<()> {
+    if web && role == DaemonRole::System {
+        bail!("the web store is available only from the per-user daemon");
+    }
+    let web_listener = if web {
+        Some(
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from((
+                std::net::Ipv4Addr::LOCALHOST,
+                web_port,
+            )))
+            .await
+            .with_context(|| format!("binding web store to 127.0.0.1:{web_port}"))?,
+        )
+    } else {
+        None
+    };
+    // Keep a web-enabled instance beside (rather than replacing) the normal
+    // user daemon. Both instances use the same package store and its existing
+    // transaction lock, so the web endpoint can run alongside the desktop GUI.
+    let socket_path = if web && role == DaemonRole::User && socket.is_none() {
+        dirs::runtime_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("npackd-web.sock")
+    } else {
+        daemon_socket_path(socket, role)
+    };
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if web
+        && socket_path.exists()
+        && tokio::net::UnixStream::connect(&socket_path).await.is_ok()
+    {
+        bail!("a web-enabled npackd is already listening at {}", socket_path.display());
     }
     if socket_path.exists() {
         fs::remove_file(&socket_path)
@@ -5633,6 +5686,29 @@ async fn run_daemon(socket: Option<PathBuf>, config: Config, role: DaemonRole) -
     }
     eprintln!("npackd listening on {}", socket_path.display());
     let state = Arc::new(DaemonState::new(config, role));
+    if let Some(listener) = web_listener {
+        let address = listener.local_addr()?;
+        let token = Keys::generate().secret_key().to_secret_hex();
+        eprintln!("npack web store: http://{address}/#token={token}");
+        let web_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, peer)) if peer.ip().is_loopback() => {
+                        let state = web_state.clone();
+                        let token = token.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = handle_web_connection(stream, address, &token, &state).await {
+                                eprintln!("npack web request error: {error:#}");
+                            }
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("npack web listener error: {error}"),
+                }
+            }
+        });
+    }
     loop {
         let (stream, _) = listener.accept().await?;
         let peer = stream.peer_cred().ok();
@@ -5643,6 +5719,281 @@ async fn run_daemon(socket: Option<PathBuf>, config: Config, role: DaemonRole) -
             }
         });
     }
+}
+
+/// Serves the bundled MkStack UI and a same-origin, authenticated bridge to
+/// the user daemon. The loopback listener is intentionally unavailable from
+/// the system daemon because HTTP requests do not carry Unix peer credentials
+/// for PolicyKit authorization.
+async fn handle_web_connection(
+    stream: tokio::net::TcpStream,
+    address: std::net::SocketAddr,
+    token: &str,
+    state: &Arc<DaemonState>,
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+    let mut reader = tokio::io::BufReader::new(stream);
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).await? == 0 {
+        return Ok(());
+    }
+    if request_line.len() > 8 * 1024 {
+        bail!("HTTP request line is too large");
+    }
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_owned();
+    let path = parts.next().unwrap_or_default().split('?').next().unwrap_or_default().to_owned();
+    if parts.next() != Some("HTTP/1.1") || parts.next().is_some() || method.is_empty() || path.is_empty() {
+        bail!("invalid HTTP request line");
+    }
+    let mut headers = HashMap::new();
+    let mut header_bytes = request_line.len();
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line).await?;
+        if read == 0 {
+            bail!("incomplete HTTP headers");
+        }
+        header_bytes += read;
+        if header_bytes > 32 * 1024 {
+            bail!("HTTP headers are too large");
+        }
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            bail!("invalid HTTP header");
+        };
+        if headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned()).is_some() {
+            bail!("duplicate HTTP header");
+        }
+    }
+    if headers.contains_key("transfer-encoding") {
+        bail!("chunked HTTP requests are not supported");
+    }
+    let host = format!("{address}");
+    if headers.get("host").map(String::as_str) != Some(host.as_str()) {
+        return write_web_response(reader.into_inner(), 403, "text/plain; charset=utf-8", b"Invalid host").await;
+    }
+    if let Some(origin) = headers.get("origin")
+        && origin != &format!("http://{host}")
+    {
+        return write_web_response(reader.into_inner(), 403, "text/plain; charset=utf-8", b"Invalid origin").await;
+    }
+    if path.starts_with("/api/") {
+        if method != "POST" {
+            return write_web_response(reader.into_inner(), 405, "application/json", b"{\"error\":\"POST required\"}").await;
+        }
+        let expected = format!("Bearer {token}");
+        if headers.get("authorization") != Some(&expected) {
+            return write_web_response(reader.into_inner(), 401, "application/json", b"{\"error\":\"A valid local session token is required.\"}").await;
+        }
+    }
+    let upload_route = path == "/api/local/inspect";
+    let max_body = if upload_route { 256 * 1024 * 1024 } else { 4 * 1024 * 1024 };
+    let body_length = headers
+        .get("content-length")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .context("invalid Content-Length")?
+        .unwrap_or(0);
+    if body_length > max_body {
+        return write_web_response(reader.into_inner(), 413, "application/json", b"{\"error\":\"Request body is too large.\"}").await;
+    }
+    let mut body = vec![0; body_length];
+    reader.read_exact(&mut body).await?;
+    let mut stream = reader.into_inner();
+
+    if method == "GET" && path == "/" {
+        let html = include_str!("../../npack-web/dist/index.html");
+        return write_web_response(stream, 200, "text/html; charset=utf-8", html.as_bytes()).await;
+    }
+    if method == "GET" && path == "/assets/app.js" {
+        return write_web_response(stream, 200, "text/javascript; charset=utf-8", include_bytes!("../../npack-web/dist/assets/app.js")).await;
+    }
+    if method == "GET" && path == "/assets/app.css" {
+        return write_web_response(stream, 200, "text/css; charset=utf-8", include_bytes!("../../npack-web/dist/assets/app.css")).await;
+    }
+    if method == "GET" && path == "/favicon.ico" {
+        return write_web_response(stream, 204, "image/x-icon", b"").await;
+    }
+    if !path.starts_with("/api/") {
+        return write_web_response(stream, 404, "text/plain; charset=utf-8", b"Not found").await;
+    }
+    if upload_route {
+        if body.is_empty() {
+            return write_web_response(stream, 400, "application/json", b"{\"error\":\"The .npk file is empty.\"}").await;
+        }
+        let filename = headers.get("x-npack-filename").map(String::as_str).unwrap_or("package.npk");
+        if !filename.to_ascii_lowercase().ends_with(".npk") {
+            return write_web_response(stream, 400, "application/json", b"{\"error\":\"Choose a .npk package file.\"}").await;
+        }
+        let upload_id = Keys::generate().secret_key().to_secret_hex();
+        let file_path = std::env::temp_dir().join(format!(
+            "npack-web-upload-{}-{upload_id}.npk",
+            std::process::id()
+        ));
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&file_path)
+            .await?;
+        if let Err(error) = file.write_all(&body).await {
+            drop(file);
+            let _ = tokio::fs::remove_file(&file_path).await;
+            return Err(error.into());
+        }
+        if let Err(error) = file.flush().await {
+            drop(file);
+            let _ = tokio::fs::remove_file(&file_path).await;
+            return Err(error.into());
+        }
+        drop(file);
+        let result = dispatch_daemon_request(state, DaemonRequest {
+            id: 1,
+            method: "InspectLocal".to_owned(),
+            params: serde_json::json!({"path": file_path.clone()}),
+        }, None).await;
+        match result {
+            Ok(mut preview) => {
+                if let Some(object) = preview.as_object_mut() {
+                    object.remove("path");
+                    object.insert("upload_id".into(), upload_id.clone().into());
+                    object.insert("file_name".into(), filename.into());
+                }
+                state.web_uploads.lock().unwrap().insert(upload_id, file_path);
+                let json = serde_json::to_vec(&serde_json::json!({"preview": preview}))?;
+                return write_web_response(stream, 200, "application/json", &json).await;
+            }
+            Err(error) => {
+                let _ = tokio::fs::remove_file(file_path).await;
+                let json = serde_json::to_vec(&serde_json::json!({"error": format!("{error:#}")}))?;
+                return write_web_response(stream, 400, "application/json", &json).await;
+            }
+        }
+    }
+    if path == "/api/local/discard" {
+        let request: serde_json::Value = serde_json::from_slice(&body).context("invalid upload-discard request")?;
+        let upload_id = request.get("upload_id").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let already_installing = state.web_uploads_in_use.lock().unwrap().contains(upload_id);
+        if already_installing {
+            return write_web_response(stream, 409, "application/json", b"{\"error\":\"This upload is already being installed.\"}").await;
+        }
+        let file_path = state.web_uploads.lock().unwrap().remove(upload_id);
+        if let Some(file_path) = file_path {
+            let _ = tokio::fs::remove_file(file_path).await;
+        }
+        return write_web_response(stream, 200, "application/json", b"{\"discarded\":true}").await;
+    }
+    if path == "/api/local/install" {
+        let request: serde_json::Value = serde_json::from_slice(&body).context("invalid upload-install request")?;
+        let upload_id = request.get("upload_id").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let reserved = state.web_uploads_in_use.lock().unwrap().insert(upload_id.to_owned());
+        if !reserved {
+            return write_web_response(stream, 409, "application/json", b"{\"error\":\"This upload is already being installed.\"}").await;
+        }
+        let file_path = state.web_uploads.lock().unwrap().get(upload_id).cloned();
+        let Some(file_path) = file_path else {
+            state.web_uploads_in_use.lock().unwrap().remove(upload_id);
+            return write_web_response(stream, 404, "application/json", b"{\"error\":\"This upload has expired. Select the file again.\"}").await;
+        };
+        let capabilities = request.get("allow_capability").cloned().unwrap_or_else(|| serde_json::json!([]));
+        let result = dispatch_daemon_request(state, DaemonRequest {
+            id: 1,
+            method: "InstallLocal".to_owned(),
+            params: serde_json::json!({"path": file_path, "allow_capability": capabilities, "async": true}),
+        }, None).await;
+        let json = match result {
+            Ok(value) => {
+                if let Some(transaction_id) = value.get("transaction_id").and_then(serde_json::Value::as_u64) {
+                    let state = state.clone();
+                    let upload_id = upload_id.to_owned();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            let status = dispatch_daemon_request(&state, DaemonRequest {
+                                id: 1,
+                                method: "GetTransaction".to_owned(),
+                                params: serde_json::json!({"transaction_id": transaction_id}),
+                            }, None).await;
+                            let status = status.ok().and_then(|value| {
+                                value.get("status").and_then(serde_json::Value::as_str).map(str::to_owned)
+                            });
+                            if status.as_deref().is_some_and(|status| status != "running") {
+                                if let Ok(mut in_use) = state.web_uploads_in_use.lock() {
+                                    in_use.remove(&upload_id);
+                                }
+                                if matches!(status.as_deref(), Some("succeeded" | "cancelled")) {
+                                    let path = state
+                                        .web_uploads
+                                        .lock()
+                                        .ok()
+                                        .and_then(|mut uploads| uploads.remove(&upload_id));
+                                    if let Some(path) = path {
+                                        let _ = tokio::fs::remove_file(path).await;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    });
+                } else if let Ok(mut in_use) = state.web_uploads_in_use.lock() {
+                    in_use.remove(upload_id);
+                }
+                serde_json::to_vec(&serde_json::json!({"result": value}))?
+            }
+            Err(error) => {
+                state.web_uploads_in_use.lock().unwrap().remove(upload_id);
+                serde_json::to_vec(&serde_json::json!({"error": format!("{error:#}")}))?
+            }
+        };
+        return write_web_response(stream, 200, "application/json", &json).await;
+    }
+
+    let request: DaemonRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            let json = serde_json::to_vec(&serde_json::json!({"error": format!("invalid request: {error}")}))?;
+            return write_web_response(stream, 400, "application/json", &json).await;
+        }
+    };
+    if matches!(request.method.as_str(), "InspectLocal" | "InstallLocal") {
+        return write_web_response(stream, 403, "application/json", b"{\"error\":\"Use the local package upload flow.\"}").await;
+    }
+    let id = request.id;
+    let response = match dispatch_daemon_request(state, request, None).await {
+        Ok(result) => DaemonResponse { id, result: Some(result), error: None, error_code: None },
+        Err(error) => {
+            let message = format!("{error:#}");
+            DaemonResponse { id, result: None, error_code: Some(daemon_error_code(&message)), error: Some(message) }
+        }
+    };
+    let json = serde_json::to_vec(&response)?;
+    write_web_response(stream, 200, "application/json", &json).await
+}
+
+async fn write_web_response(
+    mut stream: tokio::net::TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let status_text = match status {
+        200 => "OK", 204 => "No Content", 400 => "Bad Request", 401 => "Unauthorized",
+        403 => "Forbidden", 404 => "Not Found", 405 => "Method Not Allowed", 413 => "Payload Too Large",
+        _ => "Internal Server Error",
+    };
+    let header = format!(
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n",
+        body.len(),
+    );
+    stream.write_all(header.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.shutdown().await?;
+    Ok(())
 }
 
 async fn handle_daemon_connection(

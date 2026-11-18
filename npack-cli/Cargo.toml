@@ -1,6 +1,6 @@
 [package]
 name = "npack"
-version = "0.9.5"
+version = "0.10.0"
 edition.workspace = true
 description = "A Nostr-native package manager"
 license.workspace = true
@@ -26,7 +26,7 @@ nostr-sdk = "0.45.2"
 semver = "1"
 tar = "0.4"
 toml = "0.8"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "process", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "process", "signal", "fs"] }
 zstd = "0.13"
 indicatif = "0.17"
 reqwest = { version = "0.12", features = ["stream"] }

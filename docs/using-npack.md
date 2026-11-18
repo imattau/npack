@@ -1013,6 +1013,35 @@ CJK, DejaVu Sans, when installed), so other scripts display instead of empty
 boxes. egui does not do right-to-left layout yet, so Hebrew and Arabic text
 appears in the wrong order.
 
+### Local web store
+
+The MkStack-based web store offers catalogue search, package details, installs,
+local `.npk` review, installed software, updates, health checks, and relay /
+Blossom preferences. Start it from the per-user daemon:
+
+```bash
+npack daemon --web
+```
+
+Open the loopback URL printed by the daemon (port 8765 by default; choose a
+different port with `--web-port`). The browser UI uses Nostrify to discover
+release events and npackd for package search and all trust, verification, and
+installation decisions. Local `.npk` uploads are inspected by npackd before
+the review prompt and are removed from temporary storage after install or
+daemon shutdown.
+
+The web-enabled daemon uses a separate `npackd-web.sock` by default, so it can
+run alongside the reference GUI's user daemon. Both use the same package
+store and existing transaction lock. The web endpoint binds only to
+`127.0.0.1`, serves the UI and API from one origin, and uses a random per-run
+bearer token in the printed launch URL fragment. The page saves it to
+tab-scoped session storage and removes the fragment; a normal page request
+does not reveal the token.
+It is user-daemon-only; the system daemon remains Unix-socket-only so HTTP
+cannot bypass peer-credential and PolicyKit authorization. Build frontend
+changes with `npm ci && npm run build` in `npack-web/` before rebuilding npack,
+because the production assets are embedded in the daemon.
+
 ## Configuration
 
 Configuration is stored at the platform's user config path, normally:
