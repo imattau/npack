@@ -1424,7 +1424,7 @@ async fn main() -> Result<()> {
             // it -- configured_servers() itself always errors on empty,
             // so its result is only used when non-fatal, same as the
             // install-side `.unwrap_or_default()` callers.
-            let servers = configured_servers(servers, &config).unwrap_or_default();
+            let servers = publish_servers(servers, &artifact_urls, &config);
             publish_release(
                 &manifest,
                 &secret_key,
@@ -5803,7 +5803,7 @@ async fn handle_web_connection(
     }
     let mut body = vec![0; body_length];
     reader.read_exact(&mut body).await?;
-    let mut stream = reader.into_inner();
+    let stream = reader.into_inner();
 
     if method == "GET" && path == "/" {
         let html = include_str!("../../npack-web/dist/index.html");
@@ -9735,6 +9735,21 @@ fn configured_relays(cli_relays: Vec<String>, config: &Config) -> Result<Vec<Str
     Ok(relays)
 }
 
+/// Blossom servers `publish` uploads the artifact to. When the artifact is
+/// already hosted (`--artifact-url`) and no server was named on the command line
+/// or in the config file, the built-in default servers are not used: uploading to
+/// them would be unwanted, and a large artifact is rejected by them anyway.
+fn publish_servers(
+    cli_servers: Vec<String>,
+    artifact_urls: &[String],
+    config: &Config,
+) -> Vec<String> {
+    if cli_servers.is_empty() && !artifact_urls.is_empty() && config.blossom_defaulted {
+        return Vec::new();
+    }
+    configured_servers(cli_servers, config).unwrap_or_default()
+}
+
 fn configured_servers(cli_servers: Vec<String>, config: &Config) -> Result<Vec<String>> {
     let mut servers = if cli_servers.is_empty() {
         config.storage.blossom.clone()
@@ -11991,6 +12006,30 @@ fn rollback_package_at(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn publish_with_an_artifact_url_skips_the_default_blossom_servers() {
+        let mut config = Config::default();
+        config.apply_defaults();
+        assert!(config.blossom_defaulted);
+        let url = vec!["https://example.com/a.npk".to_owned()];
+        assert!(publish_servers(vec![], &url, &config).is_empty());
+        // Without a hosted artifact the defaults still apply.
+        assert!(!publish_servers(vec![], &[], &config).is_empty());
+        // A server named on the command line is always used.
+        assert_eq!(
+            publish_servers(vec!["https://b.example".into()], &url, &config),
+            ["https://b.example"]
+        );
+        // So is one the user configured.
+        let mut configured = Config::default();
+        configured.storage.blossom = vec!["https://c.example".into()];
+        configured.apply_defaults();
+        assert_eq!(
+            publish_servers(vec![], &url, &configured),
+            ["https://c.example"]
+        );
+    }
+
     use super::*;
     use tempfile::tempdir;
 
@@ -14398,6 +14437,8 @@ mod tests {
             Some(socket_path.clone()),
             Config::default(),
             DaemonRole::User,
+            false,
+            0,
         ));
         // run_daemon loops forever binding the socket at startup; poll until
         // the socket file exists rather than sleeping a fixed guess.

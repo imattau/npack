@@ -1227,6 +1227,9 @@ the hash this way -- artifact URLs were only ever transport, so the
 protocol does not change). At least one of `--server`/`--artifact-url`
 is required.
 
+When `--artifact-url` is given and no Blossom server is named (by `--server` or
+`[storage].blossom`), `publish` does not upload to the built-in default servers.
+
 The store icon is uploaded to a Blossom server too unless it is already hosted:
 `--icon-url <https-url>` skips that upload and signs the URL together with the
 SHA-256 of the icon inside the package. The URL must serve the file directly,
