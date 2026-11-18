@@ -897,9 +897,16 @@ enum Command {
             help = "Run as npackd-system: must run as root, binds a world-connectable socket, and requires PolicyKit authorization from non-root peers for Install/Remove/Update"
         )]
         system: bool,
-        #[arg(long, help = "Serve the local npack web store over loopback (user daemon only)")]
+        #[arg(
+            long,
+            help = "Serve the local npack web store over loopback (user daemon only)"
+        )]
         web: bool,
-        #[arg(long, default_value_t = 8765, help = "Loopback web-store port (0 chooses a free port)")]
+        #[arg(
+            long,
+            default_value_t = 8765,
+            help = "Loopback web-store port (0 chooses a free port)"
+        )]
         web_port: u16,
     },
 }
@@ -1670,7 +1677,12 @@ async fn main() -> Result<()> {
         Command::Manifest { artifact, output } => write_manifest(&artifact, &output)?,
         Command::Appstream { artifact, output } => appstream_command(&artifact, output.as_deref())?,
         Command::Trust { action } => trust_command(action, &config).await?,
-        Command::Daemon { socket, system, web, web_port } => {
+        Command::Daemon {
+            socket,
+            system,
+            web,
+            web_port,
+        } => {
             let role = if system {
                 if current_uid() != Some(0) {
                     bail!("`npack daemon --system` must run as root");
@@ -5665,11 +5677,11 @@ async fn run_daemon(
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    if web
-        && socket_path.exists()
-        && tokio::net::UnixStream::connect(&socket_path).await.is_ok()
-    {
-        bail!("a web-enabled npackd is already listening at {}", socket_path.display());
+    if web && socket_path.exists() && tokio::net::UnixStream::connect(&socket_path).await.is_ok() {
+        bail!(
+            "a web-enabled npackd is already listening at {}",
+            socket_path.display()
+        );
     }
     if socket_path.exists() {
         fs::remove_file(&socket_path)
@@ -5698,7 +5710,9 @@ async fn run_daemon(
                         let state = web_state.clone();
                         let token = token.clone();
                         tokio::spawn(async move {
-                            if let Err(error) = handle_web_connection(stream, address, &token, &state).await {
+                            if let Err(error) =
+                                handle_web_connection(stream, address, &token, &state).await
+                            {
                                 eprintln!("npack web request error: {error:#}");
                             }
                         });
@@ -5743,8 +5757,18 @@ async fn handle_web_connection(
     }
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_owned();
-    let path = parts.next().unwrap_or_default().split('?').next().unwrap_or_default().to_owned();
-    if parts.next() != Some("HTTP/1.1") || parts.next().is_some() || method.is_empty() || path.is_empty() {
+    let path = parts
+        .next()
+        .unwrap_or_default()
+        .split('?')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    if parts.next() != Some("HTTP/1.1")
+        || parts.next().is_some()
+        || method.is_empty()
+        || path.is_empty()
+    {
         bail!("invalid HTTP request line");
     }
     let mut headers = HashMap::new();
@@ -5765,7 +5789,10 @@ async fn handle_web_connection(
         let Some((name, value)) = line.split_once(':') else {
             bail!("invalid HTTP header");
         };
-        if headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned()).is_some() {
+        if headers
+            .insert(name.trim().to_ascii_lowercase(), value.trim().to_owned())
+            .is_some()
+        {
             bail!("duplicate HTTP header");
         }
     }
@@ -5774,24 +5801,52 @@ async fn handle_web_connection(
     }
     let host = format!("{address}");
     if headers.get("host").map(String::as_str) != Some(host.as_str()) {
-        return write_web_response(reader.into_inner(), 403, "text/plain; charset=utf-8", b"Invalid host").await;
+        return write_web_response(
+            reader.into_inner(),
+            403,
+            "text/plain; charset=utf-8",
+            b"Invalid host",
+        )
+        .await;
     }
     if let Some(origin) = headers.get("origin")
         && origin != &format!("http://{host}")
     {
-        return write_web_response(reader.into_inner(), 403, "text/plain; charset=utf-8", b"Invalid origin").await;
+        return write_web_response(
+            reader.into_inner(),
+            403,
+            "text/plain; charset=utf-8",
+            b"Invalid origin",
+        )
+        .await;
     }
     if path.starts_with("/api/") {
         if method != "POST" {
-            return write_web_response(reader.into_inner(), 405, "application/json", b"{\"error\":\"POST required\"}").await;
+            return write_web_response(
+                reader.into_inner(),
+                405,
+                "application/json",
+                b"{\"error\":\"POST required\"}",
+            )
+            .await;
         }
         let expected = format!("Bearer {token}");
         if headers.get("authorization") != Some(&expected) {
-            return write_web_response(reader.into_inner(), 401, "application/json", b"{\"error\":\"A valid local session token is required.\"}").await;
+            return write_web_response(
+                reader.into_inner(),
+                401,
+                "application/json",
+                b"{\"error\":\"A valid local session token is required.\"}",
+            )
+            .await;
         }
     }
     let upload_route = path == "/api/local/inspect";
-    let max_body = if upload_route { 256 * 1024 * 1024 } else { 4 * 1024 * 1024 };
+    let max_body = if upload_route {
+        256 * 1024 * 1024
+    } else {
+        4 * 1024 * 1024
+    };
     let body_length = headers
         .get("content-length")
         .map(|value| value.parse::<usize>())
@@ -5799,7 +5854,13 @@ async fn handle_web_connection(
         .context("invalid Content-Length")?
         .unwrap_or(0);
     if body_length > max_body {
-        return write_web_response(reader.into_inner(), 413, "application/json", b"{\"error\":\"Request body is too large.\"}").await;
+        return write_web_response(
+            reader.into_inner(),
+            413,
+            "application/json",
+            b"{\"error\":\"Request body is too large.\"}",
+        )
+        .await;
     }
     let mut body = vec![0; body_length];
     reader.read_exact(&mut body).await?;
@@ -5810,10 +5871,22 @@ async fn handle_web_connection(
         return write_web_response(stream, 200, "text/html; charset=utf-8", html.as_bytes()).await;
     }
     if method == "GET" && path == "/assets/app.js" {
-        return write_web_response(stream, 200, "text/javascript; charset=utf-8", include_bytes!("../../npack-web/dist/assets/app.js")).await;
+        return write_web_response(
+            stream,
+            200,
+            "text/javascript; charset=utf-8",
+            include_bytes!("../../npack-web/dist/assets/app.js"),
+        )
+        .await;
     }
     if method == "GET" && path == "/assets/app.css" {
-        return write_web_response(stream, 200, "text/css; charset=utf-8", include_bytes!("../../npack-web/dist/assets/app.css")).await;
+        return write_web_response(
+            stream,
+            200,
+            "text/css; charset=utf-8",
+            include_bytes!("../../npack-web/dist/assets/app.css"),
+        )
+        .await;
     }
     if method == "GET" && path == "/favicon.ico" {
         return write_web_response(stream, 204, "image/x-icon", b"").await;
@@ -5823,11 +5896,26 @@ async fn handle_web_connection(
     }
     if upload_route {
         if body.is_empty() {
-            return write_web_response(stream, 400, "application/json", b"{\"error\":\"The .npk file is empty.\"}").await;
+            return write_web_response(
+                stream,
+                400,
+                "application/json",
+                b"{\"error\":\"The .npk file is empty.\"}",
+            )
+            .await;
         }
-        let filename = headers.get("x-npack-filename").map(String::as_str).unwrap_or("package.npk");
+        let filename = headers
+            .get("x-npack-filename")
+            .map(String::as_str)
+            .unwrap_or("package.npk");
         if !filename.to_ascii_lowercase().ends_with(".npk") {
-            return write_web_response(stream, 400, "application/json", b"{\"error\":\"Choose a .npk package file.\"}").await;
+            return write_web_response(
+                stream,
+                400,
+                "application/json",
+                b"{\"error\":\"Choose a .npk package file.\"}",
+            )
+            .await;
         }
         let upload_id = Keys::generate().secret_key().to_secret_hex();
         let file_path = std::env::temp_dir().join(format!(
@@ -5851,11 +5939,16 @@ async fn handle_web_connection(
             return Err(error.into());
         }
         drop(file);
-        let result = dispatch_daemon_request(state, DaemonRequest {
-            id: 1,
-            method: "InspectLocal".to_owned(),
-            params: serde_json::json!({"path": file_path.clone()}),
-        }, None).await;
+        let result = dispatch_daemon_request(
+            state,
+            DaemonRequest {
+                id: 1,
+                method: "InspectLocal".to_owned(),
+                params: serde_json::json!({"path": file_path.clone()}),
+            },
+            None,
+        )
+        .await;
         match result {
             Ok(mut preview) => {
                 if let Some(object) = preview.as_object_mut() {
@@ -5863,7 +5956,11 @@ async fn handle_web_connection(
                     object.insert("upload_id".into(), upload_id.clone().into());
                     object.insert("file_name".into(), filename.into());
                 }
-                state.web_uploads.lock().unwrap().insert(upload_id, file_path);
+                state
+                    .web_uploads
+                    .lock()
+                    .unwrap()
+                    .insert(upload_id, file_path);
                 let json = serde_json::to_vec(&serde_json::json!({"preview": preview}))?;
                 return write_web_response(stream, 200, "application/json", &json).await;
             }
@@ -5875,11 +5972,21 @@ async fn handle_web_connection(
         }
     }
     if path == "/api/local/discard" {
-        let request: serde_json::Value = serde_json::from_slice(&body).context("invalid upload-discard request")?;
-        let upload_id = request.get("upload_id").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let request: serde_json::Value =
+            serde_json::from_slice(&body).context("invalid upload-discard request")?;
+        let upload_id = request
+            .get("upload_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
         let already_installing = state.web_uploads_in_use.lock().unwrap().contains(upload_id);
         if already_installing {
-            return write_web_response(stream, 409, "application/json", b"{\"error\":\"This upload is already being installed.\"}").await;
+            return write_web_response(
+                stream,
+                409,
+                "application/json",
+                b"{\"error\":\"This upload is already being installed.\"}",
+            )
+            .await;
         }
         let file_path = state.web_uploads.lock().unwrap().remove(upload_id);
         if let Some(file_path) = file_path {
@@ -5888,86 +5995,135 @@ async fn handle_web_connection(
         return write_web_response(stream, 200, "application/json", b"{\"discarded\":true}").await;
     }
     if path == "/api/local/install" {
-        let request: serde_json::Value = serde_json::from_slice(&body).context("invalid upload-install request")?;
-        let upload_id = request.get("upload_id").and_then(serde_json::Value::as_str).unwrap_or_default();
-        let reserved = state.web_uploads_in_use.lock().unwrap().insert(upload_id.to_owned());
+        let request: serde_json::Value =
+            serde_json::from_slice(&body).context("invalid upload-install request")?;
+        let upload_id = request
+            .get("upload_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let reserved = state
+            .web_uploads_in_use
+            .lock()
+            .unwrap()
+            .insert(upload_id.to_owned());
         if !reserved {
-            return write_web_response(stream, 409, "application/json", b"{\"error\":\"This upload is already being installed.\"}").await;
+            return write_web_response(
+                stream,
+                409,
+                "application/json",
+                b"{\"error\":\"This upload is already being installed.\"}",
+            )
+            .await;
         }
         let file_path = state.web_uploads.lock().unwrap().get(upload_id).cloned();
         let Some(file_path) = file_path else {
             state.web_uploads_in_use.lock().unwrap().remove(upload_id);
-            return write_web_response(stream, 404, "application/json", b"{\"error\":\"This upload has expired. Select the file again.\"}").await;
+            return write_web_response(
+                stream,
+                404,
+                "application/json",
+                b"{\"error\":\"This upload has expired. Select the file again.\"}",
+            )
+            .await;
         };
-        let capabilities = request.get("allow_capability").cloned().unwrap_or_else(|| serde_json::json!([]));
+        let capabilities = request
+            .get("allow_capability")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
         let result = dispatch_daemon_request(state, DaemonRequest {
             id: 1,
             method: "InstallLocal".to_owned(),
             params: serde_json::json!({"path": file_path, "allow_capability": capabilities, "async": true}),
         }, None).await;
-        let json = match result {
-            Ok(value) => {
-                if let Some(transaction_id) = value.get("transaction_id").and_then(serde_json::Value::as_u64) {
-                    let state = state.clone();
-                    let upload_id = upload_id.to_owned();
-                    tokio::spawn(async move {
-                        loop {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            let status = dispatch_daemon_request(&state, DaemonRequest {
+        let json =
+            match result {
+                Ok(value) => {
+                    if let Some(transaction_id) = value
+                        .get("transaction_id")
+                        .and_then(serde_json::Value::as_u64)
+                    {
+                        let state = state.clone();
+                        let upload_id = upload_id.to_owned();
+                        tokio::spawn(async move {
+                            loop {
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                let status = dispatch_daemon_request(&state, DaemonRequest {
                                 id: 1,
                                 method: "GetTransaction".to_owned(),
                                 params: serde_json::json!({"transaction_id": transaction_id}),
                             }, None).await;
-                            let status = status.ok().and_then(|value| {
-                                value.get("status").and_then(serde_json::Value::as_str).map(str::to_owned)
-                            });
-                            if status.as_deref().is_some_and(|status| status != "running") {
-                                if let Ok(mut in_use) = state.web_uploads_in_use.lock() {
-                                    in_use.remove(&upload_id);
-                                }
-                                if matches!(status.as_deref(), Some("succeeded" | "cancelled")) {
-                                    let path = state
-                                        .web_uploads
-                                        .lock()
-                                        .ok()
-                                        .and_then(|mut uploads| uploads.remove(&upload_id));
-                                    if let Some(path) = path {
-                                        let _ = tokio::fs::remove_file(path).await;
+                                let status = status.ok().and_then(|value| {
+                                    value
+                                        .get("status")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_owned)
+                                });
+                                if status.as_deref().is_some_and(|status| status != "running") {
+                                    if let Ok(mut in_use) = state.web_uploads_in_use.lock() {
+                                        in_use.remove(&upload_id);
                                     }
+                                    if matches!(status.as_deref(), Some("succeeded" | "cancelled"))
+                                    {
+                                        let path = state
+                                            .web_uploads
+                                            .lock()
+                                            .ok()
+                                            .and_then(|mut uploads| uploads.remove(&upload_id));
+                                        if let Some(path) = path {
+                                            let _ = tokio::fs::remove_file(path).await;
+                                        }
+                                    }
+                                    break;
                                 }
-                                break;
                             }
-                        }
-                    });
-                } else if let Ok(mut in_use) = state.web_uploads_in_use.lock() {
-                    in_use.remove(upload_id);
+                        });
+                    } else if let Ok(mut in_use) = state.web_uploads_in_use.lock() {
+                        in_use.remove(upload_id);
+                    }
+                    serde_json::to_vec(&serde_json::json!({"result": value}))?
                 }
-                serde_json::to_vec(&serde_json::json!({"result": value}))?
-            }
-            Err(error) => {
-                state.web_uploads_in_use.lock().unwrap().remove(upload_id);
-                serde_json::to_vec(&serde_json::json!({"error": format!("{error:#}")}))?
-            }
-        };
+                Err(error) => {
+                    state.web_uploads_in_use.lock().unwrap().remove(upload_id);
+                    serde_json::to_vec(&serde_json::json!({"error": format!("{error:#}")}))?
+                }
+            };
         return write_web_response(stream, 200, "application/json", &json).await;
     }
 
     let request: DaemonRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(error) => {
-            let json = serde_json::to_vec(&serde_json::json!({"error": format!("invalid request: {error}")}))?;
+            let json = serde_json::to_vec(
+                &serde_json::json!({"error": format!("invalid request: {error}")}),
+            )?;
             return write_web_response(stream, 400, "application/json", &json).await;
         }
     };
     if matches!(request.method.as_str(), "InspectLocal" | "InstallLocal") {
-        return write_web_response(stream, 403, "application/json", b"{\"error\":\"Use the local package upload flow.\"}").await;
+        return write_web_response(
+            stream,
+            403,
+            "application/json",
+            b"{\"error\":\"Use the local package upload flow.\"}",
+        )
+        .await;
     }
     let id = request.id;
     let response = match dispatch_daemon_request(state, request, None).await {
-        Ok(result) => DaemonResponse { id, result: Some(result), error: None, error_code: None },
+        Ok(result) => DaemonResponse {
+            id,
+            result: Some(result),
+            error: None,
+            error_code: None,
+        },
         Err(error) => {
             let message = format!("{error:#}");
-            DaemonResponse { id, result: None, error_code: Some(daemon_error_code(&message)), error: Some(message) }
+            DaemonResponse {
+                id,
+                result: None,
+                error_code: Some(daemon_error_code(&message)),
+                error: Some(message),
+            }
         }
     };
     let json = serde_json::to_vec(&response)?;
@@ -5982,8 +6138,14 @@ async fn write_web_response(
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let status_text = match status {
-        200 => "OK", 204 => "No Content", 400 => "Bad Request", 401 => "Unauthorized",
-        403 => "Forbidden", 404 => "Not Found", 405 => "Method Not Allowed", 413 => "Payload Too Large",
+        200 => "OK",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        413 => "Payload Too Large",
         _ => "Internal Server Error",
     };
     let header = format!(
