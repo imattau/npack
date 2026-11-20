@@ -66,7 +66,8 @@ export default function Store() {
   const [nostrCount, setNostrCount] = useState<number | null>(null);
 
   const relays = useMemo(() => asList<string>(config.relays), [config]);
-  // CheckUpdates reports every installed package; only newer versions belong here.
+  // CheckUpdates reports one status for every installed package. The Updates
+  // page should list only packages with a newer version to install.
   const availableUpdates = updates.filter((item) => typeof item.available_version === 'string');
 
   async function loadInstalled() {
@@ -155,9 +156,10 @@ export default function Store() {
     setBusy(true); setError('');
     try {
       await rpc('AddTrustedPublisher', { publisher: row.publisher });
-      setSelected({ ...row, trust: 'trusted' });
+      const trustedRow = { ...row, trust: 'trusted' };
+      setSelected(trustedRow);
       setResults((current) => current.map((item) => item.publisher === row.publisher ? { ...item, trust: 'trusted' } : item));
-      setNotice('Publisher ' + (row.npub ?? publisherShort(row.publisher)) + ' is now trusted.');
+      setNotice(`Publisher ${row.npub ?? publisherShort(row.publisher)} is now trusted.`);
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not trust this publisher.'); }
     finally { setBusy(false); }
   }
