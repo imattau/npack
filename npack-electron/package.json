@@ -1,7 +1,7 @@
 {
   "name": "npack-gui",
   "productName": "npack",
-  "version": "0.11.0",
+  "version": "0.11.2",
   "description": "Desktop window for the npack web store",
   "license": "MIT",
   "private": true,
