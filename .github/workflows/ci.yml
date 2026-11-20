@@ -12,6 +12,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            npack-web/package-lock.json
+            npack-electron/package-lock.json
+      - name: Build the embedded web store
+        working-directory: npack-web
+        run: |
+          npm ci
+          npm run build
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -50,11 +62,6 @@ jobs:
           appstreamcli validate --no-net /tmp/appstream-ci/ci.metainfo.xml
       - name: Install packaging tooling
         run: sudo apt-get install -y dpkg-dev rpm desktop-file-utils
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: npack-electron/package-lock.json
       - name: Build the desktop app
         working-directory: npack-electron
         run: |
