@@ -6,6 +6,7 @@ import { Activity, AlertTriangle, ArrowDownToLine, ArrowLeft, Check, ChevronDown
 type Page = 'browse' | 'installed' | 'updates' | 'health' | 'settings';
 type Json = Record<string, unknown>;
 type PackageRow = Json & { name: string; version: string; publisher: string; npub?: string; trust?: string; app?: Json };
+type OperationProgress = { label: string; stage: string; package?: string; detail?: string };
 
 const launchToken = new URLSearchParams(window.location.hash.slice(1)).get('token');
 const token = launchToken ?? sessionStorage.getItem('npack-web-token') ?? '';
@@ -54,6 +55,7 @@ export default function Store() {
   const [updates, setUpdates] = useState<Json[]>([]);
   const [health, setHealth] = useState<Json | null>(null);
   const [busy, setBusy] = useState(false);
+  const [operation, setOperation] = useState<OperationProgress | null>(null);
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
@@ -117,25 +119,32 @@ export default function Store() {
   }, [page]);
 
   async function install(row: PackageRow, trustOnce: boolean) {
-    setBusy(true); setNotice(`Installing ${row.name}…`); setTrustConfirm(false);
+    setBusy(true); setError(''); setNotice(''); setOperation({ label: `Installing ${row.name}`, stage: 'starting' }); setTrustConfirm(false);
     try {
       const value = await rpc<Json>('Install', { package: `${row.publisher}/${row.name}`, relay: relays, trust_once: trustOnce && row.trust !== 'trusted' ? [row.publisher] : [], allow_capability: serviceAllowed ? ['service-manager'] : [], async: true });
-      await pollTransaction(value); await loadInstalled(); setNotice(`${row.name} is installed.`);
+      await pollTransaction(value, `Installing ${row.name}`); await refreshAfterMutation(); setNotice(`${row.name} is installed.`);
       setSelected(null);
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Install failed.'); }
-    finally { setBusy(false); }
+    finally { setBusy(false); setOperation(null); }
   }
 
-  async function pollTransaction(value: Json) {
+  async function pollTransaction(value: Json, label: string) {
     const id = value.transaction_id;
     if (typeof id !== 'number') return;
     for (let attempt = 0; attempt < 600; attempt += 1) {
       const state = await rpc<Json>('GetTransaction', { transaction_id: id });
-      if (state.status === 'succeeded') return;
+      const progress = state.progress as Json | undefined;
+      if (state.status === 'running') setOperation({ label, stage: str(progress?.stage, 'working'), package: str(progress?.package) || undefined, detail: str(progress?.detail) || undefined });
+      if (state.status === 'succeeded') { setOperation({ label, stage: 'completed' }); return; }
       if (state.status === 'failed' || state.status === 'cancelled') throw new Error(str(state.error, 'Package operation failed.'));
       await new Promise((resolve) => window.setTimeout(resolve, 500));
     }
     throw new Error('The operation is taking longer than expected. Check the installed list for its result.');
+  }
+
+  async function refreshAfterMutation() {
+    await loadInstalled();
+    if (page === 'updates') setUpdates(await rpc<Json[]>('CheckUpdates'));
   }
 
   async function remove(row: PackageRow) {
@@ -146,10 +155,10 @@ export default function Store() {
   }
 
   async function updateAll() {
-    setBusy(true); setNotice('Updating installed software…');
-    try { await pollTransaction(await rpc<Json>('Update', { relay: relays, async: true })); await loadInstalled(); setNotice('Software is up to date.'); }
+    setBusy(true); setError(''); setNotice(''); setOperation({ label: 'Updating installed software', stage: 'starting' });
+    try { await pollTransaction(await rpc<Json>('Update', { relay: relays, async: true }), 'Updating installed software'); await refreshAfterMutation(); setNotice('Software is up to date.'); }
     catch (reason) { setError(reason instanceof Error ? reason.message : 'Update failed.'); }
-    finally { setBusy(false); }
+    finally { setBusy(false); setOperation(null); }
   }
 
   async function trustPublisher(row: PackageRow) {
@@ -192,9 +201,10 @@ export default function Store() {
       const payload = await response.json() as { result?: Json; error?: string };
       if (!response.ok || payload.error || !payload.result) throw new Error(payload.error ?? 'Local install failed.');
       const transaction = payload.result;
-      await pollTransaction(transaction); setUpload(null); await loadInstalled(); setNotice('Local package installed.');
+      setOperation({ label: `Installing ${str(upload.preview.name)}`, stage: 'starting' });
+      await pollTransaction(transaction, `Installing ${str(upload.preview.name)}`); setUpload(null); await refreshAfterMutation(); setNotice('Local package installed.');
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Local install failed.'); }
-    finally { setBusy(false); }
+    finally { setBusy(false); setOperation(null); }
   }
 
   function discardUpload() {
@@ -229,6 +239,7 @@ export default function Store() {
       <div className="content">
         {error && <div className="banner error-banner"><AlertTriangle size={17} /><span>{error}</span><button onClick={() => setError('')}><X size={16} /></button></div>}
         {notice && <div className="banner success-banner"><Check size={17} /><span>{notice}</span><button onClick={() => setNotice('')}><X size={16} /></button></div>}
+        {operation && <div className="operation-panel" role="status" aria-live="polite"><LoaderCircle className="spin" size={18} /><div className="operation-copy"><b>{operation.label}</b><span>{progressText(operation)}</span>{operation.package && <small>{operation.package}</small>}</div><div className="operation-track"><span /></div></div>}
         {selected ? <PackageDetails row={selected} onBack={() => setSelected(null)} onInstall={() => selected.trust === 'trusted' && packageCapabilities(selected).length === 0 ? void install(selected, false) : setTrustConfirm(true)} onTrust={() => void trustPublisher(selected)} busy={busy} installed={installed.some((item) => item.name === selected.name && item.publisher === selected.publisher)} />
           : page === 'browse' ? <section>
             <div className="eyebrow">THE NPACK CATALOGUE</div><div className="hero-row"><div><h1>Find your next<br /><em>favourite tool.</em></h1><p>Software published on Nostr, checked before it reaches your system.</p></div><button className="file-button" onClick={() => document.getElementById('npk-file')?.click()}><Upload size={17} /> Install a .npk file</button><input id="npk-file" hidden type="file" accept=".npk" onChange={(event) => { const file = event.target.files?.[0]; if (file) void inspectFile(file); event.currentTarget.value = ''; }} /></div>
@@ -254,6 +265,11 @@ function NavButton({ active, icon, label, count, onClick }: { active: boolean; i
   return <button className={`nav-button ${active ? 'active' : ''}`} onClick={onClick}>{icon}<span>{label}</span>{count !== undefined && <small>{count}</small>}</button>;
 }
 function pageTitle(page: Page) { return ({ browse: 'Discover', installed: 'Installed', updates: 'Updates', health: 'System health', settings: 'Preferences' })[page]; }
+function progressText(progress: OperationProgress): string {
+  if (progress.stage === 'completed') return 'Finishing up…';
+  const stages: Record<string, string> = { starting: 'Starting…', connecting: 'Connecting to release sources…', resolving: 'Checking package and dependencies…', downloading: 'Downloading and verifying files…', installing: 'Installing package files…', installed: 'Package installed…', updating: 'Checking for updates…' };
+  return progress.detail || stages[progress.stage] || 'Working…';
+}
 function PageHeading({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: React.ReactNode }) { return <div className="page-heading"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{description}</p></div>{action}</div>; }
 function PackageCard({ row, onClick }: { row: PackageRow; onClick: () => void }) {
   const cats = asList<string>((row.app as Json | undefined)?.categories);
