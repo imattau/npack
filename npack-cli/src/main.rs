@@ -10230,6 +10230,7 @@ fn install_with_history_at(
         allowed_capabilities,
     )?;
     transaction.commit()?;
+    refresh_desktop_caches(prefix);
     let to = HistoryVersion {
         version: installed.version.clone(),
         sha256: installed.sha256.clone(),
@@ -10685,6 +10686,53 @@ fn rollback_entries(entries: &[(PathBuf, Option<PathBuf>)]) -> Result<()> {
     Ok(())
 }
 
+/// One external tool that refreshes a freedesktop cache after a package store
+/// mutation. Like `pkcheck` and `notify-send`, these tools are optional: a
+/// missing tool or a failing run never fails the install or removal.
+#[derive(Debug, PartialEq, Eq)]
+struct DesktopCacheRefresh {
+    program: &'static str,
+    arguments: Vec<std::ffi::OsString>,
+}
+
+/// The cache refreshes `prefix` needs after package files were added or
+/// removed.
+///
+/// `update-desktop-database` rewrites `mimeinfo.cache`, which is what makes a
+/// new or removed `MimeType=`/`x-scheme-handler/` association visible to
+/// `xdg-open` and the desktop shell. `gtk-update-icon-cache` rewrites a
+/// theme's `icon-theme.cache`, but only themes that carry an `index.theme`
+/// have one; a user-prefix hicolor directory often does not.
+fn desktop_cache_refreshes(prefix: &Path) -> Vec<DesktopCacheRefresh> {
+    let mut refreshes = Vec::new();
+    let applications = prefix.join("share/applications");
+    if applications.is_dir() {
+        refreshes.push(DesktopCacheRefresh {
+            program: "update-desktop-database",
+            arguments: vec![applications.into_os_string()],
+        });
+    }
+    let icons = prefix.join("share/icons/hicolor");
+    if icons.join("index.theme").is_file() {
+        refreshes.push(DesktopCacheRefresh {
+            program: "gtk-update-icon-cache",
+            arguments: vec!["--force".into(), "--quiet".into(), icons.into_os_string()],
+        });
+    }
+    refreshes
+}
+
+fn refresh_desktop_caches(prefix: &Path) {
+    for refresh in desktop_cache_refreshes(prefix) {
+        let _ = std::process::Command::new(refresh.program)
+            .args(&refresh.arguments)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
 fn ensure_install_paths_available(
     paths: &[PathBuf],
     installed: &[InstalledPackage],
@@ -10964,7 +11012,7 @@ fn remove_package_at(package: &str, store: Option<&Path>, user: bool) -> Result<
     if publisher.is_empty() || name.is_empty() || publisher.contains('/') || name.contains('/') {
         bail!("package reference must be publisher/name");
     }
-    let root = install_paths(store, user).0;
+    let (root, prefix) = install_paths(store, user);
     let transaction =
         StoreTransaction::begin(&root, "remove", &format!("{publisher}/{name}"), &root)?;
     let before: Vec<HistoryVersion> = installed_packages(Some(&root))?
@@ -10977,6 +11025,7 @@ fn remove_package_at(package: &str, store: Option<&Path>, user: bool) -> Result<
         .collect();
     let removed = remove_locked(&publisher, name, package, &root)?;
     transaction.commit()?;
+    refresh_desktop_caches(&prefix);
     for version in before {
         append_history(
             &root,
@@ -12336,6 +12385,43 @@ mod tests {
         assert_eq!(
             fs::read(prefix.join("var/www/app/hello.txt"))?,
             b"new contents"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_cache_refreshes_follow_the_installed_prefix() -> Result<()> {
+        let dir = tempdir()?;
+        let prefix = dir.path();
+        assert!(desktop_cache_refreshes(prefix).is_empty());
+
+        // A launcher directory asks for a MIME and desktop-database rewrite.
+        fs::create_dir_all(prefix.join("share/applications"))?;
+        let refreshes = desktop_cache_refreshes(prefix);
+        assert_eq!(refreshes.len(), 1);
+        assert_eq!(refreshes[0].program, "update-desktop-database");
+        assert_eq!(
+            refreshes[0].arguments,
+            vec![prefix.join("share/applications").into_os_string()]
+        );
+
+        // An icon theme without index.theme has no cache to rewrite.
+        fs::create_dir_all(prefix.join("share/icons/hicolor"))?;
+        assert_eq!(desktop_cache_refreshes(prefix).len(), 1);
+        fs::write(
+            prefix.join("share/icons/hicolor/index.theme"),
+            b"[Icon Theme]\nName=Hicolor\n",
+        )?;
+        let refreshes = desktop_cache_refreshes(prefix);
+        assert_eq!(refreshes.len(), 2);
+        assert_eq!(refreshes[1].program, "gtk-update-icon-cache");
+        assert_eq!(
+            refreshes[1].arguments,
+            vec![
+                std::ffi::OsString::from("--force"),
+                std::ffi::OsString::from("--quiet"),
+                prefix.join("share/icons/hicolor").into_os_string(),
+            ]
         );
         Ok(())
     }

@@ -118,6 +118,14 @@ the package contents, checks dependencies and conflicts, and records the
 installed files. The `.npack` metadata directory is not installed into the
 target prefix.
 
+An install or removal also refreshes the desktop caches under the prefix. When
+`<prefix>/share/applications` exists, npack runs `update-desktop-database` so a
+new or removed `MimeType=` or `x-scheme-handler/` association takes effect in
+`mimeinfo.cache` (and therefore in `xdg-open` and the desktop shell); when an
+icon theme has an `index.theme`, it refreshes that theme's `icon-theme.cache`
+with `gtk-update-icon-cache`. Both are best effort: the tools are optional, and
+a missing tool or a failing run never fails the install.
+
 Standalone local installation proves archive integrity, but it does not
 prove who published the package. For publisher authentication, install from
 Nostr using a signed release event.
